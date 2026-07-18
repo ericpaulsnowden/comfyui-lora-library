@@ -125,11 +125,10 @@ def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
         return web.json_response({"loras": context.list_loras()})
 
 
-def build_routes(context: LibraryContext) -> web.RouteTableDef:
-    """Every lora_library route on a fresh table — used by tests and by
-    :func:`register`. Feature route modules are optional (same defensive
-    posture as ``__init__.py``): a missing/broken one logs and is skipped."""
-    routes = web.RouteTableDef()
+def _register_all(context: LibraryContext, routes: web.RouteTableDef) -> None:
+    """Core + every feature route module onto *routes*. Feature modules are
+    optional (same defensive posture as ``__init__.py``): a missing/broken
+    one logs and is skipped."""
     register_core(context, routes)
     for module_name in ("routes_notebook", "routes_sets"):
         try:
@@ -137,13 +136,27 @@ def build_routes(context: LibraryContext) -> web.RouteTableDef:
             module.register(context, routes)
         except Exception:
             logger.exception("lora_library: route module %s failed to load", module_name)
+
+
+def build_routes(context: LibraryContext) -> web.RouteTableDef:
+    """Every lora_library route on a fresh table — the tests' entry point."""
+    routes = web.RouteTableDef()
+    _register_all(context, routes)
     return routes
 
 
 def register(context: LibraryContext) -> None:
     """Attach all routes to the running ComfyUI server (called from
-    ``__init__.py``; only line in the pack that touches PromptServer)."""
+    ``__init__.py``; only function in the pack that touches PromptServer).
+
+    Registers onto ``PromptServer.instance.routes`` — NOT directly onto the
+    aiohttp app — because ComfyUI mirrors exactly that table under the
+    ``/api`` prefix at startup (server.py: "Prefix every route with /api"),
+    and the frontend's ``api.fetchApi`` calls ``/api/lora_library/...``.
+    Direct ``app.add_routes`` registration works for curl but is invisible
+    to the frontend (learned the hard way: HTTP 405s from settings.js).
+    """
     from server import PromptServer  # ComfyUI's module; import only inside ComfyUI
 
-    PromptServer.instance.app.add_routes(build_routes(context))
+    _register_all(context, PromptServer.instance.routes)
     logger.info("lora_library: routes registered")
