@@ -123,7 +123,7 @@ def test_none_set_passes_through_with_empty_stack_and_no_comfy_calls(
 ) -> None:
     node = nodes_sets.LoraLibraryApplySet()
     model_in, clip_in = FakeModel(), FakeClip()
-    model_out, clip_out, stack, trigger_words = node.apply(
+    model_out, clip_out, stack, trigger_words, _loras_text_out = node.apply(
         set="None", strength_scale=1.0, model=model_in, clip=clip_in
     )
     assert model_out is model_in
@@ -139,7 +139,7 @@ def test_missing_set_file_logs_warning_and_passes_through(
 ) -> None:
     node = nodes_sets.LoraLibraryApplySet()
     with caplog.at_level(logging.WARNING, logger="lora_library"):
-        model_out, clip_out, stack, trigger_words = node.apply(
+        model_out, clip_out, stack, trigger_words, _loras_text_out = node.apply(
             set="does-not-exist", strength_scale=1.0, model=None, clip=None
         )
     assert model_out is None
@@ -158,7 +158,9 @@ def test_corrupt_set_file_degrades_like_missing_rather_than_raising(
     bad_path.write_text(json.dumps({"format": 99, "loras": []}), encoding="utf-8")
     node = nodes_sets.LoraLibraryApplySet()
     with caplog.at_level(logging.WARNING, logger="lora_library"):
-        model_out, _, stack, trigger_words = node.apply(set="broken", strength_scale=1.0)
+        model_out, _, stack, trigger_words, _loras_text_out = node.apply(
+            set="broken", strength_scale=1.0
+        )
     assert model_out is None
     assert stack == []
     assert trigger_words == ""
@@ -174,7 +176,7 @@ def test_apply_with_model_and_clip_scales_strengths_and_preserves_order(
     node = nodes_sets.LoraLibraryApplySet()
     model_in, clip_in = FakeModel("m0"), FakeClip("c0")
 
-    model_out, clip_out, stack, trigger_words = node.apply(
+    model_out, clip_out, stack, trigger_words, _loras_text_out = node.apply(
         set=slug, strength_scale=0.5, model=model_in, clip=clip_in
     )
     calls, loaded_files = fake_comfy
@@ -217,7 +219,9 @@ def test_no_model_or_clip_wired_is_a_pure_stack_and_trigger_source(
 ) -> None:
     slug = _make_set(context)
     node = nodes_sets.LoraLibraryApplySet()
-    model_out, clip_out, stack, trigger_words = node.apply(set=slug, strength_scale=1.0)
+    model_out, clip_out, stack, trigger_words, _loras_text_out = node.apply(
+        set=slug, strength_scale=1.0
+    )
     calls, _ = fake_comfy
     assert calls == []  # comfy.* never touched when neither model nor clip is wired
     assert model_out is None
@@ -237,7 +241,9 @@ def test_clip_none_is_passed_through_and_propagates_from_the_recorder(
     )
     node = nodes_sets.LoraLibraryApplySet()
     model_in = FakeModel()
-    model_out, clip_out, _, _ = node.apply(set=slug, strength_scale=1.0, model=model_in, clip=None)
+    model_out, clip_out, _, _, _ = node.apply(
+        set=slug, strength_scale=1.0, model=model_in, clip=None
+    )
     calls, _ = fake_comfy
     assert calls[0][2] is None  # clip argument load_lora_for_models saw was None
     assert clip_out is None  # and the fake's None-clip handling propagated back out
@@ -255,7 +261,9 @@ def test_model_none_is_passed_through_when_only_clip_is_wired(
     )
     node = nodes_sets.LoraLibraryApplySet()
     clip_in = FakeClip()
-    model_out, clip_out, _, _ = node.apply(set=slug, strength_scale=1.0, model=None, clip=clip_in)
+    model_out, clip_out, _, _, _ = node.apply(
+        set=slug, strength_scale=1.0, model=None, clip=clip_in
+    )
     calls, _ = fake_comfy
     assert calls[0][1] is None
     assert model_out is None
@@ -270,7 +278,7 @@ def test_disabled_row_is_never_resolved_or_applied(context: LibraryContext, fake
         ],
     )
     node = nodes_sets.LoraLibraryApplySet()
-    _, _, stack, _ = node.apply(set=slug, strength_scale=1.0, model=FakeModel(), clip=FakeClip())
+    _, _, stack, _, _ = node.apply(set=slug, strength_scale=1.0, model=FakeModel(), clip=FakeClip())
     calls, _ = fake_comfy
     assert calls == []
     assert stack == []
@@ -288,7 +296,7 @@ def test_unresolvable_lora_is_skipped_with_warning_but_rest_of_set_still_applies
     )
     node = nodes_sets.LoraLibraryApplySet()
     with caplog.at_level(logging.WARNING, logger="lora_library"):
-        _, _, stack, _ = node.apply(
+        _, _, stack, _, _ = node.apply(
             set=slug, strength_scale=1.0, model=FakeModel(), clip=FakeClip()
         )
     calls, _ = fake_comfy
@@ -310,7 +318,7 @@ def test_zero_strength_row_is_not_loaded_but_still_reported_in_the_stack(
         ],
     )
     node = nodes_sets.LoraLibraryApplySet()
-    _, _, stack, _ = node.apply(set=slug, strength_scale=1.0, model=FakeModel(), clip=FakeClip())
+    _, _, stack, _, _ = node.apply(set=slug, strength_scale=1.0, model=FakeModel(), clip=FakeClip())
     calls, loaded_files = fake_comfy
     assert calls == []
     assert loaded_files == []
@@ -410,5 +418,49 @@ def test_input_types_without_context_falls_back_to_none_only() -> None:
 def test_class_shape_matches_format_md_section_6_2() -> None:
     cls = nodes_sets.LoraLibraryApplySet
     assert cls.CATEGORY == "EPSNodes"
-    assert cls.RETURN_TYPES == ("MODEL", "CLIP", "LORA_STACK", "STRING")
-    assert cls.RETURN_NAMES == ("model", "clip", "lora_stack", "trigger_words")
+    assert cls.RETURN_TYPES == ("MODEL", "CLIP", "LORA_STACK", "STRING", "STRING")
+    assert cls.RETURN_NAMES == ("model", "clip", "lora_stack", "trigger_words", "loras_text")
+
+
+# ---------------------------------------------------------------- loras_text
+
+
+def test_loras_text_formats_a1111_tags_in_order(context: LibraryContext) -> None:
+    """FORMAT.md SS6.2: <lora:stem:strength> tags, order preserved, extension
+    and subfolder stripped, compact %g strengths."""
+    slug, _ = sets_store.save_set(
+        context,
+        {
+            "name": "Tags",
+            "loras": [
+                {"file": "detailer.safetensors", "on": True, "strength": 0.8},
+                {"file": "styles/film_grain.safetensors", "on": True, "strength": 1.0},
+            ],
+        },
+    )
+    node = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text = node.apply(set=slug, strength_scale=1.0)
+    assert loras_text == "<lora:detailer:0.8> <lora:film_grain:1>"
+
+
+def test_loras_text_dual_strength_and_scale(context: LibraryContext) -> None:
+    """Differing clip strength uses the model:clip form; strength_scale is
+    already baked into the tag values (SS6.2: post-scale)."""
+    slug, _ = sets_store.save_set(
+        context,
+        {
+            "name": "Dual",
+            "loras": [
+                {"file": "detailer.safetensors", "on": True, "strength": 0.8, "strength_clip": 0.4},
+            ],
+        },
+    )
+    node = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text = node.apply(set=slug, strength_scale=0.5)
+    assert loras_text == "<lora:detailer:0.4:0.2>"
+
+
+def test_loras_text_empty_when_nothing_applies(context: LibraryContext) -> None:
+    node = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text = node.apply(set="None", strength_scale=1.0)
+    assert loras_text == ""

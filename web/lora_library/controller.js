@@ -77,8 +77,10 @@
  *    only agree if every `serialize:false` widget sits AFTER every normally
  *    serialized widget — an interleaved layout would misread values on
  *    reload. This is why `target`/`set`/`name` are declared first and
- *    `status` + all 4 buttons (all `serialize:false`) are declared last.
- *    Do not reorder without re-checking this.
+ *    `status` + all 3 buttons (all `serialize:false`) are declared last.
+ *    Do not reorder without re-checking this. (Was 4 buttons before the
+ *    2026-07-18 owner change removed the standalone Apply button — see
+ *    `_onSetSelected`.)
  *  - `ComboWidget` supports `options.values` as a function
  *    (ComboWidget.ts:59-64, `getValues()`) — but it's deprecated as of
  *    v0.14.5 and logs a console warning on every dropdown open
@@ -98,6 +100,57 @@
  *    art for virtual-node registration itself: ComfyUI_frontend's
  *    `src/extensions/core/noteNode.ts` (`class X extends LGraphNode`,
  *    `this.isVirtualNode = true`, `LiteGraph.registerNodeType(name, X)`).
+ *  - Combo callbacks do NOT fire during workflow restore. `configure()`
+ *    restores `widgets_values` via a plain `widget.value = info.widgets_values[i++]`
+ *    assignment (LGraphNode.ts:928-935). `ComboWidget`/`BaseSteppedWidget`
+ *    (widgets/ComboWidget.ts, widgets/BaseSteppedWidget.ts) do not override
+ *    `value`, so that assignment resolves to `BaseWidget`'s plain property
+ *    setter (widgets/BaseWidget.ts:131-133: `this._state.value = value`) —
+ *    NOT `setValue()` (BaseWidget.ts:416-436), the ONLY place `callback` is
+ *    invoked (line 432). This is the load-bearing fact behind making the
+ *    `set` combo's callback perform Apply (see `_onSetSelected`): a saved
+ *    workflow reopening can never silently re-apply a set. We still
+ *    bracket our own restore in `_isRestoring` (see `configure()` override
+ *    below) and route every *programmatic* `set`-widget write through
+ *    `_setSetValueSilently()` — belt-and-suspenders, since this guarantee
+ *    otherwise rests entirely on an internal we don't own. Precedent for
+ *    overriding `configure()` on a custom node: rgthree's own PLL node
+ *    does exactly this (power_lora_loader.js:55-74).
+ *  - `widget.hidden` is a first-class, purpose-built hiding mechanism in
+ *    this fork — NOT the same thing as the `.disabled` trick noted above
+ *    for `status`. `LGraphNode.isWidgetVisible()` (LGraphNode.ts:3935-3939)
+ *    and `getLayoutWidgets()` (3941-3947, "Filters out hidden widgets only
+ *    ... for layout calculations") both branch on `.hidden`; `computeSize()`
+ *    (line 1820) and `_arrangeWidgets()` (line 4166's `visibleWidgets`,
+ *    consumed at 4206-4210 for both Y-position and total height) build
+ *    exclusively off that filtered list. So `widget.hidden = true` removes
+ *    a widget from drawing AND layout AND size — later widgets shift up,
+ *    the node's natural height shrinks — a real hide, not a value-blank.
+ *    `drawNode()` calls `node.arrange()` unconditionally every frame
+ *    (LGraphCanvas.ts:5730), so toggling `.hidden` + `setDirtyCanvas(true,
+ *    true)` is sufficient; no manual resize bookkeeping like
+ *    `applySetToTarget()` needs for the (foreign, not-auto-arranging-for-
+ *    our-purposes) PLL target. VERIFY(live) — DONE on Eric's rig
+ *    (comfyui-test, port 8199): toggling the Properties Panel's "Show
+ *    status" row live-flips `.hidden`, the row appears/disappears with no
+ *    dead space, and the node redraws immediately — matches this reading
+ *    exactly.
+ *  - `LGraphNode.addProperty(name, default, type)` (LGraphNode.ts:1624-1638)
+ *    pushes an `INodePropertyInfo` onto `properties_info` and seeds
+ *    `this.properties[name]`. The right-click "Properties Panel" reads it
+ *    back via `getPropertyInfo()` (1905-1934, matches by `name` in
+ *    `properties_info`) and keys its editor widget off `info.type`
+ *    (LGraphCanvas.ts ~8408-8416: `panel.addWidget(info.widget || info.type,
+ *    pName, value, info, fUpdate)`) — passing `'boolean'` is what makes
+ *    "Show status" a checkbox row rather than free text. `onPropertyChanged`
+ *    fires from two places: user edits via `setProperty()` (LGraphNode.ts:
+ *    1061-1081) and workflow restore via `configure()`'s OWN properties loop
+ *    (842-850, `this.onPropertyChanged?.(k, info.properties[k])`) — the
+ *    latter is exactly what we want here (a saved "Show status: true"
+ *    should reveal the widget immediately on load), which is the opposite
+ *    conclusion from the `set`-combo finding above; the two are unrelated
+ *    code paths (property restore vs. widget-value restore) and both were
+ *    read, not assumed.
  */
 
 import { app } from '../../../scripts/app.js'
@@ -107,7 +160,7 @@ import * as api from './api.js'
 
 const NODE_TYPE = 'LoraLibrarySetController'
 const NODE_TITLE = 'LoRA Set Controller'
-const NODE_CATEGORY = 'LoRA Library'
+const NODE_CATEGORY = 'EPSNodes'
 
 /** Exact rgthree type/title/comfyClass string — constants.js addRgthree("Power Lora Loader"). */
 const POWER_LORA_LOADER_TYPE = 'Power Lora Loader (rgthree)'
@@ -117,7 +170,18 @@ const PROP_SHOW_STRENGTHS_DUAL = 'Separate Model & Clip'
 /** rgthree row widgets are named lora_<counter>; counter never reuses numbers. */
 const LORA_ROW_NAME_RE = /^lora_\d+$/
 
-const LABEL_APPLY = 'Apply set → target'
+/** FORMAT.md §6.3: our OWN node property — default false, revealed via right-click Properties. */
+const PROP_SHOW_STATUS = 'Show status'
+
+/**
+ * FORMAT.md §6.3 multi-target: label prefix + matching regex for the "All
+ * Power Lora Loaders (N)" target-combo entry. Keep these two in sync by
+ * hand (formatAllTargetsLabel() below is the only writer) — there's no
+ * runtime derivation of one from the other.
+ */
+const ALL_TARGETS_LABEL_PREFIX = 'All Power Lora Loaders'
+const ALL_TARGETS_RE = /^All Power Lora Loaders \(\d+\)$/
+
 const LABEL_CAPTURE = 'Capture target → new set'
 const LABEL_UPDATE = 'Update set (overwrite)'
 const LABEL_DELETE = 'Delete set'
@@ -166,6 +230,32 @@ function resolveTargetNode(label) {
   return nodes.find((n) => n && String(n.id) === id && n.type === POWER_LORA_LOADER_TYPE) || null
 }
 
+/** FORMAT.md §6.3: the target combo's multi-target entry text, e.g. "All Power Lora Loaders (2)". */
+function formatAllTargetsLabel(count) {
+  return `${ALL_TARGETS_LABEL_PREFIX} (${count})`
+}
+
+/**
+ * Resolve the target combo's current value to ZERO OR MORE live nodes.
+ * Everywhere that used to call `resolveTargetNode` (singular) now calls
+ * this instead, so probe/capture/apply are written once against an array
+ * and don't need to know whether "All" is in play.
+ *
+ * The "All" case returns every candidate sorted by ASCENDING node id —
+ * FORMAT.md §6.3: "CAPTURE reads from the lowest-node-id PLL", so callers
+ * that need that one specific node just take `nodes[0]`.
+ */
+function resolveTargetNodes(label) {
+  if (!label) return []
+  if (ALL_TARGETS_RE.test(String(label))) {
+    return findTargetCandidates()
+      .sort((a, b) => a.id - b.id)
+      .map((c) => c.node)
+  }
+  const single = resolveTargetNode(label)
+  return single ? [single] : []
+}
+
 /**
  * Scan a target's widgets for lora rows. `named` = everything that LOOKS like
  * a row by name (FORMAT.md §6.3: `/^lora_\d+$/`); `rows` = the subset whose
@@ -187,16 +277,22 @@ function scanLoraRows(node) {
   return { named, rows }
 }
 
+/** rgthree registers the PLL type with LiteGraph iff it's installed and loaded. */
+function isRgthreeInstalled() {
+  return (
+    typeof LiteGraph !== 'undefined' &&
+    !!(LiteGraph.registered_node_types && LiteGraph.registered_node_types[POWER_LORA_LOADER_TYPE])
+  )
+}
+
 /**
  * Single feature-detection gate every rgthree interaction goes through
  * (FORMAT.md §6.3: "probe first, mutate after"). Never partially mutates
- * anything — it only reads.
+ * anything — it only reads. Single-node; `probeTargets()` below is the
+ * multi-target-aware wrapper the UI layer actually calls.
  */
 function probeTarget(node) {
-  const rgthreeInstalled =
-    typeof LiteGraph !== 'undefined' &&
-    !!(LiteGraph.registered_node_types && LiteGraph.registered_node_types[POWER_LORA_LOADER_TYPE])
-  if (!rgthreeInstalled) {
+  if (!isRgthreeInstalled()) {
     return { ok: false, code: 'no-rgthree', message: MSG_NO_RGTHREE }
   }
   if (!node) {
@@ -235,10 +331,53 @@ function probeTarget(node) {
 }
 
 /**
- * CAPTURE (FORMAT.md §6.3 + §4). Only called after probeTarget().ok, so every
- * row here is already known to have the expected `{on, lora, strength,
- * strengthTwo}`-ish shape. nd-super-nodes' `{enabled, strengthClip}` aliases
- * are read (never written).
+ * Multi-target probe (FORMAT.md §6.3 amendment): `nodes` is whatever
+ * `resolveTargetNodes()` returned — 0, 1, or (with "All…" selected) every
+ * PLL in the graph. "probe requires ALL targets healthy" — the first
+ * unhealthy node wins and its identity is folded into the message ("any
+ * shape-drift disables with a message naming the offending node"); this
+ * still degrades to plain `probeTarget()` behavior for the single-target
+ * (N<=1) case, including the exact no-rgthree/no-target-selected/
+ * no-target-in-graph messages, since the empty/rgthree checks run first
+ * and unchanged.
+ */
+function probeTargets(nodes) {
+  if (!isRgthreeInstalled()) {
+    return { ok: false, code: 'no-rgthree', message: MSG_NO_RGTHREE }
+  }
+  if (!nodes || nodes.length === 0) {
+    const hasAny = findTargetCandidates().length > 0
+    return {
+      ok: false,
+      code: hasAny ? 'no-target-selected' : 'no-target-in-graph',
+      message: hasAny ? MSG_NO_TARGET_SELECTED : MSG_NO_TARGET_IN_GRAPH
+    }
+  }
+  for (const node of nodes) {
+    const single = probeTarget(node)
+    if (!single.ok) {
+      const named = node.title || node.type
+      const message = single.code === 'shape-drift' ? `${single.message} — ${named} #${node.id}` : single.message
+      return { ...single, message }
+    }
+  }
+  const rowCount = nodes.reduce((sum, node) => sum + scanLoraRows(node).rows.length, 0)
+  return {
+    ok: true,
+    code: 'ok',
+    message:
+      nodes.length > 1
+        ? `Ready — ${nodes.length} targets healthy (${rowCount} row${rowCount === 1 ? '' : 's'} total).`
+        : `Ready — target has ${rowCount} row${rowCount === 1 ? '' : 's'}.`,
+    rowCount
+  }
+}
+
+/**
+ * CAPTURE (FORMAT.md §6.3 + §4). Only called after probeTargets().ok (which
+ * runs probeTarget() over every node in play), so every row here is already
+ * known to have the expected `{on, lora, strength, strengthTwo}`-ish shape.
+ * nd-super-nodes' `{enabled, strengthClip}` aliases are read (never written).
  */
 function captureRows(node) {
   const { rows } = scanLoraRows(node)
@@ -338,6 +477,17 @@ function applySetToTarget(node, setData) {
   node.setDirtyCanvas(true, true)
 }
 
+/**
+ * Multi-target APPLY (FORMAT.md §6.3 amendment): "APPLY ... applies the set
+ * to EVERY PLL." `applySetToTarget()` only READS `setData` (builds a fresh
+ * `.value` object per row; never mutates the set or any row in place), so
+ * reusing the same `setData` across every target here is safe — no cloning
+ * needed.
+ */
+function applySetToTargets(nodes, setData) {
+  for (const node of nodes) applySetToTarget(node, setData)
+}
+
 // ------------------------------------------------------------ node registration
 
 /**
@@ -376,8 +526,57 @@ export function registerControllerNode() {
         this._lastStatusMessage = ''
         this._lastHeartbeat = 0
         this._lastSetsPoll = 0
+        // Guards for the `set` combo's apply-on-select callback (file header:
+        // "Combo callbacks do NOT fire during workflow restore" finding).
+        // `_isRestoring` brackets configure() (workflow load); `_silentSetWrite`
+        // brackets our OWN programmatic `.value` writes (_setSetValueSilently).
+        // Both must be false for a set-combo change to be treated as a real
+        // user selection — see _buildWidgets()'s `set` callback.
+        this._isRestoring = false
+        this._silentSetWrite = false
+
+        // FORMAT.md §6.3: "Show status" — boolean, default false, revealed
+        // via the node's right-click Properties Panel. Must exist before
+        // _buildWidgets() runs below so the status widget's initial
+        // `.hidden` can read it. See onPropertyChanged() for the live toggle.
+        this.addProperty(PROP_SHOW_STATUS, false, 'boolean')
 
         this._guarded('build widgets', () => this._buildWidgets())
+      }
+
+      /**
+       * Brackets workflow restore in `_isRestoring` — belt-and-suspenders
+       * for the `set` combo's apply-on-select callback (file header finding:
+       * widgets_values restore already can't invoke a widget's callback on
+       * this fork, since it assigns `.value` directly rather than calling
+       * `setValue()`). `onPropertyChanged` firing here for "Show status" is
+       * fine and wanted (see that method) — this override only guards the
+       * `set` combo, nothing else.
+       */
+      configure(info) {
+        this._isRestoring = true
+        try {
+          super.configure(info)
+        } finally {
+          this._isRestoring = false
+        }
+      }
+
+      /**
+       * FORMAT.md §6.3: "Show status" node property → status widget
+       * visibility. `.hidden` is a real litegraph layout primitive on this
+       * fork (file header citations) — true hiding, not the `.disabled`
+       * value-blanking trick used elsewhere in this file. Fires on both a
+       * user edit (Properties Panel → setProperty) and a workflow load
+       * that restores a non-default value (configure()'s properties loop)
+       * — both are desired here, unlike the `set`-combo case.
+       */
+      onPropertyChanged(name, value) {
+        if (name !== PROP_SHOW_STATUS) return
+        this._guarded('Show status property changed', () => {
+          if (this._w.status) this._w.status.hidden = !value
+          this.setDirtyCanvas(true, true)
+        })
       }
 
       // ---------------------------------------------------------- lifecycle
@@ -413,7 +612,7 @@ export function registerControllerNode() {
 
       _buildWidgets() {
         // Order matters beyond layout: every serialize:false widget below
-        // (status + 4 buttons) MUST stay after every normally-serialized one
+        // (status + 3 buttons) MUST stay after every normally-serialized one
         // (target/set/name) — see the litegraph save/restore note in the
         // file header for why an interleaved order would corrupt reload.
         this._w.target = this.addWidget(
@@ -424,9 +623,23 @@ export function registerControllerNode() {
           { values: () => this._targetComboValues() }
         )
 
-        this._w.set = this.addWidget('combo', 'set', '', () => {}, {
-          values: () => this._setComboValues()
-        })
+        // Choosing a set IS the apply (FORMAT.md §6.3, owner decision
+        // 2026-07-18: the separate Apply button "was very confusing and I
+        // thought it was broken") — there is no Apply button anymore. Guard
+        // against both workflow restore and our own programmatic selects
+        // (_selectSetBySlug/_setSetValueSilently); see file header and the
+        // configure() override above for why both guards exist.
+        this._w.set = this.addWidget(
+          'combo',
+          'set',
+          '',
+          () =>
+            this._guarded('set changed', () => {
+              if (this._isRestoring || this._silentSetWrite) return
+              this._onSetSelected()
+            }),
+          { values: () => this._setComboValues() }
+        )
 
         this._w.name = this.addWidget('text', 'name', '', () => {}, {})
 
@@ -439,16 +652,21 @@ export function registerControllerNode() {
         // here. Read-only-ness is enforced the other way instead: the
         // callback immediately reverts any value the user manages to type
         // back to the last computed status message.
+        //
+        // Hidden by default (FORMAT.md §6.3: "Show status" property, default
+        // false) via `.hidden` — a real litegraph layout primitive, NOT the
+        // `.disabled` trick above; see onPropertyChanged() for the live
+        // toggle and the file header for the citations backing that choice.
         this._w.status = this.addWidget('text', 'status', '', () => {
           this._w.status.value = this._lastStatusMessage
         }, {})
         this._w.status.serialize = false
+        this._w.status.hidden = !this.properties[PROP_SHOW_STATUS]
 
-        this._w.applyBtn = this._addButton(LABEL_APPLY, () => this._onApplyClick())
         this._w.captureBtn = this._addButton(LABEL_CAPTURE, () => this._onCaptureClick())
         this._w.updateBtn = this._addButton(LABEL_UPDATE, () => this._onUpdateClick())
         this._w.deleteBtn = this._addButton(LABEL_DELETE, () => this._onDeleteClick())
-        this._actionButtons = [this._w.applyBtn, this._w.captureBtn, this._w.updateBtn, this._w.deleteBtn]
+        this._actionButtons = [this._w.captureBtn, this._w.updateBtn, this._w.deleteBtn]
 
         this._refreshTargetCombo()
         this._probeAndUpdateStatus()
@@ -463,34 +681,56 @@ export function registerControllerNode() {
         return widget
       }
 
+      /**
+       * FORMAT.md §6.3 amendment: when the graph holds >=2 PLLs, append the
+       * "All Power Lora Loaders (N)" entry (the WAN high/low dual-loader
+       * case) alongside every individual node.
+       */
       _targetComboValues() {
         const candidates = findTargetCandidates()
-        return candidates.length ? candidates.map((c) => c.label) : [PLACEHOLDER_NO_TARGET]
+        if (!candidates.length) return [PLACEHOLDER_NO_TARGET]
+        const labels = candidates.map((c) => c.label)
+        if (candidates.length >= 2) labels.push(formatAllTargetsLabel(candidates.length))
+        return labels
       }
 
       _setComboValues() {
         return this._setsCache.length ? this._setsCache.map((s) => s.label) : [PLACEHOLDER_NO_SETS]
       }
 
-      /** Auto-select when exactly one PLL exists; never guess among 2+. */
+      /**
+       * Auto-select when exactly one PLL exists; never guess among 2+ — with
+       * one exception: "All Power Lora Loaders (N)" is STICKY. Once selected
+       * it stays selected as N changes (we just rewrite the embedded count),
+       * for as long as N stays >= 2. If N drops to 1, "All" stops being
+       * offered at all and the single-PLL auto-select below takes over —
+       * same rule that has always applied to the N=1 case.
+       */
       _refreshTargetCombo() {
         const widget = this._w.target
         if (!widget) return
         const candidates = findTargetCandidates()
-        const stillValid = candidates.some((c) => c.label === widget.value)
         if (candidates.length === 0) {
           widget.value = PLACEHOLDER_NO_TARGET
-        } else if (candidates.length === 1 && !stillValid) {
+          return
+        }
+        if (candidates.length >= 2 && ALL_TARGETS_RE.test(String(widget.value || ''))) {
+          widget.value = formatAllTargetsLabel(candidates.length)
+          return
+        }
+        const stillValid = candidates.some((c) => c.label === widget.value)
+        if (candidates.length === 1 && !stillValid) {
           widget.value = candidates[0].label
         }
-        // A stale value against 2+ candidates is left alone (tolerate a
-        // target id that no longer exists — FORMAT.md §6.3 persistence
-        // note) — probeTarget() will report "not found" rather than guess.
+        // A stale value against 2+ candidates (and not in "All" mode) is
+        // left alone (tolerate a target id that no longer exists —
+        // FORMAT.md §6.3 persistence note) — probeTargets() will report
+        // "not found" rather than guess.
       }
 
       _probeAndUpdateStatus() {
-        const target = resolveTargetNode(this._w.target?.value)
-        const probe = probeTarget(target)
+        const targets = resolveTargetNodes(this._w.target?.value)
+        const probe = probeTargets(targets)
         this._lastProbe = probe
         this._lastStatusMessage = probe.message
         if (this._w.status) this._w.status.value = probe.message
@@ -543,7 +783,27 @@ export function registerControllerNode() {
 
       _selectSetBySlug(slug) {
         const entry = this._setsCache.find((s) => s.slug === slug)
-        if (entry && this._w.set) this._w.set.value = entry.label
+        if (entry) this._setSetValueSilently(entry.label)
+      }
+
+      /**
+       * The ONLY sanctioned way to write `this._w.set.value` from our own
+       * code (Capture/Update select the newly-touched set; Delete falls
+       * back to whatever is now first) — brackets the write in
+       * `_silentSetWrite` so the `set` combo's apply-on-select callback
+       * (_buildWidgets) treats it as programmatic, never a user pick, even
+       * though a plain `.value =` assignment provably can't invoke that
+       * callback on this fork anyway (file header finding). Belt-and-
+       * suspenders, same reasoning as the configure() override.
+       */
+      _setSetValueSilently(label) {
+        if (!this._w.set) return
+        this._silentSetWrite = true
+        try {
+          this._w.set.value = label
+        } finally {
+          this._silentSetWrite = false
+        }
       }
 
       _toast(severity, summary, detail) {
@@ -570,7 +830,8 @@ export function registerControllerNode() {
 
       // -------------------------------------------------------- button actions
 
-      _onApplyClick() {
+      /** Fired by the `set` combo's callback (see _buildWidgets) — not a button. */
+      _onSetSelected() {
         this._runAction('Apply set', () => this._doApply())
       }
 
@@ -606,9 +867,14 @@ export function registerControllerNode() {
         this._runAction('Delete set', () => this._doDelete())
       }
 
+      /**
+       * FORMAT.md §6.3 amendment: with "All…" selected, APPLY writes the set
+       * to every PLL — `targets` may hold 1 or N nodes, `probeTargets`/
+       * `applySetToTargets` already handle both uniformly.
+       */
       async _doApply() {
-        const target = resolveTargetNode(this._w.target?.value)
-        const probe = probeTarget(target)
+        const targets = resolveTargetNodes(this._w.target?.value)
+        const probe = probeTargets(targets)
         if (!probe.ok) {
           this._toast('warn', 'LoRA Set Controller', probe.message)
           return
@@ -619,23 +885,34 @@ export function registerControllerNode() {
           return
         }
         const full = await api.getJson('/lora_library/set', { slug: entry.slug })
-        applySetToTarget(target, full)
+        applySetToTargets(targets, full)
         this._probeAndUpdateStatus()
+        const rows = (full.loras || []).length
+        const targetDesc =
+          targets.length > 1
+            ? `${targets.length} Power Lora Loaders`
+            : `${targets[0].title || targets[0].type} #${targets[0].id}`
         this._toast(
           'success',
           'LoRA Set Controller',
-          `Applied "${full.name}" -> ${target.title || target.type} #${target.id} (${(full.loras || []).length} rows).`
+          `Applied "${full.name}" -> ${targetDesc} (${rows} row${rows === 1 ? '' : 's'} each).`
         )
       }
 
+      /**
+       * FORMAT.md §6.3 amendment: with "All…" selected, CAPTURE reads from
+       * the lowest-node-id PLL — `targets[0]` after `resolveTargetNodes()`'s
+       * ascending sort.
+       */
       async _doCapture() {
-        const target = resolveTargetNode(this._w.target?.value)
-        const probe = probeTarget(target)
+        const targets = resolveTargetNodes(this._w.target?.value)
+        const probe = probeTargets(targets)
         if (!probe.ok) {
           this._toast('warn', 'LoRA Set Controller', probe.message)
           return
         }
-        const loras = captureRows(target)
+        const source = targets[0]
+        const loras = captureRows(source)
         const name = (this._w.name?.value || '').trim() || `Set ${this._setsCache.length + 1}`
         const response = await api.postJson('/lora_library/set', {
           set: { format: 1, name, loras, trigger_words: '', notes: '' }
@@ -644,12 +921,15 @@ export function registerControllerNode() {
         announceSetsChanged()
         this._selectSetBySlug(response.slug)
         if (this._w.name) this._w.name.value = ''
-        this._toast('success', 'LoRA Set Controller', `Saved "${name}" (${loras.length} rows).`)
+        const sourceNote =
+          targets.length > 1 ? ` from ${source.title || source.type} #${source.id} (lowest id of ${targets.length})` : ''
+        this._toast('success', 'LoRA Set Controller', `Saved "${name}" (${loras.length} rows)${sourceNote}.`)
       }
 
+      /** Same lowest-node-id source rule as _doCapture() — Update is a re-capture. */
       async _doUpdate() {
-        const target = resolveTargetNode(this._w.target?.value)
-        const probe = probeTarget(target)
+        const targets = resolveTargetNodes(this._w.target?.value)
+        const probe = probeTargets(targets)
         if (!probe.ok) {
           this._toast('warn', 'LoRA Set Controller', probe.message)
           return
@@ -659,7 +939,8 @@ export function registerControllerNode() {
           this._toast('warn', 'LoRA Set Controller', 'Pick a saved set first.')
           return
         }
-        const loras = captureRows(target)
+        const source = targets[0]
+        const loras = captureRows(source)
         // Preserve the existing name/trigger_words/notes; only the rows
         // change on "Update" — best-effort GET, falls back to rows-only.
         let name = entry.name
@@ -680,7 +961,9 @@ export function registerControllerNode() {
         this._applySetsResponse(response)
         announceSetsChanged()
         this._selectSetBySlug(entry.slug)
-        this._toast('success', 'LoRA Set Controller', `Updated "${name}" (${loras.length} rows).`)
+        const sourceNote =
+          targets.length > 1 ? ` from ${source.title || source.type} #${source.id} (lowest id of ${targets.length})` : ''
+        this._toast('success', 'LoRA Set Controller', `Updated "${name}" (${loras.length} rows)${sourceNote}.`)
       }
 
       async _doDelete() {
@@ -692,7 +975,7 @@ export function registerControllerNode() {
         const response = await api.postJson('/lora_library/set/delete', { slug: entry.slug })
         this._applySetsResponse(response)
         announceSetsChanged()
-        if (this._w.set) this._w.set.value = this._setsCache[0]?.label || ''
+        this._setSetValueSilently(this._setsCache[0]?.label || '')
         this._toast('success', 'LoRA Set Controller', `Deleted "${entry.name}".`)
       }
     }

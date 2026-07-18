@@ -51,6 +51,32 @@ def _slug_options() -> list[str]:
     return ["None", *slugs]
 
 
+def _format_strength(value: float) -> str:
+    """Compact strength for §6.2 tags: ``0.8`` not ``0.8000``, ``1`` not ``1.0``."""
+    return f"{value:g}"
+
+
+def _loras_text(stack: list[tuple[str, float, float]]) -> str:
+    """FORMAT.md §6.2 ``loras_text``: the applied rows as A1111-style tags.
+
+    ``<lora:stem:strength>`` normally; ``<lora:stem:model:clip>`` when the
+    two strengths differ. ``stem`` = basename without extension, tolerant of
+    either path separator (the stack may carry this machine's spelling of a
+    set written on the other OS, FORMAT.md §4).
+    """
+    tags = []
+    for file, strength_model, strength_clip in stack:
+        stem = file.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        if strength_clip == strength_model:
+            tags.append(f"<lora:{stem}:{_format_strength(strength_model)}>")
+        else:
+            tags.append(
+                f"<lora:{stem}:{_format_strength(strength_model)}"
+                f":{_format_strength(strength_clip)}>"
+            )
+    return " ".join(tags)
+
+
 def _set_file_token(context: LibraryContext | None, slug: str) -> str:
     """The set file's mtime+size as a cache-busting token, or a missing-marker."""
     if context is None or slug in ("None", ""):
@@ -78,8 +104,8 @@ class LoraLibraryApplySet:
     """
 
     CATEGORY = "EPSNodes"
-    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK", "STRING")
-    RETURN_NAMES = ("model", "clip", "lora_stack", "trigger_words")
+    RETURN_TYPES = ("MODEL", "CLIP", "LORA_STACK", "STRING", "STRING")
+    RETURN_NAMES = ("model", "clip", "lora_stack", "trigger_words", "loras_text")
     FUNCTION = "apply"
 
     @classmethod
@@ -121,23 +147,23 @@ class LoraLibraryApplySet:
         strength_scale: float,
         model: Any = None,
         clip: Any = None,
-    ) -> tuple[Any, Any, list[tuple[str, float, float]], str]:
+    ) -> tuple[Any, Any, list[tuple[str, float, float]], str, str]:
         if set in ("None", ""):
-            return model, clip, [], ""
+            return model, clip, [], "", ""
 
         context = _context
         if context is None:
             logger.warning("lora_library: Apply LoRA Set has no context configured; passthrough")
-            return model, clip, [], ""
+            return model, clip, [], "", ""
 
         try:
             set_data = sets_store.load_set(context, set)
         except sets_store.SetValidationError as exc:
             logger.warning("lora_library: set %r could not be loaded (%s); passthrough", set, exc)
-            return model, clip, [], ""
+            return model, clip, [], "", ""
         if set_data is None:
             logger.warning("lora_library: set %r has no file on disk; passthrough", set)
-            return model, clip, [], ""
+            return model, clip, [], "", ""
 
         stack: list[tuple[str, float, float]] = []
         for row in set_data["loras"]:
@@ -160,7 +186,7 @@ class LoraLibraryApplySet:
         if model is not None or clip is not None:
             model, clip = self._apply_stack(context, model, clip, stack)
 
-        return model, clip, stack, set_data["trigger_words"]
+        return model, clip, stack, set_data["trigger_words"], _loras_text(stack)
 
     @staticmethod
     def _apply_stack(

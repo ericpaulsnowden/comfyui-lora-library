@@ -53,12 +53,19 @@ genuine, untouched
 elsewhere in your graph — rgthree stays the loader; this node just moves
 whole configurations in and out of it:
 
-- **Capture target → new set** reads the loader's current rows (which
-  loras, order, on/off, strengths) into a named set file.
-- **Apply set → target** rewrites the loader to match a saved set exactly —
-  row count, order, toggles, strengths — one dropdown pick + one click to
-  swap your whole lora setup. Update/Delete manage existing sets (delete is
-  two-click confirmed).
+- **Picking a set applies it.** The `set` dropdown *is* the switch: choose
+  a set and the target loader's rows snap to it — count, order, toggles,
+  strengths. (Reloading a saved workflow never re-applies; only a real
+  selection does.)
+- **Capture target → new set** reads the loader's current rows into a named
+  set file; Update/Delete manage existing sets (delete is two-click
+  confirmed).
+- **Multi-loader targeting:** with two or more Power Lora Loaders in the
+  graph (WAN high/low noise, for example) the target dropdown offers
+  `All Power Lora Loaders (N)` — one set pick updates every loader;
+  capture reads from the lowest-numbered one.
+- A debug `status` line is hidden by default — right-click the node →
+  Properties → `Show status` to reveal it.
 - It's a frontend-only virtual node: it never executes and can't block a
   queue. If rgthree isn't installed (or its internals ever drift), the node
   disables itself with a message and points you at `Apply LoRA Set`, which
@@ -77,6 +84,10 @@ you wire through. Outputs:
   from other packs.
 - `trigger_words` — the set's stored trigger words, ready to concatenate
   into a prompt.
+- `loras_text` — what was applied, as readable A1111-style tags:
+  `<lora:detailer:0.8> <lora:film_grain:1>` (dual
+  `<lora:name:model:clip>` form when the clip strength differs; strengths
+  reflect `strength_scale`). Wire it into captions, filenames, or notes.
 
 `strength_scale` multiplies every applied strength (quick global A/B).
 Sets are JSON files in `<library folder>/sets/` — created via the API or
