@@ -151,11 +151,16 @@ One JSON file per set: `<library_dir>/sets/<slug>.json`, UTF-8, format:
   clear "update the pack" error and tolerate missing optional fields.
 - `loras[]` order **is** application order (reordering is a first-class
   feature). `file` holds the lora exactly as ComfyUI lists it
-  (`folder_paths.get_filename_list("loras")` — forward slashes). Resolution
-  at apply time: exact match first, then unique basename match (rgthree-style
-  leniency for cross-machine subfolder differences); a lora that still
-  doesn't resolve is SKIPPED WITH A LOGGED WARNING — a missing file must
-  not fail the whole run.
+  (`folder_paths.get_filename_list("loras")`) — NOTE that ComfyUI uses the
+  OS's native separator there, so a set written on Windows carries `\` and
+  one written on macOS carries `/`. Resolution at apply time is therefore
+  SEPARATOR-INSENSITIVE and returns the INSTALLED spelling for this
+  machine: exact match after normalizing both sides' separators to `/`
+  first, then unique basename match (rgthree-style leniency for
+  cross-machine subfolder differences; basename = last segment across
+  either separator); a lora that still doesn't resolve — including an
+  AMBIGUOUS basename — is SKIPPED WITH A LOGGED WARNING — a missing file
+  must not fail the whole run.
 - `on: false` rows are kept (they round-trip through the UI) but not applied.
 - `strength_clip: null` means "use `strength` for both model and clip"
   (parity with rgthree's single-strength mode).

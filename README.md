@@ -19,10 +19,32 @@ Two capabilities, one pack, no dependencies:
   the `LoRA Set Controller` drives it directly — capture its current rows as
   a set, apply a set back, reorder included.
 
-> **Status: pre-release scaffolding.** The file formats, routes, and node
-> contracts are specified in [docs/FORMAT.md](docs/FORMAT.md); nodes are
-> landing feature by feature. This README describes each capability only
-> once it actually ships.
+> **Status: pre-release, shipping feature by feature.** Available today:
+> **Apply LoRA Set** (below). The Notebook node and the rgthree Set
+> Controller are in development. Contracts live in
+> [docs/FORMAT.md](docs/FORMAT.md); this README describes each capability
+> only once it actually ships.
+
+## Apply LoRA Set (shipped)
+
+`LoRA Library → Apply LoRA Set`: pick a set from the dropdown and every
+enabled lora in it is applied **in the set's order** to the `model`/`clip`
+you wire through. Outputs:
+
+- `model`, `clip` — patched (or passed through untouched on `"None"`).
+- `lora_stack` — a `LORA_STACK` list compatible with stack-consuming nodes
+  from other packs.
+- `trigger_words` — the set's stored trigger words, ready to concatenate
+  into a prompt.
+
+`strength_scale` multiplies every applied strength (quick global A/B).
+Sets are JSON files in `<library folder>/sets/` — created via the API or
+(soon) captured from a Power Lora Loader; hand-editing is fine too. Loras
+referenced by a set resolve **separator-insensitively** with a unique-
+basename fallback, so a set written on Windows applies on macOS and vice
+versa; anything that can't resolve is skipped with a logged warning rather
+than failing the run. After creating sets outside the graph, press `R`
+(refresh node definitions) to update an open dropdown.
 
 ## Install
 

@@ -98,7 +98,7 @@ def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
             return error_response(403, "library folder can only be changed locally — FORMAT.md §2")
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001 - malformed body is a client error
+        except Exception:
             return error_response(400, "body must be JSON")
         raw = str(body.get("library_dir") or "").strip()
         config = context.load_config()
@@ -135,7 +135,7 @@ def build_routes(context: LibraryContext) -> web.RouteTableDef:
         try:
             module = __import__(f"{__package__}.{module_name}", fromlist=["register"])
             module.register(context, routes)
-        except Exception:  # noqa: BLE001 - skip the feature, keep the rest
+        except Exception:
             logger.exception("lora_library: route module %s failed to load", module_name)
     return routes
 

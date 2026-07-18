@@ -1,0 +1,253 @@
+"""Tests for the FORMAT.md §5 set routes, through
+``lora_library.routes.build_routes`` (no ComfyUI) and aiohttp's own test
+client (``aiohttp_client``, from the ``pytest-aiohttp`` plugin).
+
+``build_routes`` also tries to import ``routes_notebook`` (a parallel
+workstream's file) and, per its own defensive try/except, logs and skips it
+if that module isn't present yet or fails to import — expected noise in
+this file's test output, not a failure of anything owned here. These tests
+never assert on that log one way or the other, so they pass regardless of
+whether ``routes_notebook.py`` exists yet.
+"""
+
+from __future__ import annotations
+
+from aiohttp import web
+
+from lora_library.context import LibraryContext
+from lora_library.routes import build_routes
+
+
+def make_app(context: LibraryContext) -> web.Application:
+    app = web.Application()
+    app.add_routes(build_routes(context))
+    return app
+
+
+# -------------------------------------------------------------- GET /sets
+
+
+async def test_get_sets_empty(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.get("/lora_library/sets")
+    assert resp.status == 200
+    assert await resp.json() == {"sets": []}
+
+
+async def test_get_sets_reflects_saved_sets_sorted_by_name(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/set", json={"set": {"name": "Zebra", "loras": []}})
+    await client.post("/lora_library/set", json={"set": {"name": "Apple", "loras": []}})
+
+    resp = await client.get("/lora_library/sets")
+    body = await resp.json()
+    assert [s["name"] for s in body["sets"]] == ["Apple", "Zebra"]
+
+
+# -------------------------------------------------------------- POST /set
+
+
+async def test_post_set_creates_and_derives_slug(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/set",
+        json={
+            "set": {
+                "name": "Cinematic portrait",
+                "loras": [{"file": "detailer.safetensors", "strength": 0.8}],
+                "trigger_words": "cinematic",
+            }
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["slug"] == "cinematic-portrait"
+    assert [s["slug"] for s in body["sets"]] == ["cinematic-portrait"]
+
+
+async def test_post_set_repeated_name_gets_collision_suffix(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    first = await client.post("/lora_library/set", json={"set": {"name": "Foo", "loras": []}})
+    second = await client.post("/lora_library/set", json={"set": {"name": "Foo", "loras": []}})
+    assert (await first.json())["slug"] == "foo"
+    assert (await second.json())["slug"] == "foo-2"
+
+
+async def test_post_set_with_explicit_slug_updates_in_place(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    created = await client.post("/lora_library/set", json={"set": {"name": "Foo", "loras": []}})
+    slug = (await created.json())["slug"]
+
+    updated = await client.post(
+        "/lora_library/set",
+        json={"slug": slug, "set": {"name": "Foo Renamed", "loras": []}},
+    )
+    assert updated.status == 200
+    body = await updated.json()
+    assert body["slug"] == slug  # explicit slug is stable across a rename
+    assert len(body["sets"]) == 1  # updated in place, not duplicated
+
+    fetched = await client.get("/lora_library/set", params={"slug": slug})
+    assert (await fetched.json())["name"] == "Foo Renamed"
+
+
+async def test_post_set_malformed_json_body_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/set", data="not json", headers={"Content-Type": "application/json"}
+    )
+    assert resp.status == 400
+    assert "error" in await resp.json()
+
+
+async def test_post_set_non_object_body_is_400(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/set", json=["not", "an", "object"])
+    assert resp.status == 400
+
+
+async def test_post_set_missing_set_key_is_400(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/set", json={})
+    assert resp.status == 400
+    assert "error" in await resp.json()
+
+
+async def test_post_set_invalid_slug_in_body_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/set",
+        json={"slug": "Not A Valid Slug!", "set": {"name": "Foo", "loras": []}},
+    )
+    assert resp.status == 400
+    assert "error" in await resp.json()
+
+
+async def test_post_set_invalid_set_payload_is_400_with_clear_message(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/set", json={"set": {"name": "x", "loras": "nope"}})
+    assert resp.status == 400
+    body = await resp.json()
+    assert "loras" in body["error"]
+
+
+async def test_post_set_format_too_new_is_400_and_mentions_update_the_pack(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/set", json={"set": {"format": 2, "name": "x", "loras": []}}
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert "update the pack" in body["error"]
+
+
+# --------------------------------------------------------------- GET /set
+
+
+async def test_get_set_returns_full_shape_plus_slug(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/set",
+        json={
+            "set": {
+                "name": "Foo",
+                "loras": [{"file": "detailer.safetensors", "strength": 0.8}],
+                "trigger_words": "foo, bar",
+                "notes": "hello",
+            }
+        },
+    )
+    resp = await client.get("/lora_library/set", params={"slug": "foo"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["slug"] == "foo"
+    assert body["name"] == "Foo"
+    assert body["format"] == 1
+    assert body["trigger_words"] == "foo, bar"
+    assert body["notes"] == "hello"
+    assert body["loras"] == [
+        {"file": "detailer.safetensors", "on": True, "strength": 0.8, "strength_clip": None}
+    ]
+
+
+async def test_get_set_unknown_slug_is_404(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.get("/lora_library/set", params={"slug": "does-not-exist"})
+    assert resp.status == 404
+    assert "error" in await resp.json()
+
+
+async def test_get_set_invalid_slug_is_400(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.get("/lora_library/set", params={"slug": "Not Valid!"})
+    assert resp.status == 400
+
+
+async def test_get_set_missing_slug_query_param_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.get("/lora_library/set")
+    assert resp.status == 400
+
+
+# ---------------------------------------------------------- POST /set/delete
+
+
+async def test_post_set_delete_removes_and_returns_fresh_list(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/set", json={"set": {"name": "Foo", "loras": []}})
+
+    resp = await client.post("/lora_library/set/delete", json={"slug": "foo"})
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["sets"] == []
+
+    missing = await client.get("/lora_library/set", params={"slug": "foo"})
+    assert missing.status == 404
+
+
+async def test_post_set_delete_unknown_slug_is_404(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/set/delete", json={"slug": "does-not-exist"})
+    assert resp.status == 404
+
+
+async def test_post_set_delete_invalid_slug_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/set/delete", json={"slug": "Not Valid!"})
+    assert resp.status == 400
+
+
+async def test_post_set_delete_missing_slug_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/set/delete", json={})
+    assert resp.status == 400

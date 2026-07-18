@@ -10,6 +10,7 @@ comfyui-photoshop-bridge's ``cpsb/context.py``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -66,7 +67,9 @@ class LibraryContext:
         except FileNotFoundError:
             return {}
         except (OSError, json.JSONDecodeError) as exc:
-            logger.warning("lora_library: unreadable %s (%s); using defaults", self._config_path, exc)
+            logger.warning(
+                "lora_library: unreadable %s (%s); using defaults", self._config_path, exc
+            )
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -122,8 +125,6 @@ def _atomic_write_text(path: Path, text: str) -> None:
             fh.write(text)
         os.replace(tmp_name, path)
     except BaseException:
-        try:
+        with contextlib.suppress(OSError):
             os.unlink(tmp_name)
-        except OSError:
-            pass
         raise

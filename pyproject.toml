@@ -1,7 +1,7 @@
 [project]
 name = "comfyui-lora-library"
 description = "A file-backed LoRA notebook and switchable LoRA sets for ComfyUI: keep prompts, trigger words, and whole lora configurations in plain files you can share across machines (including a NAS)."
-version = "0.1.0"
+version = "0.2.0"
 license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,3 +38,7 @@ select = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Without confcutdir, pytest's Package collection imports the repo-root
+# __init__.py (ComfyUI's entry point, needs folder_paths) and every run dies
+# outside ComfyUI. Scoping collection to tests/ keeps `pytest` runnable as-is.
+addopts = "--confcutdir=tests"
