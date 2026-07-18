@@ -19,11 +19,29 @@ Two capabilities, one pack, no dependencies:
   the `LoRA Set Controller` drives it directly — capture its current rows as
   a set, apply a set back, reorder included.
 
-> **Status: pre-release, shipping feature by feature.** Available today:
-> **Apply LoRA Set** and the **LoRA Set Controller** (below). The Notebook
-> node is in final assembly. Contracts live in
-> [docs/FORMAT.md](docs/FORMAT.md); this README describes each capability
-> only once it actually ships.
+> **Status: pre-release. All three capabilities ship today:** the **LoRA
+> Notebook**, **Apply LoRA Set**, and the **LoRA Set Controller** (each
+> described below). Contracts live in [docs/FORMAT.md](docs/FORMAT.md).
+
+## LoRA Notebook (shipped)
+
+`LoRA Library → LoRA Notebook`: a two-pane editor inside the node — entry
+list on the left (grouped by `# Category` headings, with `＋ New` /
+`🗑 Delete`), a flexible text editor + `Save` on the right. The selected
+entry's text is the node's `STRING` output.
+
+- **Plain Markdown, yours:** one `## Entry Name` per entry in a file you
+  point the node at — relative names live in the library folder, absolute
+  paths (including NAS shares) work as-is. Edit it in ComfyUI, VS Code, or
+  on the other machine; the node re-reads the file every run, so external
+  edits are picked up automatically (`IS_CHANGED` hashes the file).
+- **Safe for shared files:** saving checks the file hasn't changed under
+  you since you loaded it. If it has (the other machine got there first),
+  nothing is written — you get *File changed on disk* with **Reload** /
+  **Overwrite** to resolve it yourself. Writes are atomic, and the file's
+  existing CRLF/LF style is preserved so cross-OS diffs stay clean.
+- The workflow stores only the file path + selected entry name — never the
+  text. The file is the truth; the node is a view.
 
 ## LoRA Set Controller (shipped; requires rgthree-comfy)
 
