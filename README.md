@@ -20,10 +20,31 @@ Two capabilities, one pack, no dependencies:
   a set, apply a set back, reorder included.
 
 > **Status: pre-release, shipping feature by feature.** Available today:
-> **Apply LoRA Set** (below). The Notebook node and the rgthree Set
-> Controller are in development. Contracts live in
+> **Apply LoRA Set** and the **LoRA Set Controller** (below). The Notebook
+> node is in final assembly. Contracts live in
 > [docs/FORMAT.md](docs/FORMAT.md); this README describes each capability
 > only once it actually ships.
+
+## LoRA Set Controller (shipped; requires rgthree-comfy)
+
+`LoRA Library → LoRA Set Controller`: a small panel node that drives a
+genuine, untouched
+[Power Lora Loader (rgthree)](https://github.com/rgthree/rgthree-comfy)
+elsewhere in your graph — rgthree stays the loader; this node just moves
+whole configurations in and out of it:
+
+- **Capture target → new set** reads the loader's current rows (which
+  loras, order, on/off, strengths) into a named set file.
+- **Apply set → target** rewrites the loader to match a saved set exactly —
+  row count, order, toggles, strengths — one dropdown pick + one click to
+  swap your whole lora setup. Update/Delete manage existing sets (delete is
+  two-click confirmed).
+- It's a frontend-only virtual node: it never executes and can't block a
+  queue. If rgthree isn't installed (or its internals ever drift), the node
+  disables itself with a message and points you at `Apply LoRA Set`, which
+  needs no dependencies.
+- Every `Apply LoRA Set` dropdown refreshes automatically after any
+  capture/update/delete — no page reload.
 
 ## Apply LoRA Set (shipped)
 

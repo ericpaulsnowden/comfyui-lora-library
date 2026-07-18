@@ -1,13 +1,705 @@
 /**
- * @file LoRA Set Controller — frontend-only virtual node (FORMAT.md §6.3)
- * that drives a genuine `Power Lora Loader (rgthree)`. STUB: implemented by
- * the controller workstream; the entry file already calls this hook.
+ * @file LoRA Set Controller — frontend-only virtual node (FORMAT.md §6.3) that
+ * drives a genuine, untouched `Power Lora Loader (rgthree)` node elsewhere in
+ * the graph. Registered purely in JS (like core's MarkdownNote/NoteNode) —
+ * never executes, never appears in the API prompt.
+ *
+ * This file binds to rgthree internals it does not own. Every binding is
+ * cited below with the exact file + lines read (rgthree-comfy's COMPILED
+ * `web/comfyui/power_lora_loader.js`, since that's what actually runs — not
+ * the TS source), plus the ComfyUI_frontend litegraph fork that governs
+ * widget/serialize mechanics. `VERIFY(live)` marks anything that could differ
+ * on the version actually installed on Eric's rig — see the final report for
+ * the consolidated risk list.
+ *
+ * Key rgthree bindings (rgthree-comfy/web/comfyui/power_lora_loader.js):
+ *  - Node type string: `"Power Lora Loader (rgthree)"` — constants.js
+ *    `addRgthree("Power Lora Loader")` (lines 2-4, 36).
+ *  - Row widgets are named `lora_<n>` via `addNewLoraWidget()` (lines 85-94);
+ *    `<n>` comes from a counter that only increments (never reuses numbers
+ *    after a row is removed), so row names are NOT necessarily contiguous —
+ *    we identify rows by name-pattern + value-shape, never by parsing/relying
+ *    on the numeric suffix, and never by assuming a fixed count.
+ *  - Row value shape: `{on, lora, strength, strengthTwo}` (DEFAULT_LORA_WIDGET_DATA,
+ *    lines 352-357); the `value` setter (lines 386-395) does a plain
+ *    `this._value = v` assignment — confirms whole-object assignment
+ *    (`widget.value = {...}`) is safe and is in fact the exact pattern
+ *    rgthree's own `configure()` uses when restoring rows from a workflow
+ *    (lines 65-70: `const widget = this.addNewLoraWidget(); widget.value = {...widgetValue}`).
+ *  - Single vs dual strength mode is a per-NODE property, not per-row:
+ *    `node.properties["Show Strengths"]` (constants at lines 15-20; default
+ *    set at line 28), consumed at draw time at line 405
+ *    (`currentShowModelAndClip = node.properties[...] === "Separate Model & Clip"`).
+ *  - Resize-after-mutate: rgthree's own "+ Add Lora" button handler (lines
+ *    99-113) does `computeSize()` then `size[1] = Math.max(..., computed[1])`
+ *    then `setDirtyCanvas(true, true)`. We follow the simpler `onNodeCreated`
+ *    variant (lines 78-83, `Math.max(this.size[N], computed[N])`) rather than
+ *    the `configure()`-only `_tempHeight` fallback (line 73), because
+ *    `_tempHeight`/`_tempWidth` are only ever set inside `configure()` (line
+ *    63-64) and may not exist on a node that was only ever built via manual
+ *    "+ Add Lora" clicks.
+ *  - Row removal: rgthree's own context-menu "🗑️ Remove" handler (lines
+ *    201-206) calls `removeArrayItem(this.widgets, widget)`, a plain splice
+ *    helper (rgthree-comfy/web/common/shared_utils.js:111-114 —
+ *    `arr.splice(arr.indexOf(item), 1)`, no side effects). We do not import
+ *    that internal helper (it is not a stable public surface for another
+ *    node pack to depend on); instead we call the official LiteGraph
+ *    `LGraphNode.prototype.removeWidget(widget)` API, which a genuine PLL
+ *    instance always inherits. See VERIFY(live) note at applySetToTarget().
+ *
+ * Key ComfyUI_frontend litegraph bindings (src/lib/litegraph/src/):
+ *  - `LGraphNode.removeWidget(widget)` (LGraphNode.ts:2037-2058) takes a
+ *    WIDGET REFERENCE and throws `'Widget not found on this node'` if it
+ *    can't find it via `indexOf` — it does NOT accept a numeric index,
+ *    despite rgthree's OWN internal `configure()` calling `this.removeWidget(0)`
+ *    in a loop (power_lora_loader.js:57-58). VERIFY(live): that suggests
+ *    either version skew (an older/looser litegraph rgthree was built
+ *    against) or that rgthree's own teardown loop is fragile on current
+ *    frontends — not our problem to fix, but it means we must ALWAYS pass a
+ *    real widget object, never an index, which is what we do.
+ *  - Two distinct, similarly-named "serialize" flags (types/widgets.ts:62-66,
+ *    434-441; confirmed by an explicit code comment in
+ *    src/utils/executionUtil.ts:96-98): `widget.serialize` (top-level on the
+ *    widget instance) controls inclusion in the saved workflow's
+ *    `widgets_values` (LGraphNode.ts:986); `widget.options.serialize`
+ *    controls inclusion in the API execution prompt only. rgthree's button
+ *    pattern `addWidget("button", ..., {serialize:false})`
+ *    (fast_actions_button.js:24) sets the LATTER, not the former — it does
+ *    NOT keep a button out of `widgets_values` on this fork. We therefore set
+ *    `widget.serialize = false` directly on the widget objects `addWidget`
+ *    returns (see `_addButton`/status widget below). Moot for prompt
+ *    inclusion either way since `isVirtualNode` nodes are stripped from the
+ *    API prompt wholesale (executionUtil.ts:37-39, 86-91).
+ *  - Save/restore ordering hazard (LGraphNode.ts:912-936 restore vs 982-994
+ *    save): save writes `widgets_values[i]` at each widget's OWN index and
+ *    leaves a hole where `serialize===false`; restore instead walks a
+ *    SEPARATE counter that only advances past non-skipped widgets. These two
+ *    only agree if every `serialize:false` widget sits AFTER every normally
+ *    serialized widget — an interleaved layout would misread values on
+ *    reload. This is why `target`/`set`/`name` are declared first and
+ *    `status` + all 4 buttons (all `serialize:false`) are declared last.
+ *    Do not reorder without re-checking this.
+ *  - `ComboWidget` supports `options.values` as a function
+ *    (ComboWidget.ts:59-64, `getValues()`) — but it's deprecated as of
+ *    v0.14.5 and logs a console warning on every dropdown open
+ *    (ComboWidget.ts:126-135: "Using a function for values is deprecated.").
+ *    It is still fully functional (this is the same pattern the deprecation
+ *    message itself cites from ComfyUI-KJNodes), so we use it for `target`
+ *    (cheap, pure in-memory graph scan — safe to re-run on every call) and
+ *    for `set` (backed by a manually-refreshed cache, never a network call
+ *    from inside the values function itself). VERIFY(live): a future
+ *    litegraph release could remove this path outright.
+ *  - `LiteGraph`/`LGraphNode` are ambient globals in real, currently-shipping
+ *    custom-node JS (not importable via any stable path from a node pack's
+ *    own web dir) — confirmed by rgthree's OWN shipped code using them
+ *    unimported: `LiteGraph.ContextMenu`/`LiteGraph.WIDGET_TEXT_COLOR` in
+ *    power_lora_loader.js, `LiteGraph.NODE_WIDGET_HEIGHT` in bookmark.js:34,
+ *    `LiteGraph.registerNodeType` in node_collector.js/base_node.js. Prior
+ *    art for virtual-node registration itself: ComfyUI_frontend's
+ *    `src/extensions/core/noteNode.ts` (`class X extends LGraphNode`,
+ *    `this.isVirtualNode = true`, `LiteGraph.registerNodeType(name, X)`).
  */
+
+import { app } from '../../../scripts/app.js'
+import * as api from './api.js'
+
+// ---------------------------------------------------------------- constants
+
+const NODE_TYPE = 'LoraLibrarySetController'
+const NODE_TITLE = 'LoRA Set Controller'
+const NODE_CATEGORY = 'LoRA Library'
+
+/** Exact rgthree type/title/comfyClass string — constants.js addRgthree("Power Lora Loader"). */
+const POWER_LORA_LOADER_TYPE = 'Power Lora Loader (rgthree)'
+/** Per-node property (not per-row) that picks single vs dual strength mode. */
+const PROP_SHOW_STRENGTHS = 'Show Strengths'
+const PROP_SHOW_STRENGTHS_DUAL = 'Separate Model & Clip'
+/** rgthree row widgets are named lora_<counter>; counter never reuses numbers. */
+const LORA_ROW_NAME_RE = /^lora_\d+$/
+
+const LABEL_APPLY = 'Apply set → target'
+const LABEL_CAPTURE = 'Capture target → new set'
+const LABEL_UPDATE = 'Update set (overwrite)'
+const LABEL_DELETE = 'Delete set'
+const LABEL_DELETE_CONFIRM = 'Really delete?'
+const DELETE_CONFIRM_MS = 4000
+
+/** onDrawForeground fires on every canvas redraw; throttle our own work. */
+const HEARTBEAT_MIN_MS = 1000
+const SETS_POLL_MS = 4000
+/** Belt-and-suspenders cap so a future rgthree shape change can never spin us forever. */
+const MAX_ROW_ADJUST_STEPS = 500
+
+const PLACEHOLDER_NO_TARGET = '(none found)'
+const PLACEHOLDER_NO_SETS = '(no sets saved)'
+
+const MSG_NO_RGTHREE = 'Install rgthree-comfy, or use Apply LoRA Set instead'
+const MSG_SHAPE_DRIFT = 'Power Lora Loader internals changed — controller disabled (v-check)'
+const MSG_NO_TARGET_IN_GRAPH =
+  'No Power Lora Loader (rgthree) node in this graph yet — add one, then pick it above.'
+const MSG_NO_TARGET_SELECTED = 'Pick a target Power Lora Loader node above.'
+
+// ------------------------------------------------------- pure graph helpers
+// (No `this` — these only ever read/write a passed-in node, so probe/capture/
+// apply can be reasoned about and, if needed, exercised independently of the
+// widget/UI plumbing below.)
+
+/** Every live `Power Lora Loader (rgthree)` instance in the current graph. */
+function findTargetCandidates() {
+  const nodes = app.graph?._nodes || app.graph?.nodes || []
+  const out = []
+  for (const node of nodes) {
+    if (node && node.type === POWER_LORA_LOADER_TYPE) {
+      out.push({ id: node.id, node, label: `${node.title || node.type} #${node.id}` })
+    }
+  }
+  return out
+}
+
+/** Resolve a combo label ("<title> #<id>") back to a live node, or null. */
+function resolveTargetNode(label) {
+  if (!label) return null
+  const match = /#(-?\d+)\s*$/.exec(String(label))
+  if (!match) return null
+  const id = match[1]
+  const nodes = app.graph?._nodes || app.graph?.nodes || []
+  return nodes.find((n) => n && String(n.id) === id && n.type === POWER_LORA_LOADER_TYPE) || null
+}
+
+/**
+ * Scan a target's widgets for lora rows. `named` = everything that LOOKS like
+ * a row by name (FORMAT.md §6.3: `/^lora_\d+$/`); `rows` = the subset whose
+ * `.value` is actually an object with a `lora` key. `named.length !== rows.length`
+ * is the shape-drift signal (a row-shaped name with a value that doesn't look
+ * like rgthree's row shape) — zero rows found at all is a normal, healthy
+ * "empty PLL", not drift.
+ */
+function scanLoraRows(node) {
+  const named = []
+  const rows = []
+  const widgets = (node && node.widgets) || []
+  for (const widget of widgets) {
+    if (!widget || typeof widget.name !== 'string' || !LORA_ROW_NAME_RE.test(widget.name)) continue
+    named.push(widget)
+    const v = widget.value
+    if (v && typeof v === 'object' && 'lora' in v) rows.push(widget)
+  }
+  return { named, rows }
+}
+
+/**
+ * Single feature-detection gate every rgthree interaction goes through
+ * (FORMAT.md §6.3: "probe first, mutate after"). Never partially mutates
+ * anything — it only reads.
+ */
+function probeTarget(node) {
+  const rgthreeInstalled =
+    typeof LiteGraph !== 'undefined' &&
+    !!(LiteGraph.registered_node_types && LiteGraph.registered_node_types[POWER_LORA_LOADER_TYPE])
+  if (!rgthreeInstalled) {
+    return { ok: false, code: 'no-rgthree', message: MSG_NO_RGTHREE }
+  }
+  if (!node) {
+    const hasAny = findTargetCandidates().length > 0
+    return {
+      ok: false,
+      code: hasAny ? 'no-target-selected' : 'no-target-in-graph',
+      message: hasAny ? MSG_NO_TARGET_SELECTED : MSG_NO_TARGET_IN_GRAPH
+    }
+  }
+  if (node.type !== POWER_LORA_LOADER_TYPE) {
+    return { ok: false, code: 'wrong-type', message: MSG_NO_TARGET_SELECTED }
+  }
+  // Capability check, not a version check (FORMAT.md §6.3: "feature detection,
+  // not version pinning"). addNewLoraWidget is rgthree's own row-add method
+  // (power_lora_loader.js:85-94); removeWidget/computeSize are standard
+  // LGraphNode API every genuine node inherits.
+  if (
+    typeof node.addNewLoraWidget !== 'function' ||
+    typeof node.removeWidget !== 'function' ||
+    typeof node.computeSize !== 'function' ||
+    !Array.isArray(node.widgets)
+  ) {
+    return { ok: false, code: 'shape-drift', message: MSG_SHAPE_DRIFT }
+  }
+  const { named, rows } = scanLoraRows(node)
+  if (named.length !== rows.length) {
+    return { ok: false, code: 'shape-drift', message: MSG_SHAPE_DRIFT }
+  }
+  return {
+    ok: true,
+    code: 'ok',
+    message: `Ready — target has ${rows.length} row${rows.length === 1 ? '' : 's'}.`,
+    rowCount: rows.length
+  }
+}
+
+/**
+ * CAPTURE (FORMAT.md §6.3 + §4). Only called after probeTarget().ok, so every
+ * row here is already known to have the expected `{on, lora, strength,
+ * strengthTwo}`-ish shape. nd-super-nodes' `{enabled, strengthClip}` aliases
+ * are read (never written).
+ */
+function captureRows(node) {
+  const { rows } = scanLoraRows(node)
+  const out = []
+  for (const widget of rows) {
+    const v = widget.value
+    if (v.lora == null || v.lora === 'None') continue
+    out.push({
+      file: v.lora,
+      on: v.on ?? v.enabled ?? true,
+      strength: v.strength ?? 1,
+      strength_clip: (v.strengthTwo ?? v.strengthClip) ?? null
+    })
+  }
+  return out
+}
+
+/**
+ * APPLY (FORMAT.md §6.3). Rewrites `node`'s rows to match `setData.loras`
+ * exactly: count, order, on/off, strengths. Missing-on-this-machine loras are
+ * still written (rgthree shows its own missing-lora state — that's the
+ * user's ground truth, not ours to hide).
+ *
+ * Single vs dual strength decision (documented per the task's explicit ask):
+ * `strength_clip: null` only becomes a real `strengthTwo` value when the
+ * TARGET NODE is currently in dual mode (`properties["Show Strengths"] ===
+ * "Separate Model & Clip"`, power_lora_loader.js:15-20/28/405). In single
+ * mode we leave `strengthTwo: null` untouched rather than inventing a value —
+ * we deliberately do NOT flip the target's mode to fit the set; the property
+ * is the target's own presentation choice, not something a set should
+ * override. This means a set captured in dual mode can lose visible
+ * per-clip-strength fidelity if applied to a target left in single mode;
+ * that's accepted, spec'd behavior, not a bug.
+ */
+/**
+ * Announce a set CRUD to the rest of the pack (FORMAT.md §7.4) — sets.js
+ * listens and refreshes every Apply LoRA Set combo. A DOM event rather than
+ * an import keeps the two modules decoupled: either can ship/fail alone.
+ */
+function announceSetsChanged() {
+  try {
+    window.dispatchEvent(new CustomEvent('lora_library:sets-changed'))
+  } catch {
+    // Announcement is a nicety; CRUD success must not depend on it.
+  }
+}
+
+function applySetToTarget(node, setData) {
+  const desired = Array.isArray(setData?.loras) ? setData.loras : []
+  const dualMode = !!(node.properties && node.properties[PROP_SHOW_STRENGTHS] === PROP_SHOW_STRENGTHS_DUAL)
+
+  let { rows: current } = scanLoraRows(node)
+  let steps = 0
+  // Grow: rgthree's own addNewLoraWidget() (power_lora_loader.js:85-94) both
+  // creates the widget AND repositions it just before the "+ Add Lora"
+  // button spacer — no extra bookkeeping needed on our side.
+  while (current.length < desired.length && steps++ < MAX_ROW_ADJUST_STEPS) {
+    node.addNewLoraWidget()
+    current = scanLoraRows(node).rows
+  }
+  // Shrink: remove extras from the tail via the official LGraphNode API
+  // (ComfyUI_frontend src/lib/litegraph/src/LGraphNode.ts:2037-2058), which
+  // takes a WIDGET REFERENCE (not an index — VERIFY(live), see file header).
+  // Every remaining row's `.value` gets fully overwritten below regardless,
+  // so which specific rows we drop doesn't matter — tail-removal is simplest.
+  steps = 0
+  while (current.length > desired.length && steps++ < MAX_ROW_ADJUST_STEPS) {
+    const widget = current.pop()
+    try {
+      node.removeWidget(widget)
+    } catch (error) {
+      const idx = node.widgets.indexOf(widget)
+      if (idx !== -1) node.widgets.splice(idx, 1)
+    }
+  }
+
+  // Whole-object assignment through the widget's `value` setter — the same
+  // pattern rgthree's own configure() uses (power_lora_loader.js:65-70,
+  // 386-395), so getLoraInfo() etc. fire exactly as they would on workflow load.
+  current = scanLoraRows(node).rows
+  for (let i = 0; i < desired.length; i++) {
+    const row = desired[i] || {}
+    current[i].value = {
+      on: row.on ?? true,
+      lora: row.file,
+      strength: row.strength ?? 1,
+      strengthTwo: dualMode ? (row.strength_clip ?? row.strength ?? 1) : null
+    }
+  }
+
+  // Redraw/resize exactly as rgthree's own onNodeCreated (power_lora_loader.js:78-83) —
+  // not the configure()-only `_tempHeight` fallback (line 73), which may not
+  // exist on a node that was only ever built via "+ Add Lora" clicks.
+  const computed = node.computeSize()
+  node.size[0] = Math.max(node.size[0], computed[0])
+  node.size[1] = Math.max(node.size[1], computed[1])
+  node.setDirtyCanvas(true, true)
+}
+
+// ------------------------------------------------------------ node registration
 
 /**
  * Register the `LoraLibrarySetController` virtual node type with LiteGraph.
- * Called once from the extension's `init()` hook.
+ * Called once from the extension's `init()` hook (lora_library.js), which
+ * already wraps this call in its own try/catch — we still guard everything
+ * here too, per FORMAT.md §6.3: this file must never throw during graph load.
  */
 export function registerControllerNode() {
-  // TODO(controller): FORMAT.md §6.3
+  try {
+    if (typeof LiteGraph === 'undefined' || typeof LGraphNode === 'undefined') {
+      api.warn('LiteGraph/LGraphNode globals not found; LoRA Set Controller not registered')
+      return
+    }
+    if (LiteGraph.registered_node_types && LiteGraph.registered_node_types[NODE_TYPE]) {
+      return // already registered (double-init guard)
+    }
+
+    class LoraLibrarySetController extends LGraphNode {
+      static title = NODE_TITLE
+
+      constructor(title = NODE_TITLE) {
+        super(title)
+        // isVirtualNode: never executes, never enters the API prompt
+        // (ComfyUI_frontend src/utils/executionUtil.ts:37-39, 86-91 strip
+        // isVirtualNode nodes wholesale before building the prompt) — this
+        // node can never break queueing by construction, not just by care.
+        this.isVirtualNode = true
+        // target/set/name persist in the workflow; buttons+status opt out
+        // individually via widget.serialize = false (see _addButton below).
+        this.serialize_widgets = true
+
+        this._w = {}
+        this._setsCache = []
+        this._lastProbe = null
+        this._lastStatusMessage = ''
+        this._lastHeartbeat = 0
+        this._lastSetsPoll = 0
+
+        this._guarded('build widgets', () => this._buildWidgets())
+      }
+
+      // ---------------------------------------------------------- lifecycle
+
+      onAdded() {
+        this._guarded('onAdded', () => {
+          this._refreshTargetCombo()
+          this._probeAndUpdateStatus()
+          this._refreshSetsCache()
+        })
+      }
+
+      onRemoved() {
+        this._guarded('onRemoved', () => {
+          clearTimeout(this._w.deleteBtn?._armTimer)
+        })
+      }
+
+      onDrawForeground() {
+        this._guarded('heartbeat', () => this._heartbeat())
+      }
+
+      /** Every handler funnels through here — FORMAT.md §6.3: never throw. */
+      _guarded(label, fn) {
+        try {
+          fn()
+        } catch (error) {
+          api.warn(`LoRA Set Controller: ${label} failed`, error)
+        }
+      }
+
+      // ------------------------------------------------------------ widgets
+
+      _buildWidgets() {
+        // Order matters beyond layout: every serialize:false widget below
+        // (status + 4 buttons) MUST stay after every normally-serialized one
+        // (target/set/name) — see the litegraph save/restore note in the
+        // file header for why an interleaved order would corrupt reload.
+        this._w.target = this.addWidget(
+          'combo',
+          'target',
+          '',
+          () => this._guarded('target changed', () => this._probeAndUpdateStatus()),
+          { values: () => this._targetComboValues() }
+        )
+
+        this._w.set = this.addWidget('combo', 'set', '', () => {}, {
+          values: () => this._setComboValues()
+        })
+
+        this._w.name = this.addWidget('text', 'name', '', () => {}, {})
+
+        // Read-only status line. VERIFY(live) FINDING, confirmed against the
+        // live litegraph build: setting `.disabled = true` on a plain 'text'
+        // widget suppresses its VALUE text on canvas entirely (only the
+        // widget's `name` label still renders) — it does not just gray it
+        // out. That would make this widget useless for its one job (showing
+        // the fail-soft message), so we deliberately do NOT set `.disabled`
+        // here. Read-only-ness is enforced the other way instead: the
+        // callback immediately reverts any value the user manages to type
+        // back to the last computed status message.
+        this._w.status = this.addWidget('text', 'status', '', () => {
+          this._w.status.value = this._lastStatusMessage
+        }, {})
+        this._w.status.serialize = false
+
+        this._w.applyBtn = this._addButton(LABEL_APPLY, () => this._onApplyClick())
+        this._w.captureBtn = this._addButton(LABEL_CAPTURE, () => this._onCaptureClick())
+        this._w.updateBtn = this._addButton(LABEL_UPDATE, () => this._onUpdateClick())
+        this._w.deleteBtn = this._addButton(LABEL_DELETE, () => this._onDeleteClick())
+        this._actionButtons = [this._w.applyBtn, this._w.captureBtn, this._w.updateBtn, this._w.deleteBtn]
+
+        this._refreshTargetCombo()
+        this._probeAndUpdateStatus()
+      }
+
+      _addButton(label, callback) {
+        const widget = this.addWidget('button', label, null, callback, {})
+        // widget.serialize (top-level) — NOT options.serialize — is what
+        // LGraphNode.ts:986 checks when writing widgets_values. See file
+        // header for the two-flags finding this depends on. VERIFY(live).
+        widget.serialize = false
+        return widget
+      }
+
+      _targetComboValues() {
+        const candidates = findTargetCandidates()
+        return candidates.length ? candidates.map((c) => c.label) : [PLACEHOLDER_NO_TARGET]
+      }
+
+      _setComboValues() {
+        return this._setsCache.length ? this._setsCache.map((s) => s.label) : [PLACEHOLDER_NO_SETS]
+      }
+
+      /** Auto-select when exactly one PLL exists; never guess among 2+. */
+      _refreshTargetCombo() {
+        const widget = this._w.target
+        if (!widget) return
+        const candidates = findTargetCandidates()
+        const stillValid = candidates.some((c) => c.label === widget.value)
+        if (candidates.length === 0) {
+          widget.value = PLACEHOLDER_NO_TARGET
+        } else if (candidates.length === 1 && !stillValid) {
+          widget.value = candidates[0].label
+        }
+        // A stale value against 2+ candidates is left alone (tolerate a
+        // target id that no longer exists — FORMAT.md §6.3 persistence
+        // note) — probeTarget() will report "not found" rather than guess.
+      }
+
+      _probeAndUpdateStatus() {
+        const target = resolveTargetNode(this._w.target?.value)
+        const probe = probeTarget(target)
+        this._lastProbe = probe
+        this._lastStatusMessage = probe.message
+        if (this._w.status) this._w.status.value = probe.message
+        for (const button of this._actionButtons || []) button.disabled = !probe.ok
+        this.setDirtyCanvas(true, false)
+      }
+
+      _heartbeat() {
+        const now = Date.now()
+        if (now - this._lastHeartbeat < HEARTBEAT_MIN_MS) return
+        this._lastHeartbeat = now
+        this._refreshTargetCombo()
+        this._probeAndUpdateStatus()
+        if (now - this._lastSetsPoll >= SETS_POLL_MS) {
+          this._lastSetsPoll = now
+          this._guarded('sets poll', () => this._refreshSetsCache())
+        }
+      }
+
+      // --------------------------------------------------------- sets cache
+
+      async _refreshSetsCache() {
+        try {
+          const data = await api.getJson('/lora_library/sets')
+          this._applySetsResponse(data)
+        } catch (error) {
+          api.warn(
+            'LoRA Set Controller: GET /lora_library/sets failed (backend sets routes may not be deployed yet)',
+            error
+          )
+        }
+      }
+
+      _applySetsResponse(data) {
+        const list = Array.isArray(data?.sets) ? data.sets : []
+        const seenLabels = new Set()
+        this._setsCache = list.map((s) => {
+          let label = s.name || s.slug
+          if (seenLabels.has(label)) label = `${label} (${s.slug})`
+          seenLabels.add(label)
+          return { slug: s.slug, name: s.name, count: s.count, label }
+        })
+        this.setDirtyCanvas(true, false)
+      }
+
+      _selectedSetEntry() {
+        const value = this._w.set?.value
+        return this._setsCache.find((s) => s.label === value) || null
+      }
+
+      _selectSetBySlug(slug) {
+        const entry = this._setsCache.find((s) => s.slug === slug)
+        if (entry && this._w.set) this._w.set.value = entry.label
+      }
+
+      _toast(severity, summary, detail) {
+        try {
+          app.extensionManager?.toast?.add?.({
+            severity,
+            summary,
+            detail,
+            life: severity === 'error' ? 6000 : 3000
+          })
+        } catch {
+          // Toast is a nicety; never let it be the reason an action "fails".
+        }
+      }
+
+      async _runAction(label, fn) {
+        try {
+          await fn()
+        } catch (error) {
+          api.warn(`LoRA Set Controller: ${label} failed`, error)
+          this._toast('error', 'LoRA Set Controller', `${label} failed: ${error?.message || error}`)
+        }
+      }
+
+      // -------------------------------------------------------- button actions
+
+      _onApplyClick() {
+        this._runAction('Apply set', () => this._doApply())
+      }
+
+      _onCaptureClick() {
+        this._runAction('Capture target', () => this._doCapture())
+      }
+
+      _onUpdateClick() {
+        this._runAction('Update set', () => this._doUpdate())
+      }
+
+      _onDeleteClick() {
+        // Two-step confirm: first click arms the button and flips its label
+        // for ~4s; a second click within that window actually deletes.
+        const button = this._w.deleteBtn
+        if (!button) return
+        if (!button._armed) {
+          button._armed = true
+          button.name = LABEL_DELETE_CONFIRM
+          clearTimeout(button._armTimer)
+          button._armTimer = setTimeout(() => {
+            button._armed = false
+            button.name = LABEL_DELETE
+            this.setDirtyCanvas(true, false)
+          }, DELETE_CONFIRM_MS)
+          this.setDirtyCanvas(true, false)
+          return
+        }
+        clearTimeout(button._armTimer)
+        button._armed = false
+        button.name = LABEL_DELETE
+        this.setDirtyCanvas(true, false)
+        this._runAction('Delete set', () => this._doDelete())
+      }
+
+      async _doApply() {
+        const target = resolveTargetNode(this._w.target?.value)
+        const probe = probeTarget(target)
+        if (!probe.ok) {
+          this._toast('warn', 'LoRA Set Controller', probe.message)
+          return
+        }
+        const entry = this._selectedSetEntry()
+        if (!entry) {
+          this._toast('warn', 'LoRA Set Controller', 'Pick a saved set first.')
+          return
+        }
+        const full = await api.getJson('/lora_library/set', { slug: entry.slug })
+        applySetToTarget(target, full)
+        this._probeAndUpdateStatus()
+        this._toast(
+          'success',
+          'LoRA Set Controller',
+          `Applied "${full.name}" -> ${target.title || target.type} #${target.id} (${(full.loras || []).length} rows).`
+        )
+      }
+
+      async _doCapture() {
+        const target = resolveTargetNode(this._w.target?.value)
+        const probe = probeTarget(target)
+        if (!probe.ok) {
+          this._toast('warn', 'LoRA Set Controller', probe.message)
+          return
+        }
+        const loras = captureRows(target)
+        const name = (this._w.name?.value || '').trim() || `Set ${this._setsCache.length + 1}`
+        const response = await api.postJson('/lora_library/set', {
+          set: { format: 1, name, loras, trigger_words: '', notes: '' }
+        })
+        this._applySetsResponse(response)
+        announceSetsChanged()
+        this._selectSetBySlug(response.slug)
+        if (this._w.name) this._w.name.value = ''
+        this._toast('success', 'LoRA Set Controller', `Saved "${name}" (${loras.length} rows).`)
+      }
+
+      async _doUpdate() {
+        const target = resolveTargetNode(this._w.target?.value)
+        const probe = probeTarget(target)
+        if (!probe.ok) {
+          this._toast('warn', 'LoRA Set Controller', probe.message)
+          return
+        }
+        const entry = this._selectedSetEntry()
+        if (!entry) {
+          this._toast('warn', 'LoRA Set Controller', 'Pick a saved set first.')
+          return
+        }
+        const loras = captureRows(target)
+        // Preserve the existing name/trigger_words/notes; only the rows
+        // change on "Update" — best-effort GET, falls back to rows-only.
+        let name = entry.name
+        let trigger_words = ''
+        let notes = ''
+        try {
+          const existing = await api.getJson('/lora_library/set', { slug: entry.slug })
+          name = existing.name ?? name
+          trigger_words = existing.trigger_words ?? ''
+          notes = existing.notes ?? ''
+        } catch (error) {
+          api.warn('LoRA Set Controller: could not read existing set before update; overwriting rows only', error)
+        }
+        const response = await api.postJson('/lora_library/set', {
+          slug: entry.slug,
+          set: { format: 1, name, loras, trigger_words, notes }
+        })
+        this._applySetsResponse(response)
+        announceSetsChanged()
+        this._selectSetBySlug(entry.slug)
+        this._toast('success', 'LoRA Set Controller', `Updated "${name}" (${loras.length} rows).`)
+      }
+
+      async _doDelete() {
+        const entry = this._selectedSetEntry()
+        if (!entry) {
+          this._toast('warn', 'LoRA Set Controller', 'Pick a saved set first.')
+          return
+        }
+        const response = await api.postJson('/lora_library/set/delete', { slug: entry.slug })
+        this._applySetsResponse(response)
+        announceSetsChanged()
+        if (this._w.set) this._w.set.value = this._setsCache[0]?.label || ''
+        this._toast('success', 'LoRA Set Controller', `Deleted "${entry.name}".`)
+      }
+    }
+
+    LiteGraph.registerNodeType(NODE_TYPE, LoraLibrarySetController)
+    LoraLibrarySetController.category = NODE_CATEGORY
+  } catch (error) {
+    api.warn('registerControllerNode failed', error)
+  }
 }
