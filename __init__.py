@@ -74,7 +74,7 @@ _routes.register(_context)
 # The "LoraLibrary" prefix exists to avoid colliding with other packs'
 # generically named lora nodes.
 _NODE_SPECS = [
-    ("nodes_notebook", "LoraLibraryNotebook", "LoRA Notebook"),
+    ("nodes_notebook", "LoraLibraryNotebook", "Prompt Notebook"),
     ("nodes_sets", "LoraLibraryApplySet", "Apply LoRA Set"),
 ]
 
@@ -91,6 +91,41 @@ for _module_name, _class_id, _display in _NODE_SPECS:
         logger.exception("lora_library: feature module %s failed to load", _module_name)
 
 WEB_DIRECTORY = "./web"
+
+
+def _warn_on_duplicate_installs() -> None:
+    """Shout when this pack is installed under more than one folder.
+
+    A rename (comfyui-lora-library → EPSNodes → comfyui-epsnodes) makes it
+    easy to end up with an old clone AND a new one in custom_nodes. Both
+    load; ComfyUI keeps the FIRST frontend extension registered under our
+    name, so a stale clone can silently win the UI while the newer backend
+    wins the nodes — the worst of both. (Exactly this bit the owner on
+    2026-07-18.) Detection: any sibling directory that also carries our
+    ``lora_library/version.py``.
+    """
+    here = Path(__file__).resolve().parent
+    try:
+        siblings = [
+            other
+            for other in here.parent.iterdir()
+            if other.is_dir()
+            and other.resolve() != here
+            and (other / "lora_library" / "version.py").is_file()
+        ]
+    except OSError:
+        return
+    for other in siblings:
+        logger.error(
+            "EPSNodes is installed TWICE: %s AND %s. Delete the older folder — "
+            "with both present, whichever loads first controls the UI and may "
+            "be a stale version.",
+            here.name,
+            other.name,
+        )
+
+
+_warn_on_duplicate_installs()
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY", "__version__"]
 

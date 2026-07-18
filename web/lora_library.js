@@ -34,7 +34,7 @@ function safely(label, fn) {
   }
 }
 
-const REPO_URL = 'https://github.com/ericpaulsnowden/EPSNodes'
+const REPO_URL = 'https://github.com/ericpaulsnowden/comfyui-epsnodes'
 
 app.registerExtension({
   name: 'lora_library.LoraLibrary',

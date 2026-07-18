@@ -131,19 +131,19 @@ class LoraLibraryNotebook:
     def read_entry(self, file: str, entry: str) -> tuple[list[str], list[str]]:
         context = _context
         if context is None:
-            raise RuntimeError("lora_library: LoRA Notebook has no context configured")
+            raise RuntimeError("lora_library: Prompt Notebook has no context configured")
 
         path = context.resolve_notebook_file(file)
         parsed, mtime, _line_ending = markdown_store.load_notebook(path)
         if mtime is None:
             raise ValueError(
-                f"LoRA Notebook: file {file!r} does not exist (resolved: {path})"
+                f"Prompt Notebook: file {file!r} does not exist (resolved: {path})"
             )
 
         names = _selected_names(entry)
         if not names:
             raise ValueError(
-                f"LoRA Notebook: no entry selected in {file!r} (resolved: {path})"
+                f"Prompt Notebook: no entry selected in {file!r} (resolved: {path})"
             )
 
         texts: list[str] = []
@@ -159,7 +159,7 @@ class LoraLibraryNotebook:
 
         if missing:
             raise ValueError(
-                f"LoRA Notebook: no entry named {missing!r} in {file!r} (resolved: {path})"
+                f"Prompt Notebook: no entry named {missing!r} in {file!r} (resolved: {path})"
             )
 
         return (texts, result_names)

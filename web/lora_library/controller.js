@@ -185,7 +185,7 @@ const ALL_TARGETS_RE = /^All Power Lora Loaders \(\d+\)$/
 const LABEL_CAPTURE = 'Capture target → new set'
 const LABEL_UPDATE = 'Update set (overwrite)'
 const LABEL_DELETE = 'Delete set'
-const LABEL_DELETE_CONFIRM = 'Really delete?'
+const LABEL_DELETE_CONFIRM = 'Are you sure?'
 const DELETE_CONFIRM_MS = 4000
 
 /** onDrawForeground fires on every canvas redraw; throttle our own work. */

@@ -7,11 +7,11 @@ the pack will grow beyond them.
 
 Current capabilities, no dependencies:
 
-- **LoRA Notebook** — a node holding a scrollable list of entries (one per
-  lora, or anything else) with an editor pane beside it. Backed by a plain
+- **Prompt Notebook** — your prompt library as a node: a scrollable list of
+  named prompts with an editor pane beside it. Backed by a plain
   **Markdown file you can put anywhere** — including a NAS folder shared by
-  several machines. The selected entry's text is a `STRING` output you can
-  wire into any prompt input. The file is the truth: edit it in ComfyUI, in
+  several machines. Selected prompts flow out as `STRING`s you can wire
+  into any text input. The file is the truth: edit it in ComfyUI, in
   VS Code, on the other computer — everything stays in sync.
 - **LoRA Sets** — save a whole lora configuration (which loras, order,
   on/off, strengths) as a named set, then switch between sets from a
@@ -25,9 +25,9 @@ Current capabilities, no dependencies:
 > Notebook**, **Apply LoRA Set**, and the **LoRA Set Controller** (each
 > described below). Contracts live in [docs/FORMAT.md](docs/FORMAT.md).
 
-## LoRA Notebook (shipped)
+## Prompt Notebook (shipped)
 
-`EPSNodes → LoRA Notebook`: a two-pane editor inside the node — entry
+`EPSNodes → Prompt Notebook`: a two-pane editor inside the node — entry
 list on the left (grouped by `# Category` headings, with `＋ New` /
 `🗑 Delete`), a flexible text editor + `Save` on the right. Outputs:
 `text` and `name` (the entry's heading — handy for filename prefixes and

@@ -1,11 +1,15 @@
 # FORMAT.md — the binding contract for EPSNodes
 
-Naming (2026-07-18 rebrand): the PACK is **EPSNodes** (repo, node-browser
-category, Settings section, About badge — everything a user sees). The
-python module `lora_library/`, the `/lora_library/*` route prefix, and the
+Naming (2026-07-18 rebrand, refined same day): the PACK is **EPSNodes**
+everywhere a user sees it (node-browser category, Settings section, About
+badge); the REPO/install folder is **`comfyui-epsnodes`**, matching the
+sibling plugins' `comfyui-*` convention (owner decision). The python
+module `lora_library/`, the `/lora_library/*` route prefix, and the
 `LoraLibrary*` node class ids are the pack's first FEATURE FAMILY and stay
 frozen (§8) — future non-lora features arrive as sibling modules under the
-same EPSNodes banner, without repo churn.
+same EPSNodes banner, without repo churn. `LoraLibraryNotebook`'s display
+name is **"Prompt Notebook"** (it stores prompts; the original name was a
+misnomer).
 
 This document is BINDING, in the comfyui-photoshop-bridge PROTOCOL.md sense:
 the backend (`lora_library/`), the frontend (`web/`), and the on-disk file
@@ -210,7 +214,7 @@ Route paths are FROZEN once shipped (§8).
 Class ids are FROZEN once shipped. Both nodes re-read their files at every
 execution — **the file is the truth; the UI is a view.**
 
-### §6.1 `LoraLibraryNotebook` (display: "LoRA Notebook")
+### §6.1 `LoraLibraryNotebook` (display: "Prompt Notebook")
 
 - Widgets: `file` (STRING, default `"loras.md"`), `entry` (STRING — the
   SELECTION; the DOM widget UI sets it, but it stays a plain serialized

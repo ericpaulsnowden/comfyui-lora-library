@@ -1,5 +1,5 @@
 /**
- * @file LoRA Notebook two-pane DOM widget (FORMAT.md §7.2) — attaches to
+ * @file Prompt Notebook two-pane DOM widget (FORMAT.md §7.2) — attaches to
  * `LoraLibraryNotebook` nodes. Left pane: a scrollable, category-grouped,
  * multi-selectable, drag-to-reorder entry list with New/Delete controls.
  * Right pane: a `<textarea>` editor with a Save button and a status line
@@ -91,7 +91,7 @@ const WIDGET_TYPE = 'lora_library_notebook'
 /** FORMAT.md §7.2: "resizable via getMinHeight (~180)". */
 const MIN_WIDGET_HEIGHT = 180
 
-/** How long the Delete button stays in "Really delete?" mode. */
+/** How long the Delete button stays in "Are you sure?" mode. */
 const DELETE_CONFIRM_MS = 4000
 
 /** Debounce for reloading after the `file` widget's value changes. */
@@ -240,7 +240,7 @@ const CSS_TEXT = `
 .llnb-btn:disabled { opacity: 0.45; cursor: default; }
 .llnb-btn-danger { border-color: var(--error-text, #ff4444); color: var(--error-text, #ff4444); }
 .llnb-btn-small { flex: 0 0 auto; padding: 2px 8px; }
-.llnb-btn-save { flex: 0 0 auto; align-self: flex-start; margin-bottom: 3px; }
+.llnb-btn-save { flex: 0 0 auto; }
 .llnb-input {
   flex: 1 1 auto;
   min-width: 0;
@@ -270,27 +270,46 @@ const CSS_TEXT = `
 .llnb-textarea:disabled { opacity: 0.5; }
 .llnb-textarea::placeholder { color: var(--descrip-text, #999); }
 .llnb-bottom-row {
+  /* One row: Save left, status right-justified (owner ask 2026-07-18 —
+     the stacked layout wasted vertical space). Wraps only when cramped. */
   flex: 0 0 auto;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 3px 8px;
   padding: 4px 6px;
 }
-.llnb-status { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.llnb-status {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
 .llnb-status-text {
   color: var(--descrip-text, #999);
   font-size: 10px;
-  overflow-wrap: anywhere;
-  white-space: normal;
+  text-align: right;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.llnb-status-actions { display: flex; gap: 4px; }
+.llnb-status-text:empty { display: none; }
+.llnb-status-actions { display: flex; flex: 0 0 auto; gap: 4px; }
 .llnb-status-actions:empty { display: none; }
 .llnb-status-hint {
   color: var(--descrip-text, #999);
   font-size: 10px;
   font-style: italic;
-  overflow-wrap: anywhere;
-  white-space: normal;
+  text-align: right;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .llnb-status-hint:empty { display: none; }
 `
@@ -1374,7 +1393,7 @@ function onDeleteClick(state) {
   if (!state.deleteConfirmActive) {
     state.deleteConfirmActive = true
     if (state.deleteBtn) {
-      state.deleteBtn.textContent = 'Really delete?'
+      state.deleteBtn.textContent = 'Are you sure?'
       state.deleteBtn.classList.add('llnb-btn-danger')
     }
     state.deleteConfirmTimer = setTimeout(() => cancelDeleteConfirm(state), DELETE_CONFIRM_MS)
