@@ -1,0 +1,2 @@
+# Intentionally empty: comfyui-lora-library is stdlib-only.
+# (torch / comfy modules are provided by ComfyUI itself.)
