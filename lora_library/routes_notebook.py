@@ -1,4 +1,4 @@
-"""HTTP routes for the LoRA notebook — the five ``/lora_library/notebook*``
+"""HTTP routes for the LoRA notebook — the six ``/lora_library/notebook*``
 rows of FORMAT.md §5.
 
 Mirrors ``routes_sets.py``'s shape: thin aiohttp handlers doing only
@@ -12,6 +12,9 @@ path and runs it through ``notebook_path_error`` before touching disk.
 from __future__ import annotations
 
 import logging
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 from aiohttp import web
@@ -35,6 +38,21 @@ def _resolve_path(
         return context.resolve_notebook_file(file_value or ""), None
     except (OSError, ValueError) as exc:
         return None, error_response(400, f"invalid 'file' path: {exc}")
+
+
+def _reveal_folder(path: Path) -> None:
+    """Open *path* in the OS file manager, non-blocking.
+
+    A module-level seam (FORMAT.md §5 ``open_folder``) so tests monkeypatch
+    this one function instead of spawning a real Finder/Explorer/xdg-open
+    process.
+    """
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(path)])
+    elif sys.platform == "win32":
+        os.startfile(str(path))  # type: ignore[attr-defined]
+    else:
+        subprocess.Popen(["xdg-open", str(path)])
 
 
 def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
@@ -222,3 +240,34 @@ def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
         return web.json_response(
             {"ok": True, "mtime": new_mtime, "entries": markdown_store.list_entries(parsed)}
         )
+
+    @routes.post("/lora_library/notebook/open_folder")
+    async def post_notebook_open_folder(request: web.Request) -> web.Response:
+        """FORMAT.md §5's ``open_folder`` row: reveal the resolved file's
+        parent folder in the OS file manager on THIS machine. Unconditionally
+        loopback-only like ``fs/list`` — §2's library_dir exception for
+        remote callers doesn't apply, since this drives desktop UI that only
+        makes sense on the server's own machine."""
+        if not request_is_loopback(request):
+            return error_response(403, "revealing folders is host-machine-only — FORMAT.md §5")
+        try:
+            body = await request.json()
+        except Exception:  # broad: malformed body is a client error
+            return error_response(400, "body must be JSON")
+        if not isinstance(body, dict):
+            return error_response(400, "body must be a JSON object")
+
+        path, err = _resolve_path(context, body.get("file"))
+        if err is not None:
+            return err
+
+        folder = path.parent
+        if not folder.is_dir():
+            return error_response(404, f"no such folder {folder}")
+
+        try:
+            _reveal_folder(folder)
+        except Exception as exc:  # broad: any spawn failure surfaces to the caller
+            return error_response(500, str(exc))
+
+        return web.json_response({"ok": True})

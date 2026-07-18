@@ -18,6 +18,7 @@ from pathlib import Path
 
 from aiohttp import web
 
+from lora_library import routes_notebook
 from lora_library.context import LibraryContext
 from lora_library.routes import build_routes
 
@@ -782,3 +783,61 @@ async def test_full_lifecycle_create_read_update_rename_delete(
         )
     ).json()
     assert deleted["entries"] == []
+
+
+# ----------------------------------------------------- POST /notebook/open_folder
+
+
+async def test_post_open_folder_success_reveals_resolved_parent(
+    context: LibraryContext, library_dir: Path, aiohttp_client, monkeypatch
+) -> None:
+    calls: list[Path] = []
+    monkeypatch.setattr(routes_notebook, "_reveal_folder", calls.append)
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/open_folder", json={"file": "loras.md"}
+    )
+    assert resp.status == 200
+    assert await resp.json() == {"ok": True}
+    assert calls == [library_dir]
+
+
+async def test_post_open_folder_remote_is_403(
+    context: LibraryContext, aiohttp_client, monkeypatch
+) -> None:
+    monkeypatch.setattr(routes_notebook, "_reveal_folder", lambda _p: None)
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/open_folder", json={"file": "loras.md"}, headers=REMOTE
+    )
+    assert resp.status == 403
+    assert "error" in await resp.json()
+
+
+async def test_post_open_folder_missing_folder_is_404(
+    context: LibraryContext, tmp_path: Path, aiohttp_client, monkeypatch
+) -> None:
+    monkeypatch.setattr(routes_notebook, "_reveal_folder", lambda _p: None)
+    client = await aiohttp_client(make_app(context))
+    missing = tmp_path / "does-not-exist" / "notes.md"
+    resp = await client.post(
+        "/lora_library/notebook/open_folder", json={"file": str(missing)}
+    )
+    assert resp.status == 404
+    body = await resp.json()
+    assert "does-not-exist" in body["error"]
+
+
+async def test_post_open_folder_reveal_failure_is_500(
+    context: LibraryContext, aiohttp_client, monkeypatch
+) -> None:
+    def boom(_path: Path) -> None:
+        raise RuntimeError("no file manager found")
+
+    monkeypatch.setattr(routes_notebook, "_reveal_folder", boom)
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/open_folder", json={"file": "loras.md"}
+    )
+    assert resp.status == 500
+    assert (await resp.json())["error"] == "no file manager found"

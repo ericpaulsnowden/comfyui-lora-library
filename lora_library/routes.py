@@ -80,13 +80,42 @@ def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
         return web.json_response({"version": __version__})
 
     @routes.get("/lora_library/config")
-    async def get_config(_request: web.Request) -> web.Response:
+    async def get_config(request: web.Request) -> web.Response:
         configured = bool(context.load_config().get("library_dir"))
         return web.json_response(
             {
                 "library_dir": str(context.library_dir()),
                 "default_library_dir": str(context.default_library_dir),
                 "configured": configured,
+                # §2 verdict for THIS caller — lets the frontend gate the
+                # host-machine-only affordances (§7.2 file panel buttons).
+                "is_local": request_is_loopback(request),
+            }
+        )
+
+    @routes.get("/lora_library/fs/list")
+    async def get_fs_list(request: web.Request) -> web.Response:
+        # FORMAT.md §5: the §7.2 picker's directory listing. Loopback-only —
+        # a remote browser defers to the host for file selection (§7.2), so
+        # it never needs to walk the server's filesystem.
+        if not request_is_loopback(request):
+            return error_response(403, "file browsing is host-machine-only — FORMAT.md §5")
+        raw = (request.query.get("dir") or "").strip()
+        directory = Path(raw) if raw else context.library_dir()
+        if not directory.is_absolute():
+            return error_response(400, f"dir must be an absolute path (got {raw!r})")
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
+        except OSError as exc:
+            return error_response(400, f"could not list {directory}: {exc}")
+        return web.json_response(
+            {
+                "dir": str(directory),
+                "parent": str(directory.parent) if directory.parent != directory else None,
+                "dirs": [p.name for p in entries if p.is_dir()],
+                "files": [
+                    p.name for p in entries if p.is_file() and p.suffix.lower() == ".md"
+                ],
             }
         )
 

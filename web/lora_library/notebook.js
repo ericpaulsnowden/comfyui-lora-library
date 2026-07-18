@@ -1,12 +1,17 @@
 /**
  * @file Prompt Notebook two-pane DOM widget (FORMAT.md §7.2) — attaches to
  * `LoraLibraryNotebook` nodes. Left pane: a scrollable, category-grouped,
- * multi-selectable, drag-to-reorder entry list with New/Delete controls.
- * Right pane: a `<textarea>` editor with a Save button and a status line
- * (conflict resolution per §3.5 lands there too). The node's own
- * `file`/`entry` STRING widgets stay the serialized truth (§6.1/§7.2) — this
- * DOM widget only ever *reads* `file` and *writes* `entry` through its
- * normal widget setter; it never serializes itself.
+ * multi-selectable, drag-to-reorder, double-click-to-rename entry list with
+ * New/Delete controls (Delete removes every selected entry, not just the
+ * active one). Right pane: a `<textarea>` editor with a Save button and a
+ * status line (conflict resolution per §3.5 lands there too). Above both
+ * panes, a file panel shows the notebook's RESOLVED absolute path plus
+ * Browse…/Open folder buttons — hidden (and the `file` widget made
+ * effectively read-only) for a remote (`is_local: false`) viewer. The
+ * node's own `file`/`entry` STRING widgets stay the serialized truth
+ * (§6.1/§7.2) — this DOM widget only ever *reads* `file` and *writes*
+ * `entry`/`file` through their normal widget setters; it never serializes
+ * itself.
  *
  * Multi-select (FORMAT.md §6.1/§7.2, owner amendment 2026-07-18): ctrl/
  * cmd+click toggles one entry in/out of the selection, shift+click extends
@@ -75,6 +80,77 @@
  *    pointer-event path live before today's change — drag-to-reorder reuses
  *    the identical technique.
  *
+ * Multi-delete (FORMAT.md §7.2 amendment, owner 2026-07-18c): Delete now
+ * removes EVERY selected entry, not just the active one. The confirm label
+ * shows the count when >1 ("Are you sure? (3)"); deletion is sequential
+ * over the existing single-entry §5 delete route (one request per name, in
+ * selection order), refreshing `base_mtime` from each response so later
+ * requests in the same run check against the file's latest state. A
+ * mid-run 409 stops the run and surfaces the same Reload/Overwrite
+ * conflict UI Save/Move already use; Overwrite resumes the run from the
+ * failed name with that one request forced (base_mtime omitted), then
+ * continues normally. See performDeleteRun() below.
+ *
+ * Rename (FORMAT.md §7.2 amendment): double-clicking a row swaps its label
+ * for an inline `<input>` (same `.llnb-input` styling family as the
+ * New-entry row) with ✓/✕ buttons; Enter/✓ commits via the existing §5
+ * entry route's `rename_to` + `base_mtime`, Esc/blur cancels. Click-vs-
+ * drag-vs-double-click disambiguation: a browser's native `dblclick` only
+ * ever fires *after* two complete click cycles on the same element, and
+ * both of this file's own click handlers (onEntryPointerDown's
+ * sub-threshold-movement path, dispatching to handleEntryClick) run
+ * synchronously inside each of those two cycles — so by the time our
+ * `dblclick` listener runs, both single-clicks have already resolved
+ * (normally collapsing the selection to just this row, per selectSingle(),
+ * which is also why the renamed row is always `state.activeName`). There
+ * is therefore no "pending click" to race against the dblclick itself; the
+ * real hazard is a LATER-resolving async side effect of one of those
+ * clicks — specifically chooseSelection()'s load-failure rollback — calling
+ * renderList() after rename mode has already opened. renderList() is what
+ * renders `state.renamingName`'s row as the input in the first place
+ * (rather than an imperative one-off DOM swap), so any such incidental
+ * re-render regenerates the SAME rename input instead of destroying it.
+ * Every other "something else wants the list/selection to change" entry
+ * point (chooseSelection, openNewEntryRow, reloadNow) explicitly calls
+ * closeRenameRow() first, exactly like they already do for
+ * cancelDeleteConfirm()/closeNewEntryRow() — so clicking another row (or
+ * anything else that mutates the list) deterministically cancels an
+ * in-progress rename rather than leaving it to chance. The one case that
+ * isn't one of those explicit call sites — focus simply leaving the input
+ * (clicking Save, the splitter, outside the widget, tabbing away) — is
+ * caught by the input's own `blur` handler, deferred by one tick so a
+ * same-tick blur racing a successful commit's own renderList() (which
+ * naturally blurs the about-to-be-removed input) sees `renamingName`
+ * already cleared and no-ops. The confirm/cancel buttons call
+ * `preventDefault()` on their OWN `mousedown` for the standard reason:
+ * without it, clicking them would shift focus away from the input (firing
+ * that same blur-cancel) before their `click` handler ever ran. See the
+ * "Rename" section below (openRenameRow/closeRenameRow/buildRenameRow/
+ * performRename) for the implementation.
+ *
+ * File panel + remote gating (FORMAT.md §7.2 amendment): a muted bar
+ * between the node's own widgets and the two panes shows the notebook's
+ * RESOLVED absolute path (the `file` field of every `GET /notebook`
+ * response — NOT the `file` WIDGET's possibly-relative value), truncated
+ * with a `direction: rtl` trick (keeps the tail — usually the filename —
+ * visible instead of the head) and the full path in `title`. Its two
+ * buttons: `Browse…` opens a small modal file picker (attached to
+ * `document.body`, not nested inside this widget's own root — see
+ * openBrowsePicker()'s doc comment for why) walking `GET /fs/list`;
+ * `Open folder` fires `POST /notebook/open_folder` and reports failure on
+ * the status line. `GET /config`'s `is_local` (fetched once per attach,
+ * cached at MODULE scope with a short TTL so N attached nodes share one
+ * fetch) hides both buttons and makes the `file` widget effectively
+ * read-only for a remote (non-loopback) viewer — deliberately NOT via
+ * `widget.disabled`, which on this litegraph fork blanks a disabled TEXT
+ * widget's VALUE entirely rather than just graying it out (see
+ * controller.js's header finding on its own `status` widget); instead the
+ * `file` widget's callback (already wrapped by wireFileWidget below)
+ * reverts any edit back to the last known-good value and posts a calm
+ * status note. Every other feature in this file (browsing/editing/saving/
+ * deleting/renaming/reordering entries) stays fully functional for a
+ * remote viewer — only the FILE the node points at is host-controlled.
+ *
  * Vanilla ES modules, no build step — DOM nodes are built with
  * `document.createElement` (see the local `el()` helper) rather than any
  * templating, matching this pack's other frontend modules.
@@ -123,7 +199,7 @@ let stylesInjected = false
 const CSS_TEXT = `
 .llnb-root {
   display: flex;
-  flex-direction: row;
+  flex-direction: column;
   width: 100%;
   height: 100%;
   box-sizing: border-box;
@@ -134,6 +210,52 @@ const CSS_TEXT = `
   font-family: inherit;
   font-size: 11px;
   color: var(--input-text, #ccc);
+}
+.llnb-filepanel {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--border-color, #444);
+  background: var(--comfy-menu-bg, #262626);
+}
+.llnb-filepanel-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  /* Front-truncation trick (owner ask, FORMAT.md §7.2): direction:rtl moves
+     the ellipsis to the START of the string so the TAIL (usually the
+     filename) stays visible when the path is too long for the bar; the
+     text's own character order stays left-to-right via unicode-bidi. */
+  direction: rtl;
+  text-align: left;
+  unicode-bidi: plaintext;
+  color: var(--descrip-text, #999);
+  font-size: 10px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+.llnb-filepanel-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--descrip-text, #999);
+  font-size: 10px;
+  font-style: italic;
+}
+.llnb-filepanel-note:empty { display: none; }
+.llnb-filepanel-actions { flex: 0 0 auto; display: flex; gap: 4px; }
+.llnb-panes {
+  display: flex;
+  flex-direction: row;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 }
 .llnb-pane {
   display: flex;
@@ -203,6 +325,18 @@ const CSS_TEXT = `
   box-shadow: inset 0 0 0 1px rgba(66, 133, 244, 0.55);
 }
 .llnb-entry-dragging { opacity: 0.4; }
+.llnb-entry-renaming {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px;
+  margin: 1px 0;
+}
+.llnb-input-rename {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 2px 4px;
+}
 .llnb-drag-marker {
   height: 2px;
   margin: 3px 4px;
@@ -312,6 +446,73 @@ const CSS_TEXT = `
   text-overflow: ellipsis;
 }
 .llnb-status-hint:empty { display: none; }
+.llnb-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 10000;
+}
+.llnb-picker {
+  display: flex;
+  flex-direction: column;
+  width: min(480px, 90vw);
+  max-height: min(520px, 80vh);
+  background: var(--comfy-menu-bg, #262626);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--input-text, #ccc);
+}
+.llnb-picker-header {
+  flex: 0 0 auto;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color, #444);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  direction: rtl;
+  text-align: left;
+  unicode-bidi: plaintext;
+  color: var(--descrip-text, #999);
+}
+.llnb-picker-list {
+  flex: 1 1 auto;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.llnb-picker-row {
+  padding: 5px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.llnb-picker-row:hover { background: var(--content-hover-bg, #2a2a2a); }
+.llnb-picker-status,
+.llnb-picker-empty {
+  padding: 10px;
+  color: var(--descrip-text, #999);
+  font-style: italic;
+}
+.llnb-picker-error { color: var(--error-text, #ff4444); font-style: normal; }
+.llnb-picker-footer {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border-color, #444);
+}
 `
 
 function injectStyles() {
@@ -407,6 +608,10 @@ export function attachNotebookWidget(node) {
     wireFileWidget(state)
     wireNodeCleanup(state)
 
+    // FORMAT.md §7.2 amendment: one `/config` check per attach (cached at
+    // module scope — see "Remote gating" below) to gate the file panel's
+    // buttons and the `file` widget's edit-guard.
+    refreshRemoteGating(state).catch((error) => api.warn('initial config load failed', error))
     reloadNow(state).catch((error) => api.warn('initial notebook load failed', error))
   } catch (error) {
     api.warn('attachNotebookWidget failed', error)
@@ -450,6 +655,23 @@ function createState(node, fileWidget, entryWidget) {
     // In-flight pointer gesture (pointerdown → move → up), or null between
     // gestures. See onEntryPointerDown().
     drag: null,
+    // FORMAT.md §7.2 amendment — name of the row currently showing the
+    // inline rename input (buildRenameRow), or null. See the file header's
+    // "Rename" paragraph.
+    renamingName: null,
+    // FORMAT.md §7.2 amendment — the file panel's resolved absolute path
+    // (the `file` field of the last `GET /notebook` response) and whether
+    // THIS browser is local (`GET /config`'s `is_local`; null = not yet
+    // known, treated as local — see refreshRemoteGating()).
+    resolvedFile: null,
+    isLocal: null,
+    // The file WIDGET's last known-good value — wireFileWidget() reverts to
+    // this when a remote viewer edits a read-only `file` widget.
+    lastKnownFileValue: null,
+    // The Browse… picker's window-level Escape-key listener while open (the
+    // picker lives on document.body, not inside this widget's own DOM — see
+    // openBrowsePicker()).
+    pickerKeydownHandler: null,
     // DOM refs, filled in by buildUi() — only elements later functions need
     // to reach back into are tracked here (e.g. `newBtn` isn't, since
     // nothing but renderFooter() itself ever touches it).
@@ -462,7 +684,11 @@ function createState(node, fileWidget, entryWidget) {
     statusTextEl: null,
     statusActionsEl: null,
     statusHintEl: null,
-    deleteBtn: null
+    deleteBtn: null,
+    filePanelPathEl: null,
+    filePanelNoteEl: null,
+    browseBtn: null,
+    openFolderBtn: null
   }
 }
 
@@ -498,7 +724,9 @@ function buildUi(state) {
   const bottomRow = el('div', { className: 'llnb-bottom-row' }, [state.saveBtn, statusRow])
   const rightPane = el('div', { className: 'llnb-pane llnb-pane-right' }, [state.textarea, bottomRow])
 
-  state.root = el('div', { className: 'llnb-root' }, [state.leftPane, splitter, rightPane])
+  const panesRow = el('div', { className: 'llnb-panes' }, [state.leftPane, splitter, rightPane])
+  const filePanel = buildFilePanel(state)
+  state.root = el('div', { className: 'llnb-root' }, [filePanel, panesRow])
 
   state.textarea.addEventListener('input', () => {
     setDirty(state, state.textarea.value !== state.lastSavedText)
@@ -581,10 +809,27 @@ function wireSplitter(state, splitter) {
 // file widget chaining + node cleanup
 // ---------------------------------------------------------------------------
 
+/**
+ * Wraps the `file` widget's callback for two independent reasons that share
+ * one seam: (1) the pre-existing debounced-reload-on-change
+ * (onFileWidgetChanged), and (2) FORMAT.md §7.2's remote read-only guard —
+ * a remote (`is_local: false`) viewer's edit is reverted here instead of
+ * via `widget.disabled` (see the file header's "File panel + remote
+ * gating" paragraph for why that flag is unusable for this).
+ */
 function wireFileWidget(state) {
   const widget = state.fileWidget
   const original = widget.callback
+  state.lastKnownFileValue = widget.value
   widget.callback = function (value, ...rest) {
+    if (state.isLocal === false && value !== state.lastKnownFileValue) {
+      widget.value = state.lastKnownFileValue
+      setStatus(state, 'The host machine controls which file this node reads.')
+      state.node.graph?.setDirtyCanvas(true, true)
+      return undefined
+    }
+    state.lastKnownFileValue = value
+
     let result
     if (typeof original === 'function') {
       try {
@@ -639,9 +884,266 @@ function teardown(state) {
   // leak the drag's window-level pointermove/pointerup/pointercancel
   // listeners forever — see onEntryPointerDown().
   state.drag?.cleanup?.()
+  // The Browse… picker lives on document.body, not inside this node's own
+  // DOM — it must be torn down explicitly, or a node removed mid-picker
+  // would leak it (and its window-level keydown listener) forever.
+  closeBrowsePicker(state)
   // Invalidate any in-flight fetches so their `.then` handlers no-op.
   state.loadToken += 1
   state.selectToken += 1
+}
+
+// ---------------------------------------------------------------------------
+// Remote gating (FORMAT.md §7.2 amendment) — see the file header's "File
+// panel + remote gating" paragraph. `GET /lora_library/config` is cached at
+// MODULE scope (every attached LoraLibraryNotebook node shares one fetch)
+// with a short TTL, and concurrent callers de-dupe onto one in-flight
+// promise.
+// ---------------------------------------------------------------------------
+
+const CONFIG_CACHE_TTL_MS = 60000
+
+let cachedConfig = null
+let cachedConfigAt = 0
+let cachedConfigPromise = null
+
+function fetchConfig() {
+  if (cachedConfigPromise) return cachedConfigPromise
+  cachedConfigPromise = api
+    .getJson('/lora_library/config')
+    .then((data) => {
+      cachedConfig = data
+      cachedConfigAt = Date.now()
+      return data
+    })
+    .finally(() => {
+      cachedConfigPromise = null
+    })
+  return cachedConfigPromise
+}
+
+function getConfig() {
+  if (cachedConfig && Date.now() - cachedConfigAt < CONFIG_CACHE_TTL_MS) {
+    return Promise.resolve(cachedConfig)
+  }
+  return fetchConfig()
+}
+
+/**
+ * Refreshes `state.isLocal` from (cached) `/config` and applies it to the
+ * file-panel buttons + the `file` widget's edit-guard (wireFileWidget).
+ * Never throws: a failed fetch is logged and leaves `state.isLocal`
+ * whatever it already was (`null`/unknown reads as "local" everywhere this
+ * is checked with `=== false`) — this fails OPEN rather than disabling
+ * functionality over a network hiccup, this file's usual posture.
+ */
+async function refreshRemoteGating(state) {
+  let config
+  try {
+    config = await getConfig()
+  } catch (error) {
+    api.warn('could not load /lora_library/config; treating this node as local', error)
+    return
+  }
+  state.isLocal = config?.is_local !== false
+  updateRemoteGatingUi(state)
+}
+
+function updateRemoteGatingUi(state) {
+  const remote = state.isLocal === false
+  if (state.browseBtn) state.browseBtn.style.display = remote ? 'none' : ''
+  if (state.openFolderBtn) state.openFolderBtn.style.display = remote ? 'none' : ''
+  if (state.filePanelNoteEl) {
+    state.filePanelNoteEl.textContent = remote ? 'Host machine controls this file' : ''
+    state.filePanelNoteEl.title = remote
+      ? 'The host machine controls which file this node reads.'
+      : ''
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File panel: resolved path + Browse…/Open folder (FORMAT.md §7.2 amendment)
+// ---------------------------------------------------------------------------
+
+function buildFilePanel(state) {
+  state.filePanelPathEl = el('div', { className: 'llnb-filepanel-path' })
+  state.filePanelNoteEl = el('div', { className: 'llnb-filepanel-note' })
+  state.browseBtn = el('button', {
+    className: 'llnb-btn llnb-btn-small',
+    text: 'Browse…',
+    attrs: { title: 'Pick a notebook .md file on the server' }
+  })
+  state.openFolderBtn = el('button', {
+    className: 'llnb-btn llnb-btn-small',
+    text: 'Open folder',
+    attrs: { title: "Reveal this file's folder on the server machine" }
+  })
+
+  state.browseBtn.addEventListener('click', () => {
+    if (state.busy) return
+    openBrowsePicker(state)
+  })
+  state.openFolderBtn.addEventListener('click', () => {
+    onOpenFolderClick(state).catch((error) => api.warn('open folder failed', error))
+  })
+
+  const actions = el('div', { className: 'llnb-filepanel-actions' }, [state.browseBtn, state.openFolderBtn])
+  return el('div', { className: 'llnb-filepanel' }, [state.filePanelPathEl, state.filePanelNoteEl, actions])
+}
+
+function updateFilePanelPath(state) {
+  if (!state.filePanelPathEl) return
+  const path = state.resolvedFile || ''
+  state.filePanelPathEl.textContent = path
+  state.filePanelPathEl.title = path
+}
+
+async function onOpenFolderClick(state) {
+  if (!state.resolvedFile) return
+  try {
+    await api.postJson('/lora_library/notebook/open_folder', { file: state.resolvedFile })
+  } catch (error) {
+    api.warn('open folder failed', error)
+    setStatus(state, `Could not open folder: ${error.message}`)
+  }
+}
+
+/** Best-effort join of a `GET /fs/list` `dir` + child name using the SAME
+ * separator style the server's `dir` string already uses — the server may
+ * run on Windows (backslash paths, incl. UNC `\\server\share`) or POSIX
+ * (forward slash), and the picker has no other way to know which. */
+function joinServerPath(dir, name) {
+  const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/'
+  return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`
+}
+
+/** Best-effort parent-folder guess for seeding the picker at the resolved
+ * file's own folder; null (→ server default, the library folder) if it
+ * can't tell. */
+function dirnameOfServerPath(path) {
+  if (!path) return null
+  const sep = path.includes('\\') && !path.includes('/') ? '\\' : '/'
+  const idx = path.lastIndexOf(sep)
+  if (idx <= 0) return null
+  return path.slice(0, idx)
+}
+
+const PICKER_OVERLAY_ID = 'llnb-picker-overlay'
+
+function closeBrowsePicker(state) {
+  document.getElementById(PICKER_OVERLAY_ID)?.remove()
+  if (state.pickerKeydownHandler) {
+    window.removeEventListener('keydown', state.pickerKeydownHandler)
+    state.pickerKeydownHandler = null
+  }
+}
+
+/**
+ * FORMAT.md §7.2's Browse… dialog. Deliberately attached to `document.body`
+ * rather than nested inside this widget's own root: the DOM widget's box is
+ * only ever as tall as the node currently is (as small as
+ * MIN_WIDGET_HEIGHT), and litegraph can reposition/clip it during pan/zoom
+ * (see `hideOnZoom` on attachDomWidget() above) — a file browser confined to
+ * that box would be cramped on a small node and would fight the same
+ * clipping. A fixed, centered overlay on `document.body` stays a
+ * comfortable, constant size regardless of the node's size/position, at the
+ * cost of managing its own teardown by hand (closeBrowsePicker(), called
+ * from here, Escape, a backdrop click, and this node's own teardown()).
+ */
+function openBrowsePicker(state) {
+  closeBrowsePicker(state) // only one picker at a time, ever
+
+  const backdrop = el('div', { className: 'llnb-picker-backdrop', attrs: { id: PICKER_OVERLAY_ID } })
+  const dialog = el('div', { className: 'llnb-picker' })
+  backdrop.append(dialog)
+  backdrop.addEventListener('mousedown', (event) => {
+    if (event.target === backdrop) closeBrowsePicker(state)
+  })
+  dialog.addEventListener('mousedown', (event) => event.stopPropagation())
+  document.body.append(backdrop)
+
+  state.pickerKeydownHandler = (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closeBrowsePicker(state)
+    }
+  }
+  window.addEventListener('keydown', state.pickerKeydownHandler)
+
+  loadPickerDir(state, dialog, dirnameOfServerPath(state.resolvedFile))
+}
+
+async function loadPickerDir(state, dialog, dir) {
+  dialog.replaceChildren(el('div', { className: 'llnb-picker-status', text: 'Loading…' }))
+  let data
+  try {
+    data = await api.getJson('/lora_library/fs/list', dir ? { dir } : undefined)
+  } catch (error) {
+    api.warn('fs/list failed', error)
+    dialog.replaceChildren(
+      el('div', { className: 'llnb-picker-header', text: 'Browse' }),
+      el('div', {
+        className: 'llnb-picker-status llnb-picker-error',
+        text: `Could not list folder: ${error.message}`
+      }),
+      buildPickerFooter(state)
+    )
+    return
+  }
+  renderPickerDialog(state, dialog, data)
+}
+
+function renderPickerDialog(state, dialog, data) {
+  const header = el('div', { className: 'llnb-picker-header', text: data.dir, attrs: { title: data.dir } })
+  const list = el('div', { className: 'llnb-picker-list' })
+
+  if (data.parent) {
+    const upRow = el('div', { className: 'llnb-picker-row', text: '.. (parent folder)' })
+    upRow.addEventListener('click', () => loadPickerDir(state, dialog, data.parent))
+    list.append(upRow)
+  }
+  for (const name of data.dirs || []) {
+    const row = el('div', { className: 'llnb-picker-row', text: `📁 ${name}` })
+    row.addEventListener('click', () => loadPickerDir(state, dialog, joinServerPath(data.dir, name)))
+    list.append(row)
+  }
+  for (const name of data.files || []) {
+    const row = el('div', { className: 'llnb-picker-row', text: `📄 ${name}` })
+    row.addEventListener('click', () => {
+      closeBrowsePicker(state)
+      setFileWidgetValue(state, joinServerPath(data.dir, name))
+    })
+    list.append(row)
+  }
+  if (!data.parent && !(data.dirs || []).length && !(data.files || []).length) {
+    list.append(el('div', { className: 'llnb-picker-empty', text: 'No subfolders or .md files here.' }))
+  }
+
+  dialog.replaceChildren(header, list, buildPickerFooter(state))
+}
+
+function buildPickerFooter(state) {
+  const cancelBtn = el('button', { className: 'llnb-btn llnb-btn-small', text: 'Cancel' })
+  cancelBtn.addEventListener('click', () => closeBrowsePicker(state))
+  return el('div', { className: 'llnb-picker-footer' }, [cancelBtn])
+}
+
+/** Writes `value` through the `file` widget's real setter+callback — the
+ * exact same pattern syncEntryWidget() uses for `entry` — so picking a file
+ * here behaves exactly like typing it in, including the debounced reload
+ * (onFileWidgetChanged, via wireFileWidget) and that same wrapper's §7.2
+ * read-only guard (moot in practice, since Browse… is itself hidden for a
+ * remote caller — belt-and-suspenders all the same). */
+function setFileWidgetValue(state, value) {
+  const widget = state.fileWidget
+  if (widget.value === value) return
+  widget.value = value
+  try {
+    widget.callback?.(value)
+  } catch (error) {
+    api.warn('file widget callback threw', error)
+  }
+  state.node.graph?.setDirtyCanvas(true, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -652,7 +1154,13 @@ async function reloadNow(state) {
   const token = ++state.loadToken
   cancelDeleteConfirm(state)
   closeNewEntryRow(state)
+  closeRenameRow(state)
   clearConflict(state)
+
+  // FORMAT.md §7.2 remote gating: opportunistic re-check on every reload, on
+  // top of the initial one at attach — cheap, since getConfig() is
+  // module-level cached/de-duped (see "Remote gating" above).
+  refreshRemoteGating(state).catch((error) => api.warn('config refresh failed', error))
 
   const file = state.fileWidget.value ?? ''
   let data
@@ -669,6 +1177,10 @@ async function reloadNow(state) {
   state.file = file
   state.entries = Array.isArray(data.entries) ? data.entries : []
   state.exists = data.exists !== false
+  // FORMAT.md §7.2 file panel: the RESOLVED absolute path, distinct from
+  // the (possibly relative) `file` WIDGET value above.
+  state.resolvedFile = typeof data.file === 'string' ? data.file : null
+  updateFilePanelPath(state)
   setStatus(state, baselineStatus(state, data.problems))
 
   // Restore the selection from the entry widget's (possibly multi-line)
@@ -879,6 +1391,7 @@ async function loadEntryText(state, name) {
 async function chooseSelection(state, names, active) {
   cancelDeleteConfirm(state)
   closeNewEntryRow(state)
+  closeRenameRow(state)
 
   const previousSelection = state.selection
   const previousActive = state.activeName
@@ -987,26 +1500,36 @@ function renderList(state) {
       }
     }
 
-    const selected = isSelected(state, entry.name)
-    const active = entry.name === state.activeName
-    const classes = ['llnb-entry']
-    if (selected) classes.push('llnb-entry-selected')
-    if (active) classes.push('llnb-entry-active')
-
-    const row = el('div', {
-      className: classes.join(' '),
-      text: entry.name,
-      attrs: { tabindex: '0', title: entry.name }
-    })
-    row.addEventListener('pointerdown', (event) => onEntryPointerDown(state, event, entry.name))
-    row.addEventListener('keydown', (event) => {
-      if (event.key !== 'Enter' && event.key !== ' ') return
-      event.preventDefault()
-      handleEntryClick(state, entry.name, { shiftKey: event.shiftKey, toggleKey: event.ctrlKey || event.metaKey })
-    })
+    const row =
+      state.renamingName === entry.name ? buildRenameRow(state, entry) : buildEntryRow(state, entry)
     state.listEl.append(row)
     state.dragRows.push({ el: row, kind: 'entry', name: entry.name, category })
   }
+}
+
+/** The normal (non-renaming) row: click/ctrl/shift-click selection,
+ * pointer-drag reorder (onEntryPointerDown below), double-click to rename
+ * (onEntryDoubleClick, in the "Rename" section further down). */
+function buildEntryRow(state, entry) {
+  const selected = isSelected(state, entry.name)
+  const active = entry.name === state.activeName
+  const classes = ['llnb-entry']
+  if (selected) classes.push('llnb-entry-selected')
+  if (active) classes.push('llnb-entry-active')
+
+  const row = el('div', {
+    className: classes.join(' '),
+    text: entry.name,
+    attrs: { tabindex: '0', title: entry.name }
+  })
+  row.addEventListener('pointerdown', (event) => onEntryPointerDown(state, event, entry.name))
+  row.addEventListener('dblclick', (event) => onEntryDoubleClick(state, event, entry.name))
+  row.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    handleEntryClick(state, entry.name, { shiftKey: event.shiftKey, toggleKey: event.ctrlKey || event.metaKey })
+  })
+  return row
 }
 
 // ---------------------------------------------------------------------------
@@ -1276,6 +1799,162 @@ async function performMove(state, name, target, { force = false } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Rename (FORMAT.md §7.2 amendment) — double-click a row to edit its name
+// inline. See the file header's "Rename" paragraph for the full writeup of
+// how this avoids fighting the click/drag disambiguation above; this
+// section is the implementation it describes.
+// ---------------------------------------------------------------------------
+
+function openRenameRow(state, name) {
+  if (state.renamingName === name) return
+  state.renamingName = name
+  renderList(state)
+}
+
+function closeRenameRow(state) {
+  if (state.renamingName == null) return
+  state.renamingName = null
+  renderList(state)
+}
+
+/** Native `dblclick` only ever follows two complete click cycles on the
+ * same element — see the file header — so both single-clicks have already
+ * run by the time this fires. */
+function onEntryDoubleClick(state, event, name) {
+  event.preventDefault()
+  event.stopPropagation()
+  if (state.busy) return
+  // Belt-and-suspenders: a real drag can't produce a dblclick (a drag
+  // commits via finishDrag()/pointerup, never a click), but a stray
+  // in-flight drag object from some other pointer sequence should never
+  // survive into rename mode.
+  state.drag?.cleanup?.()
+  state.drag = null
+  cancelDeleteConfirm(state)
+  closeNewEntryRow(state)
+  openRenameRow(state, name)
+}
+
+function buildRenameRow(state, entry) {
+  const input = el('input', {
+    className: 'llnb-input llnb-input-rename',
+    attrs: { type: 'text', value: entry.name }
+  })
+  const confirmBtn = el('button', { className: 'llnb-btn llnb-btn-small', text: '✓', attrs: { title: 'Rename' } })
+  const cancelBtn = el('button', { className: 'llnb-btn llnb-btn-small', text: '✕', attrs: { title: 'Cancel' } })
+
+  const commit = () => {
+    performRename(state, entry.name, input.value).catch((error) => api.warn('rename entry failed', error))
+  }
+  const cancel = () => closeRenameRow(state)
+
+  // Without preventDefault on mousedown, clicking either button would shift
+  // focus off `input` first, firing the blur handler below and tearing this
+  // row down before the button's own `click` ever ran (see file header).
+  confirmBtn.addEventListener('mousedown', (event) => event.preventDefault())
+  cancelBtn.addEventListener('mousedown', (event) => event.preventDefault())
+  confirmBtn.addEventListener('click', commit)
+  cancelBtn.addEventListener('click', cancel)
+
+  input.addEventListener('keydown', (event) => {
+    event.stopPropagation()
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      commit()
+    } else if (event.key === 'Escape') {
+      event.preventDefault()
+      cancel()
+    }
+  })
+  // Catch-all for every other way focus can leave the input (Save, the
+  // splitter, outside the widget, tabbing away...). Deferred one tick so a
+  // same-tick blur racing a commit's own renderList() — which naturally
+  // blurs the about-to-be-removed input — sees `renamingName` already
+  // cleared and no-ops instead of double-cancelling (see file header).
+  input.addEventListener('blur', () => {
+    setTimeout(() => {
+      if (state.renamingName === entry.name) cancel()
+    }, 0)
+  })
+
+  const row = el('div', { className: 'llnb-entry-renaming', attrs: { title: entry.name } }, [
+    input,
+    confirmBtn,
+    cancelBtn
+  ])
+
+  requestAnimationFrame(() => {
+    input.focus()
+    input.select()
+  })
+
+  return row
+}
+
+/**
+ * Commits a rename via the existing §5 entry route's `rename_to` (FORMAT.md
+ * has no dedicated rename endpoint). Always refetches `name`'s CURRENT
+ * server-side text first rather than trusting anything already in the
+ * editor pane, so a rename can never silently rewrite the entry's body —
+ * whether because the row being renamed isn't the active one (in practice
+ * it always is — see the file header — but this doesn't rely on that) or
+ * because the active entry has unsaved edits (those stay unsaved; renaming
+ * is a heading-only operation, same as §3.4 promises for a plain update).
+ */
+async function performRename(state, name, rawNewName, { force = false } = {}) {
+  if (state.renamingName !== name) return // superseded by another close/open already
+
+  const newName = (rawNewName || '').trim()
+  if (!newName) {
+    setStatus(state, 'Enter a name for this entry.')
+    return
+  }
+  if (newName === name) {
+    closeRenameRow(state)
+    return
+  }
+  if (state.entries.some((entry) => entry.name === newName)) {
+    setStatus(state, `An entry named "${newName}" already exists.`)
+    return
+  }
+
+  state.busy = true
+  updateSaveButtonEnabled(state)
+  updateDeleteButtonEnabled(state)
+  setStatus(state, `Renaming to "${newName}"…`)
+  try {
+    const current = await fetchEntry(state, name)
+    const body = { file: state.file, name, text: current.text ?? '', rename_to: newName }
+    if (!force && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
+
+    const data = await api.postJson('/lora_library/notebook/entry', body)
+    state.busy = false
+    state.entries = Array.isArray(data.entries) ? data.entries : state.entries
+    state.baseMtime = typeof data.mtime === 'number' ? data.mtime : state.baseMtime
+    state.renamingName = null
+
+    const nextSelection = state.selection.map((n) => (n === name ? newName : n))
+    const nextActive = state.activeName === name ? newName : state.activeName
+    setSelection(state, nextSelection, nextActive)
+    updateSaveButtonEnabled(state)
+    setStatus(state, `Renamed to "${newName}".`)
+  } catch (error) {
+    state.busy = false
+    updateSaveButtonEnabled(state)
+    updateDeleteButtonEnabled(state)
+    if (error?.status === 409) {
+      showConflict(state, 'File changed on disk', {
+        onReload: () => reloadNow(state),
+        onOverwrite: () => performRename(state, name, newName, { force: true })
+      })
+    } else {
+      api.warn('failed to rename notebook entry', error)
+      setStatus(state, `Could not rename "${name}" to "${newName}": ${error.message}`)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Footer: New / Delete buttons <-> inline "new entry name" row
 // ---------------------------------------------------------------------------
 
@@ -1332,6 +2011,7 @@ function renderFooter(state) {
 function openNewEntryRow(state) {
   if (state.busy || state.creatingNew) return
   cancelDeleteConfirm(state)
+  closeRenameRow(state)
   state.creatingNew = true
   renderFooter(state)
 }
@@ -1388,12 +2068,13 @@ async function confirmNewEntry(state, rawName) {
 // ---------------------------------------------------------------------------
 
 function onDeleteClick(state) {
-  if (!state.activeName || state.busy) return
+  if (!state.selection.length || state.busy) return
+  closeRenameRow(state)
 
   if (!state.deleteConfirmActive) {
     state.deleteConfirmActive = true
     if (state.deleteBtn) {
-      state.deleteBtn.textContent = 'Are you sure?'
+      state.deleteBtn.textContent = deleteConfirmLabel(state.selection.length)
       state.deleteBtn.classList.add('llnb-btn-danger')
     }
     state.deleteConfirmTimer = setTimeout(() => cancelDeleteConfirm(state), DELETE_CONFIRM_MS)
@@ -1401,7 +2082,13 @@ function onDeleteClick(state) {
   }
 
   cancelDeleteConfirm(state)
-  performDelete(state).catch((error) => api.warn('delete failed', error))
+  performDeleteRun(state, [...state.selection], 0).catch((error) => api.warn('delete failed', error))
+}
+
+/** "Are you sure?" (one entry) or "Are you sure? (3)" (owner amendment
+ * 2026-07-18c) — the plain, not-yet-armed button label never changes. */
+function deleteConfirmLabel(count) {
+  return count > 1 ? `Are you sure? (${count})` : 'Are you sure?'
 }
 
 function cancelDeleteConfirm(state) {
@@ -1416,27 +2103,59 @@ function cancelDeleteConfirm(state) {
   }
 }
 
-async function performDelete(state, { force = false } = {}) {
-  const name = state.activeName
-  if (!name || state.busy) return
-
+/**
+ * Deletes `names` sequentially over the single-entry §5 delete route,
+ * starting at `startIndex` (>0 only on a post-conflict Overwrite resume —
+ * see below). Each successful response's `mtime` becomes the NEXT
+ * request's `base_mtime`, and each deleted name is dropped from the
+ * selection right away using the exact rule this file always used for a
+ * single delete ("Delete acts on the ACTIVE entry only": hand `active` to
+ * the last other still-selected name, or clear it if none remain) —
+ * applied once per name here, which naturally converges to "clear
+ * selection" by the time the whole batch is gone, since nothing outside
+ * this run ever ADDS to `state.selection` while it's in flight (see the
+ * file header's "Multi-delete" paragraph).
+ *
+ * A 409 stops the run right where it is — everything deleted so far stays
+ * deleted and is already reflected in `state.selection`/the `entry` widget
+ * — and shows the same Reload/Overwrite conflict UI Save/Move already use;
+ * Overwrite re-enters this same function at the failed index with
+ * `force: true` (that ONE request skips `base_mtime`), then continues
+ * normally through the rest of `names`.
+ */
+async function performDeleteRun(state, names, startIndex, { force = false } = {}) {
   state.busy = true
+  updateSaveButtonEnabled(state)
   updateDeleteButtonEnabled(state)
-  setStatus(state, 'Deleting…')
-  try {
-    const body = { file: state.file, name }
-    if (!force && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
+  setStatus(state, names.length > 1 ? `Deleting ${names.length} entries…` : 'Deleting…')
 
-    const data = await api.postJson('/lora_library/notebook/delete', body)
-    state.busy = false
+  for (let index = startIndex; index < names.length; index++) {
+    const name = names[index]
+    let data
+    try {
+      const body = { file: state.file, name }
+      const skipCheck = force && index === startIndex
+      if (!skipCheck && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
+      data = await api.postJson('/lora_library/notebook/delete', body)
+    } catch (error) {
+      state.busy = false
+      updateSaveButtonEnabled(state)
+      updateDeleteButtonEnabled(state)
+      if (error?.status === 409) {
+        showConflict(state, 'File changed on disk', {
+          onReload: () => reloadNow(state),
+          onOverwrite: () => performDeleteRun(state, names, index, { force: true })
+        })
+      } else {
+        api.warn('failed to delete notebook entry', error)
+        setStatus(state, `Delete failed: ${error.message}`)
+      }
+      return
+    }
+
     state.entries = Array.isArray(data.entries) ? data.entries : state.entries
+    state.baseMtime = typeof data.mtime === 'number' ? data.mtime : state.baseMtime
 
-    // §7.2: "Delete acts on the ACTIVE entry only." Drop it from the
-    // selection; if it WAS the active one, hand "active" to the last
-    // remaining selected entry (or clear the editor if none remain). If the
-    // active entry had already moved on to something else while this
-    // request was in flight, leave that alone — just drop the deleted name
-    // from the selection set.
     const previousActive = state.activeName
     const nextSelection = state.selection.filter((n) => n !== name)
     const nextActive = previousActive === name ? lastOrNull(nextSelection) : previousActive
@@ -1450,20 +2169,11 @@ async function performDelete(state, { force = false } = {}) {
         if (result === 'failed') resetEditorDom(state)
       }
     }
-    setStatus(state, 'Deleted.')
-  } catch (error) {
-    state.busy = false
-    updateDeleteButtonEnabled(state)
-    if (error?.status === 409) {
-      showConflict(state, 'File changed on disk', {
-        onReload: () => reloadNow(state),
-        onOverwrite: () => performDelete(state, { force: true })
-      })
-    } else {
-      api.warn('failed to delete notebook entry', error)
-      setStatus(state, `Delete failed: ${error.message}`)
-    }
   }
+
+  state.busy = false
+  updateDeleteButtonEnabled(state)
+  setStatus(state, names.length > 1 ? `Deleted ${names.length} entries.` : 'Deleted.')
 }
 
 // ---------------------------------------------------------------------------
@@ -1528,7 +2238,7 @@ function updateSaveButtonEnabled(state) {
 
 function updateDeleteButtonEnabled(state) {
   if (!state.deleteBtn) return
-  state.deleteBtn.disabled = state.busy || !state.activeName
+  state.deleteBtn.disabled = state.busy || state.selection.length === 0
 }
 
 // ---------------------------------------------------------------------------
