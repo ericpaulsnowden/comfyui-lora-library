@@ -135,8 +135,8 @@
  * between the node's own widgets and the two panes shows the notebook's
  * RESOLVED absolute path (the `file` field of every `GET /notebook`
  * response — NOT the `file` WIDGET's possibly-relative value), truncated
- * with a `direction: rtl` trick (keeps the tail — usually the filename —
- * visible instead of the head) and the full path in `title`. Its two
+ * from the front by `frontTruncate()` (keeps the tail — usually the
+ * filename — visible instead of the head) and the full path in `title`. Its two
  * buttons: `Browse…` opens a small modal file picker (attached to
  * `document.body`, not nested inside this widget's own root — see
  * openBrowsePicker()'s doc comment for why) walking `GET /fs/list`;
@@ -258,13 +258,8 @@ const CSS_TEXT = `
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  /* Front-truncation trick (owner ask, FORMAT.md §7.2): direction:rtl moves
-     the ellipsis to the START of the string so the TAIL (usually the
-     filename) stays visible when the path is too long for the bar; the
-     text's own character order stays left-to-right via unicode-bidi. */
-  direction: rtl;
-  text-align: left;
-  unicode-bidi: plaintext;
+  /* Front-truncation is done in JS (see frontTruncate) — the CSS
+     direction:rtl hack it replaced was defeated by unicode-bidi. */
   color: var(--descrip-text, #999);
   font-size: 10px;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -539,9 +534,6 @@ const CSS_TEXT = `
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  direction: rtl;
-  text-align: left;
-  unicode-bidi: plaintext;
   color: var(--descrip-text, #999);
 }
 .llnb-picker-list {
@@ -1069,10 +1061,27 @@ function buildFilePanel(state) {
   return el('div', { className: 'llnb-filepanel' }, [state.filePanelPathEl, state.filePanelNoteEl, actions])
 }
 
+/**
+ * `text` shortened from the FRONT, so the tail — the filename, the part
+ * that identifies which notebook this is — survives (FORMAT.md §7.2).
+ *
+ * Done in JS rather than with the `direction: rtl` CSS hack this file
+ * originally used: that hack was paired with `unicode-bidi: plaintext`,
+ * which resolves paragraph direction from the first STRONG character —
+ * the Latin letters in any real path — so it silently re-established LTR
+ * and put the ellipsis back on the tail, hiding exactly what it was meant
+ * to keep. (Found live while porting this bar into comfyui-premiere-bridge.)
+ */
+function frontTruncate(text, maxChars = 56) {
+  const value = String(text ?? '')
+  if (value.length <= maxChars) return value
+  return `…${value.slice(-(maxChars - 1))}`
+}
+
 function updateFilePanelPath(state) {
   if (!state.filePanelPathEl) return
   const path = state.resolvedFile || ''
-  state.filePanelPathEl.textContent = path
+  state.filePanelPathEl.textContent = frontTruncate(path)
   state.filePanelPathEl.title = path
 }
 
