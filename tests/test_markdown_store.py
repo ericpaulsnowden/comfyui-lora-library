@@ -226,6 +226,76 @@ class TestUpsertCreate:
         assert ms.list_entries(parsed) == [{"name": "Existing", "category": ""}]
 
 
+class TestUpsertCreateAfter:
+    def test_create_after_inserts_immediately_below_the_named_entry(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n## E2\nB2\n## E3\nB3\n")
+        ms.upsert_entry(parsed, "New", "new body", after="E1")
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": "Cat A"},
+            {"name": "New", "category": "Cat A"},
+            {"name": "E2", "category": "Cat A"},
+            {"name": "E3", "category": "Cat A"},
+        ]
+        assert ms.get_entry(parsed, "New")["text"] == "new body"
+
+    def test_create_after_the_last_entry_lands_at_the_category_boundary(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n")
+        ms.upsert_entry(parsed, "New", "n", after="E1")
+        assert ms.serialize(parsed) == [
+            "# Cat A",
+            "## E1",
+            "B1",
+            "## New",
+            "n",
+            "# Cat B",
+            "## E2",
+            "B2",
+        ]
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": "Cat A"},
+            {"name": "New", "category": "Cat A"},
+            {"name": "E2", "category": "Cat B"},
+        ]
+
+    def test_create_after_unknown_name_falls_back_to_append(self) -> None:
+        parsed = ms.parse("## E1\nB1\n")
+        ms.upsert_entry(parsed, "New", "n", after="does-not-exist")
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": ""},
+            {"name": "New", "category": ""},
+        ]
+
+    def test_create_after_omitted_falls_back_to_append(self) -> None:
+        parsed = ms.parse("## E1\nB1\n")
+        ms.upsert_entry(parsed, "New", "n")
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": ""},
+            {"name": "New", "category": ""},
+        ]
+
+    def test_create_after_takes_priority_over_category(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n")
+        ms.upsert_entry(parsed, "New", "n", category="Cat B", after="E1")
+        # `after` resolved, so `category` is never consulted: New lands
+        # next to E1 in Cat A, not appended to Cat B.
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": "Cat A"},
+            {"name": "New", "category": "Cat A"},
+            {"name": "E2", "category": "Cat B"},
+        ]
+
+    def test_create_after_is_ignored_on_update(self) -> None:
+        parsed = ms.parse("## E1\nold\n## E2\nB2\n")
+        ms.upsert_entry(parsed, "E1", "new body", after="E2")
+        # E1 already existed: this is an update, so `after` never applies —
+        # E1 keeps its position and E2 is untouched.
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": ""},
+            {"name": "E2", "category": ""},
+        ]
+        assert ms.get_entry(parsed, "E1")["text"] == "new body"
+
+
 class TestUpsertUpdate:
     def test_update_replaces_body_in_place(self) -> None:
         parsed = ms.parse("## E1\nold\n## E2\nother\n")
@@ -409,6 +479,73 @@ class TestCreateCategory:
         assert ms.list_categories(parsed) == []
 
 
+class TestCreateCategoryAfter:
+    def test_after_a_category_name_inserts_the_new_block_right_after_it(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n")
+        ms.create_category(parsed, "New Cat", "desc", after="Cat A")
+        assert ms.serialize(parsed) == [
+            "# Cat A",
+            "## E1",
+            "B1",
+            "# New Cat",
+            "desc",
+            "# Cat B",
+            "## E2",
+            "B2",
+        ]
+        assert ms.list_categories(parsed) == ["Cat A", "New Cat", "Cat B"]
+
+    def test_after_an_entry_name_splits_the_block_and_reparents_the_remainder(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n## E2\nB2\n## E3\nB3\n")
+        ms.create_category(parsed, "New Cat", "desc", after="E1")
+        assert ms.serialize(parsed) == [
+            "# Cat A",
+            "## E1",
+            "B1",
+            "# New Cat",
+            "desc",
+            "## E2",
+            "B2",
+            "## E3",
+            "B3",
+        ]
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": "Cat A"},
+            {"name": "E2", "category": "New Cat"},
+            {"name": "E3", "category": "New Cat"},
+        ]
+        # The reparented entries' bodies travelled byte-identically.
+        assert ms.get_entry(parsed, "E2")["text"] == "B2"
+        assert ms.get_entry(parsed, "E3")["text"] == "B3"
+
+    def test_after_the_last_entry_in_a_block_has_no_remainder_to_split(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        ms.create_category(parsed, "New Cat", after="E1")
+        assert ms.serialize(parsed) == ["# Cat A", "## E1", "B1", "# New Cat"]
+        assert ms.list_categories(parsed) == ["Cat A", "New Cat"]
+
+    def test_after_unknown_falls_back_to_end_of_file(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        ms.create_category(parsed, "New Cat", after="does-not-exist")
+        assert ms.serialize(parsed) == ["# Cat A", "## E1", "B1", "# New Cat"]
+
+    def test_after_prefers_a_category_match_over_a_same_named_entry(self) -> None:
+        # "Dup" names both a category and an (unrelated) entry — different
+        # namespaces — so this also documents the tie-break: the category
+        # match wins, checked before any entry lookup is attempted.
+        parsed = ms.parse("# Dup\n## E1\nB1\n# Cat B\n## Dup\nB2\n")
+        ms.create_category(parsed, "New Cat", after="Dup")
+        assert ms.serialize(parsed) == [
+            "# Dup",
+            "## E1",
+            "B1",
+            "# New Cat",
+            "# Cat B",
+            "## Dup",
+            "B2",
+        ]
+
+
 class TestSetCategoryDescription:
     def test_replace_description_on_a_bare_heading(self) -> None:
         parsed = ms.parse("# Cat A\n## E1\nB1\n")
@@ -491,6 +628,70 @@ class TestSetCategoryDescription:
         assert "# Cat A\r\nNew.\r\n## E1\r\nB1\r\n" in rewritten
         # The untouched sibling category + entry are still present byte-for-byte.
         assert "# Cat B\r\n## E2\r\nB2\r\n" in rewritten
+
+
+class TestSetCategoryName:
+    def test_rename_changes_the_heading_and_keeps_entries_intact(self) -> None:
+        parsed = ms.parse("# Cat A\nSome prose.\n## E1\nB1\n## E2\nB2\n")
+        result = ms.set_category_name(parsed, "Cat A", "Cat A2")
+        assert result == {"name": "Cat A2", "description": "Some prose."}
+        assert ms.list_categories(parsed) == ["Cat A2"]
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": "Cat A2"},
+            {"name": "E2", "category": "Cat A2"},
+        ]
+        assert ms.get_entry(parsed, "E1")["text"] == "B1"
+        assert ms.get_entry(parsed, "E2")["text"] == "B2"
+        assert ms.serialize(parsed) == [
+            "# Cat A2",
+            "Some prose.",
+            "## E1",
+            "B1",
+            "## E2",
+            "B2",
+        ]
+
+    def test_rename_to_a_duplicate_name_raises_and_leaves_both_unchanged(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n")
+        with pytest.raises(ms.NameCollisionError):
+            ms.set_category_name(parsed, "Cat A", "Cat B")
+        assert ms.list_categories(parsed) == ["Cat A", "Cat B"]
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": "Cat A"},
+            {"name": "E2", "category": "Cat B"},
+        ]
+
+    def test_rename_to_its_own_current_name_is_a_noop(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        ms.set_category_name(parsed, "Cat A", "Cat A")
+        assert ms.list_categories(parsed) == ["Cat A"]
+
+    def test_rename_unknown_category_raises_not_found(self) -> None:
+        parsed = ms.parse("## E1\nB1\n")
+        with pytest.raises(ms.CategoryNotFoundError):
+            ms.set_category_name(parsed, "Nope", "New Name")
+
+    def test_rename_blank_new_name_raises(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        with pytest.raises(ms.InvalidEntryNameError):
+            ms.set_category_name(parsed, "Cat A", "   ")
+
+    def test_rename_new_name_with_newline_raises(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        with pytest.raises(ms.InvalidEntryNameError):
+            ms.set_category_name(parsed, "Cat A", "Cat\nB")
+
+    def test_rename_repeated_name_targets_the_last_block(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat A\n## E2\nB2\n")
+        ms.set_category_name(parsed, "Cat A", "Renamed")
+        assert ms.serialize(parsed) == [
+            "# Cat A",
+            "## E1",
+            "B1",
+            "# Renamed",
+            "## E2",
+            "B2",
+        ]
 
 
 class TestMoveEntry:
@@ -645,6 +846,99 @@ class TestMoveEntry:
             "# Cat A",
             "## Keep Me",
         ]
+
+
+class TestMoveCategory:
+    def test_move_before_another_category(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n# Cat C\n## E3\nB3\n")
+        result = ms.move_category(parsed, "Cat C", before="Cat A")
+        assert result == {"name": "Cat C"}
+        assert ms.list_categories(parsed) == ["Cat C", "Cat A", "Cat B"]
+        assert ms.list_entries(parsed) == [
+            {"name": "E3", "category": "Cat C"},
+            {"name": "E1", "category": "Cat A"},
+            {"name": "E2", "category": "Cat B"},
+        ]
+
+    def test_move_to_end_of_file_when_before_omitted(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n")
+        ms.move_category(parsed, "Cat A")
+        assert ms.list_categories(parsed) == ["Cat B", "Cat A"]
+        assert ms.serialize(parsed) == [
+            "# Cat B",
+            "## E2",
+            "B2",
+            "# Cat A",
+            "## E1",
+            "B1",
+        ]
+
+    def test_move_carries_description_and_entries_byte_identically(self) -> None:
+        text = (
+            "# Cat B\n## E3\nB3\n"
+            "# Cat A\nDescription prose.\n## E1\nLine one.\n\nLine two.\n## E2\nB2\n"
+        )
+        parsed = ms.parse(text)
+        ms.move_category(parsed, "Cat A", before="Cat B")
+        assert ms.list_categories(parsed) == ["Cat A", "Cat B"]
+        assert ms.get_category_description(parsed, "Cat A") == "Description prose."
+        assert ms.get_entry(parsed, "E1")["text"] == "Line one.\n\nLine two."
+        assert ms.get_entry(parsed, "E2")["text"] == "B2"
+        assert ms.list_entries(parsed) == [
+            {"name": "E1", "category": "Cat A"},
+            {"name": "E2", "category": "Cat A"},
+            {"name": "E3", "category": "Cat B"},
+        ]
+
+    def test_move_preserves_relative_order_of_a_multi_entry_block(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n## E2\nB2\n## E3\nB3\n# Cat B\n## E4\nB4\n")
+        ms.move_category(parsed, "Cat B", before="Cat A")
+        assert ms.serialize(parsed) == [
+            "# Cat B",
+            "## E4",
+            "B4",
+            "# Cat A",
+            "## E1",
+            "B1",
+            "## E2",
+            "B2",
+            "## E3",
+            "B3",
+        ]
+
+    def test_move_the_uncategorized_head_block_is_rejected(self) -> None:
+        parsed = ms.parse("## Head1\nH1\n# Cat A\n## E1\nB1\n")
+        with pytest.raises(ms.CategoryNotFoundError):
+            ms.move_category(parsed, "", before="Cat A")
+
+    def test_move_blank_name_is_rejected_even_with_no_head_entries(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        with pytest.raises(ms.CategoryNotFoundError):
+            ms.move_category(parsed, "   ")
+
+    def test_move_unknown_name_raises(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        with pytest.raises(ms.CategoryNotFoundError):
+            ms.move_category(parsed, "does-not-exist")
+
+    def test_move_unknown_before_raises(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        with pytest.raises(ms.CategoryNotFoundError):
+            ms.move_category(parsed, "Cat A", before="does-not-exist")
+
+    def test_move_before_self_is_a_documented_noop(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n")
+        result = ms.move_category(parsed, "Cat A", before="Cat A")
+        assert result == {"name": "Cat A"}
+        assert ms.list_categories(parsed) == ["Cat A", "Cat B"]
+
+    def test_move_explicit_blank_before_is_not_treated_as_omitted(self) -> None:
+        # Unlike a bare omission (before=None, which means "end of file"),
+        # an explicit "" is looked up like any other name and fails — same
+        # "blank is never a valid name" convention move_entry gets for free.
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        with pytest.raises(ms.CategoryNotFoundError):
+            ms.move_category(parsed, "Cat A", before="")
 
 
 # -------------------------------------------------------------- round trips

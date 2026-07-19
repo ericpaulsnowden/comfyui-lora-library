@@ -53,7 +53,10 @@ class EntryNotFoundError(MarkdownStoreError):
 class CategoryNotFoundError(MarkdownStoreError):
     """``set_category_description``'s *name* addresses no existing category
     (FORMAT.md §3.2's sibling of :class:`EntryNotFoundError` for categories —
-    the route layer maps this to 404 the same way)."""
+    the route layer maps this to 404 the same way) — also reused by
+    :func:`set_category_name` for the same problem, and by
+    :func:`move_category` for an unknown *name*/*before* AND for the
+    uncategorized head region, which is never a movable category."""
 
 
 class ConflictError(MarkdownStoreError):
@@ -318,6 +321,7 @@ def upsert_entry(
     *,
     category: str | None = None,
     rename_to: str | None = None,
+    after: str | None = None,
 ) -> dict:
     """Create *name* (new) or update it in place (existing), optionally
     renaming it to *rename_to* — the one create/update/rename operation
@@ -330,6 +334,17 @@ def upsert_entry(
     the heading)", never a category move — so *category* is silently
     ignored once the entry already exists.
 
+    *after*, when given, names an existing addressable entry (FORMAT.md
+    §3.4 Create after): on CREATE, the new entry is inserted immediately
+    BELOW it, in that entry's own block — taking priority over *category*,
+    which is not consulted once *after* resolves (this naturally lands at a
+    category boundary too, when *after* names the last entry in its block:
+    inserting after the last element of a list is just an append). *after*
+    naming an unknown entry, or omitted, falls back to the *category*/
+    end-of-file placement above. Like *category*, *after* is CREATE-ONLY —
+    silently ignored once *name* already exists, same "update never moves
+    the entry" rule.
+
     Raises :class:`InvalidEntryTextError` if *text* contains an
     unrepresentable heading-looking line, :class:`InvalidEntryNameError` for
     a blank *name* on create, or :class:`NameCollisionError` if *rename_to*
@@ -338,6 +353,7 @@ def upsert_entry(
     name = (name or "").strip()
     category = (category or "").strip()
     rename_to = (rename_to or "").strip()
+    after = (after or "").strip()
 
     bad_line = find_unrepresentable_heading_line(text)
     if bad_line is not None:
@@ -365,6 +381,12 @@ def upsert_entry(
         raise InvalidEntryNameError("entry name must not be empty — FORMAT.md §3.2")
 
     new_entry = Entry(name=name, heading_line=f"## {name}", body=body_lines, addressable=True)
+    after_target = _find_addressable(parsed, after) if after else None
+    if after_target is not None:
+        after_block, after_entry = after_target
+        after_block.entries.insert(after_block.entries.index(after_entry) + 1, new_entry)
+        return {"name": name, "category": after_block.name}
+
     target = _find_last_block(parsed, category) if category else parsed.blocks[-1]
     if target is None:
         target = CategoryBlock(name=category, heading_line=f"# {category}")
@@ -388,15 +410,20 @@ def remove_entry(parsed: ParsedNotebook, name: str) -> bool:
     return True
 
 
-def create_category(parsed: ParsedNotebook, name: str, description: str = "") -> dict:
-    """Append a brand-new ``# name`` heading at end-of-file, with
-    *description* as its FORMAT.md §3.1 description block — the CREATE-ONLY
-    primitive behind §3.4's "Create category" (``POST
-    /lora_library/notebook/category``, FORMAT.md §5, is the create-OR-
-    describe composition of this and :func:`set_category_description`; the
-    route picks one by checking whether *name* is already in
-    :func:`list_categories`). Mutates *parsed*; returns
-    ``{"name","description"}``.
+def create_category(
+    parsed: ParsedNotebook,
+    name: str,
+    description: str = "",
+    *,
+    after: str | None = None,
+) -> dict:
+    """Append a brand-new ``# name`` heading, with *description* as its
+    FORMAT.md §3.1 description block — the CREATE-ONLY primitive behind
+    §3.4's "Create category" (``POST /lora_library/notebook/category``,
+    FORMAT.md §5, is the create-OR-describe composition of this and
+    :func:`set_category_description`; the route picks one by checking
+    whether *name* is already in :func:`list_categories`). Mutates
+    *parsed*; returns ``{"name","description"}``.
 
     *name* must be unique among existing categories, non-empty after
     trimming, and free of embedded newlines (a category name is exactly one
@@ -406,6 +433,20 @@ def create_category(parsed: ParsedNotebook, name: str, description: str = "") ->
     preamble lines (unlike an entry body's degenerate one-blank-line case)
     so "no description" never leaves a stray blank line dangling after the
     heading — FORMAT.md §3.1's "empty when absent", taken literally.
+
+    *after*, when given, positions the new heading right after an existing
+    entry OR category (FORMAT.md §3.4/§5 — the "New while a category is
+    active" case) instead of appending at end-of-file. A CATEGORY name
+    match (checked first; a hand-edited duplicate targets the LAST one,
+    same convention as :func:`set_category_description`) is a whole-block
+    insertion — the matched block itself is untouched. An ENTRY name match
+    SPLITS that entry's block right after it: FORMAT.md's "the file is the
+    truth" rule means whatever entries textually followed it in the old
+    block (if any) now follow the new heading instead, so they become the
+    new category's own entries — those :class:`Entry` objects are relocated
+    by reference, never rebuilt, so their bodies travel byte-identically.
+    *after* naming neither an entry nor a category, or omitted, falls back
+    to the end-of-file append.
 
     Raises :class:`InvalidEntryNameError` for a blank or newline-containing
     *name*, :class:`NameCollisionError` if *name* already names a category,
@@ -432,7 +473,21 @@ def create_category(parsed: ParsedNotebook, name: str, description: str = "") ->
     block = CategoryBlock(
         name=name, heading_line=f"# {name}", preamble=description.split("\n") if description else []
     )
-    parsed.blocks.append(block)
+
+    after = (after or "").strip()
+    after_category = _find_last_block(parsed, after) if after else None
+    if after_category is not None:
+        parsed.blocks.insert(parsed.blocks.index(after_category) + 1, block)
+    else:
+        after_entry = _find_addressable(parsed, after) if after else None
+        if after_entry is not None:
+            src_block, entry = after_entry
+            split_at = src_block.entries.index(entry) + 1
+            block.entries = src_block.entries[split_at:]
+            del src_block.entries[split_at:]
+            parsed.blocks.insert(parsed.blocks.index(src_block) + 1, block)
+        else:
+            parsed.blocks.append(block)
     return {"name": name, "description": _trimmed_text(block.preamble)}
 
 
@@ -468,6 +523,47 @@ def set_category_description(parsed: ParsedNotebook, name: str, description: str
     # docstring.
     block.preamble = description.split("\n") if description else []
     return {"name": name, "description": _trimmed_text(block.preamble)}
+
+
+def set_category_name(parsed: ParsedNotebook, name: str, new_name: str) -> dict:
+    """Rename category *name*'s heading to *new_name* — the RENAME-ONLY
+    primitive behind FORMAT.md §3.4/§5's category ``rename_to`` (a third
+    primitive the ``POST /lora_library/notebook/category`` route composes
+    alongside :func:`set_category_description` on a KNOWN *name*, per
+    :func:`create_category`'s docstring). A repeated category name targets
+    the LAST block with that name, same convention as
+    :func:`set_category_description`. Mutates *parsed*; returns
+    ``{"name","description"}`` for the renamed block.
+
+    Renaming to *name*'s own current value (after trimming) is a
+    documented plain no-op — same convention as :func:`upsert_entry`'s
+    entry rename — so resaving an unchanged name from the §7.2 editor's
+    name field never raises.
+
+    Raises :class:`CategoryNotFoundError` if no category named *name*
+    exists, :class:`InvalidEntryNameError` for a blank or newline-containing
+    *new_name*, or :class:`NameCollisionError` if *new_name* already names a
+    DIFFERENT existing category (FORMAT.md §3.4's "unique among
+    categories").
+    """
+    name = (name or "").strip()
+    block = _find_last_block(parsed, name) if name else None
+    if block is None:
+        raise CategoryNotFoundError(f"no such category {name!r} — FORMAT.md §3.2")
+
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise InvalidEntryNameError("category name must not be empty — FORMAT.md §3.2")
+    if "\n" in new_name:
+        raise InvalidEntryNameError("category name must not contain newlines — FORMAT.md §3.2")
+    if new_name != name and any(
+        b.heading_line is not None and b.name == new_name for b in parsed.blocks
+    ):
+        raise NameCollisionError(f"a category named {new_name!r} already exists — FORMAT.md §3.4")
+
+    block.name = new_name
+    block.heading_line = f"# {new_name}"
+    return {"name": new_name, "description": _trimmed_text(block.preamble)}
 
 
 def move_entry(
@@ -538,6 +634,73 @@ def move_entry(
     src_block.entries.remove(entry)
     dst_block.entries.append(entry)
     return {"name": entry.name, "category": dst_block.name}
+
+
+def move_category(
+    parsed: ParsedNotebook,
+    name: str,
+    *,
+    before: str | None = None,
+) -> dict:
+    """Relocate the whole :class:`CategoryBlock` named *name* — FORMAT.md
+    §3.4 Move category, the primitive behind §5's ``POST
+    /lora_library/notebook/move_category`` and §7.2's drag-a-category-
+    header. Mutates *parsed* in place; returns ``{"name"}``.
+
+    - *before* omitted (``None``): move *name* to the end of the file.
+    - *before* given: move *name* to just before that named category.
+      Moving a category before itself (``before == name``, after trimming)
+      is a documented no-op, same convention as :func:`move_entry`'s
+      ``before == entry.name``. An explicitly blank *before* (``""``, as
+      opposed to omitted — the route tells the two apart the same way
+      ``post_notebook_move`` already does for entries) is looked up like
+      any other name and fails as "not found", the same "blank is never a
+      valid name" outcome :func:`move_entry` gets for free from
+      ``_find_addressable`` never matching an empty name.
+
+    The moved :class:`CategoryBlock` object is relocated by reference
+    (removed from and reinserted into ``parsed.blocks``) — never rebuilt —
+    so its heading, §3.1 description, and every entry's body travel
+    byte-identically, and the entries' relative order inside the block
+    (left untouched) is preserved.
+
+    A repeated category name targets the LAST block with that name for
+    both *name* and *before*, same convention as
+    :func:`set_category_description`.
+
+    The uncategorized head block (``""``, FORMAT.md §3.1's implicit leading
+    region) is not a "category" in this sense and can never be moved — a
+    blank/whitespace-only *name* always raises, regardless of any
+    hand-edited blank-titled ``#`` heading elsewhere in the file (the same
+    blanket rule :func:`get_category_description` uses for the same
+    reason).
+
+    Raises :class:`CategoryNotFoundError` if *name* is blank or names no
+    existing category, or if a given *before* names no existing category.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise CategoryNotFoundError(
+            "the uncategorized head region is not a movable category — FORMAT.md §3.4"
+        )
+    block = _find_last_block(parsed, name)
+    if block is None:
+        raise CategoryNotFoundError(f"no such category {name!r} — FORMAT.md §3.2")
+
+    if before is None:
+        parsed.blocks.remove(block)
+        parsed.blocks.append(block)
+        return {"name": name}
+
+    before = before.strip()
+    if before == name:
+        return {"name": name}
+    target = _find_last_block(parsed, before) if before else None
+    if target is None:
+        raise CategoryNotFoundError(f"no such category {before!r} to move before — FORMAT.md §3.2")
+    parsed.blocks.remove(block)
+    parsed.blocks.insert(parsed.blocks.index(target), block)
+    return {"name": name}
 
 
 # --------------------------------------------------------------------- I/O

@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import os
 import re
-from pathlib import Path
+import string
+from pathlib import Path, PureWindowsPath
 
 from aiohttp import web
 
@@ -24,6 +26,10 @@ logger = logging.getLogger("lora_library")
 
 #: FORMAT.md §4 — set slugs; also the only characters accepted in URLs.
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-_]*$")
+
+#: FORMAT.md §5 — the fs/list sentinel meaning "the top level": every drive
+#: on Windows, the single filesystem root on POSIX.
+ROOTS = "ROOTS"
 
 
 # --------------------------------------------------------------------- guards
@@ -70,6 +76,68 @@ def error_response(status: int, message: str) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
 
+# --------------------------------------------------- fs/list: ROOTS & drives
+#
+# 2026-07-19 fix: the §7.2 picker could reach the top of C:\ but no further
+# — drive roots reported `parent: null`, which reads as "nothing above
+# here" and traps the user instead of offering a way to another drive or a
+# NAS/UNC path. The pieces below are their own functions (rather than
+# inlined in the handler) specifically so tests can monkeypatch the
+# Windows-only bits from macOS/Linux CI — real drive enumeration and real
+# `os.name` are both unavailable there.
+
+
+def _is_windows() -> bool:
+    """True on a real Windows host (FORMAT.md §5's drive-letter world).
+
+    A seam, not a bare ``os.name`` check inlined in the handler, so tests
+    can monkeypatch it to exercise the Windows branches (drive enumeration,
+    drive-root → "ROOTS" parent) without depending on the dev/CI machine's
+    own platform.
+    """
+    return os.name == "nt"
+
+
+def _list_windows_drives() -> list[str]:
+    """Every existing drive's root, e.g. ``["C:\\\\", "D:\\\\"]``.
+
+    Backs the ``dir="ROOTS"`` sentinel on Windows. Probes A-Z with
+    ``Path.exists()`` — factored out to its own function so tests replace
+    it wholesale instead of needing real drives to exist.
+    """
+    return [
+        f"{letter}:\\" for letter in string.ascii_uppercase if Path(f"{letter}:\\").exists()
+    ]
+
+
+def _is_unc_share_root(directory: Path) -> bool:
+    """True when *directory* is a UNC share root (``\\\\server\\share``).
+
+    Re-parsed with ``PureWindowsPath`` rather than trusting the ambient
+    ``Path`` flavor, so this is exercisable on any platform: a share root's
+    "drive" is the ``\\\\server\\share`` string itself (no drive LETTER),
+    which is exactly what distinguishes it from a real drive root like
+    ``C:\\`` — the two need different ``parent`` answers (see below).
+    """
+    drive = PureWindowsPath(str(directory)).drive
+    return bool(drive) and not (len(drive) == 2 and drive[1] == ":")
+
+
+def _fs_root_parent(directory: Path, *, windows: bool) -> str | None:
+    """FORMAT.md §5 ``parent`` for a *directory* that IS a filesystem root.
+
+    - Windows drive root (``C:\\``): climbs to the drive list (``"ROOTS"``)
+      — the fix. Today this reported ``null`` and trapped the user.
+    - UNC share root (``\\\\server\\share``): reports ``null`` even on
+      Windows — there is no portable way to enumerate a server's other
+      shares, so there is nothing to climb to.
+    - POSIX root (``/``): reports ``null`` — it has no sibling to climb to.
+    """
+    if windows and not _is_unc_share_root(directory):
+        return ROOTS
+    return None
+
+
 # ---------------------------------------------------------------- core routes
 
 def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
@@ -97,10 +165,22 @@ def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
     async def get_fs_list(request: web.Request) -> web.Response:
         # FORMAT.md §5: the §7.2 picker's directory listing. Loopback-only —
         # a remote browser defers to the host for file selection (§7.2), so
-        # it never needs to walk the server's filesystem.
+        # it never needs to walk the server's filesystem. The loopback
+        # check runs before ROOTS/absolute-path handling below: ROOTS is an
+        # exception to the absolute-path requirement, never to this one.
         if not request_is_loopback(request):
             return error_response(403, "file browsing is host-machine-only — FORMAT.md §5")
         raw = (request.query.get("dir") or "").strip()
+        windows = _is_windows()
+        if raw == ROOTS:
+            # The one non-absolute accepted value: the virtual "top" of the
+            # filesystem. Windows has no single root — this is a synthetic
+            # drive list. POSIX has exactly one, so ROOTS just resolves to it.
+            if windows:
+                return web.json_response(
+                    {"dir": ROOTS, "parent": None, "dirs": _list_windows_drives(), "files": []}
+                )
+            raw = "/"
         directory = Path(raw) if raw else context.library_dir()
         if not directory.is_absolute():
             return error_response(400, f"dir must be an absolute path (got {raw!r})")
@@ -108,10 +188,12 @@ def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
             entries = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
         except OSError as exc:
             return error_response(400, f"could not list {directory}: {exc}")
+        at_root = directory.parent == directory
+        parent = _fs_root_parent(directory, windows=windows) if at_root else str(directory.parent)
         return web.json_response(
             {
                 "dir": str(directory),
-                "parent": str(directory.parent) if directory.parent != directory else None,
+                "parent": parent,
                 "dirs": [p.name for p in entries if p.is_dir()],
                 "files": [
                     p.name for p in entries if p.is_file() and p.suffix.lower() == ".md"

@@ -18,7 +18,7 @@ Current capabilities, no dependencies:
   `Apply LoRA Set` works standalone (MODEL/CLIP in → out, plus a
   `LORA_STACK` and trigger words). If you use
   [rgthree's Power Lora Loader](https://github.com/rgthree/rgthree-comfy),
-  the `Power Lora Loader State Controller` drives it directly — capture
+  the `Lora Loader State Controller` drives it directly — capture
   its current rows as a state, apply a state back, reorder included.
 
 > **Status: pre-release. All three capabilities ship today:** the **Prompt
@@ -62,9 +62,9 @@ captions).
 - The workflow stores only the file path + selected entry name — never the
   text. The file is the truth; the node is a view.
 
-## Power Lora Loader State Controller (shipped; requires rgthree-comfy)
+## Lora Loader State Controller (shipped; requires rgthree-comfy)
 
-`EPSNodes → Power Lora Loader State Controller`: a small panel node that
+`EPSNodes → Lora Loader State Controller`: a small panel node that
 drives a genuine, untouched
 [Power Lora Loader (rgthree)](https://github.com/rgthree/rgthree-comfy)
 elsewhere in your graph — rgthree stays the loader; this node just moves

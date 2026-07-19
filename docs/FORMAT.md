@@ -143,6 +143,19 @@ Writers re-emit the file from the parse, with these guarantees:
   exists, else the file start). Category membership FOLLOWS position — the
   file is the truth, so dragging an entry under another category heading IS
   the category change. The moved entry's body travels byte-identically.
+- **Create after** (owner ask 2026-07-19 "New makes an entry right below
+  the selected one"): create supports an optional `after` = an existing
+  entry name; the new entry is inserted immediately BELOW it (same
+  category), rather than at end-of-file/category. `after` naming an unknown
+  entry, or omitted, falls back to the existing append behavior. The new
+  entry's name must still be unique (§3.2).
+- **Move category** (owner ask 2026-07-19 "drag category and everything in
+  it"): relocate a whole category block — its `# heading`, its §3.1
+  description, and ALL its entries as one unit — to just before another
+  named category, or to end-of-file. Every moved entry's body and the
+  description travel byte-identically; the relative order inside the block
+  is preserved. The uncategorized head region (`""`) is not a movable
+  category.
 
 ### §3.5 Concurrency (the two-machine case)
 
@@ -205,15 +218,16 @@ message>"}` with a 4xx status. `mtime` values are float POSIX seconds.
 |---|---|
 | `GET /lora_library/version` | `{"version": "X.Y.Z"}` |
 | `GET /lora_library/config` | `{"library_dir", "default_library_dir", "configured": bool, "is_local": bool}` — `is_local` = §2 loopback verdict for THIS request, so a browser can tell whether it sits on the server machine (drives §7.2's remote read-only gating) |
-| `GET /lora_library/fs/list?dir=` | **loopback-only** (403 remote): server-filesystem browser for the §7.2 picker. Empty/missing `dir` ⇒ `library_dir`. → `{"dir": <abs>, "parent": <abs or null>, "dirs": [names], "files": [names]}` — `files` limited to `.md`; entries sorted case-insensitively; unreadable dir ⇒ 400 |
+| `GET /lora_library/fs/list?dir=` | **loopback-only** (403 remote): server-filesystem browser for the §7.2 picker. Empty/missing `dir` ⇒ `library_dir`. `dir="ROOTS"` (sentinel) ⇒ the top level: on Windows every existing drive (`C:\`, `D:\`, `U:\`, …) as `dirs` + `parent: null`; on POSIX the filesystem root `/`. → `{"dir": <abs or "ROOTS">, "parent": <abs, "ROOTS", or null>, "dirs": [names], "files": [names]}` — `files` limited to `.md`; entries sorted case-insensitively; a directory at a drive root reports `parent: "ROOTS"` so the picker can climb to the drive list (the 2026-07-19 "stuck at top of C:\, can't reach another drive/NAS" fix); a UNC path (`\\server\share\…`) passed as `dir` lists normally; unreadable/nonexistent dir ⇒ 400 |
 | `POST /lora_library/notebook/open_folder` `{"file"}` | **loopback-only** (403 remote): reveals the resolved notebook file's folder in the OS file manager ON THE SERVER MACHINE (Explorer/Finder). Missing folder ⇒ 404; `{"ok": true}` |
 | `POST /lora_library/config` `{"library_dir"}` | validates (absolute, creatable, writable), persists; `{"ok", "library_dir"}` |
 | `GET /lora_library/loras` | `{"loras": [".."]}` — installed loras for pickers |
 | `GET /lora_library/notebook?file=` | `{"file": <resolved abs>, "exists": bool, "mtime", "entries": [{"name","category"}], "categories": [names in file order — includes EMPTY categories, which `entries` alone can't reveal], "problems": [".."]}` (missing file ⇒ `exists:false`, empty lists — NOT an error) |
 | `GET /lora_library/notebook/category?file=&name=` | `{"name","description","mtime"}`; 404 if no such category |
-| `POST /lora_library/notebook/category` `{"file","name","description"?,"base_mtime"?}` | §3.4 create-or-describe: unknown `name` ⇒ CREATE the category (at end-of-file) with the given description; known `name` ⇒ replace its description. §3.5 conflicts ⇒ 409; un-representable description lines ⇒ 400. → `{"ok","mtime","entries","categories"}` |
+| `POST /lora_library/notebook/category` `{"file","name","description"?,"after"?,"rename_to"?,"base_mtime"?}` | §3.4 create-or-describe: unknown `name` ⇒ CREATE the category (default end-of-file; `after` = insert the new `# heading` right after that entry/category — used by New-below when the active item is a category) with the given description; known `name` ⇒ replace its description and, when `rename_to` is present, rename the heading (unique among categories). §3.5 ⇒ 409; un-representable description lines ⇒ 400. → `{"ok","mtime","entries","categories"}` |
 | `GET /lora_library/notebook/entry?file=&name=` | `{"name","category","text","mtime"}`; 404 if absent |
-| `POST /lora_library/notebook/entry` `{"file","name","text","category"?,"rename_to"?,"base_mtime"?}` | create-or-update per §3.4/§3.5; `{"ok","mtime","entries"}` (fresh list) |
+| `POST /lora_library/notebook/entry` `{"file","name","text","category"?,"after"?,"rename_to"?,"base_mtime"?}` | create-or-update per §3.4/§3.5; `after` = insert a NEW entry directly below that entry (§3.4 Create after); `{"ok","mtime","entries"}` (fresh list) |
+| `POST /lora_library/notebook/move_category` `{"file","name","before"?,"base_mtime"?}` | §3.4 Move category: relocate the whole block before the named category, or to end-of-file when `before` omitted; unknown `name`/`before` ⇒ 404; §3.5 ⇒ 409; `{"ok","mtime","entries","categories"}` |
 | `POST /lora_library/notebook/delete` `{"file","name","base_mtime"?}` | `{"ok","mtime","entries"}` |
 | `POST /lora_library/notebook/move` `{"file","name","before"?,"category"?,"base_mtime"?}` | §3.4 Move: exactly one of `before` (entry name to insert before) or `category` (append to that category's end; `""` = uncategorized/file-end rule) — both/neither ⇒ 400; unknown `name`/`before` ⇒ 404; §3.5 conflicts ⇒ 409; `{"ok","mtime","entries"}` |
 | `GET /lora_library/sets` | `{"sets": [{"slug","name","count"}]}` sorted by name |
@@ -280,17 +294,53 @@ execution — **the file is the truth; the UI is a view.**
   warning, missing individual loras follow §4 skip rules.
 - `IS_CHANGED` → set file mtime/size + widget values; `VALIDATE_INPUTS`
   True (set list is dynamic).
+- **Sync target of the controller's Push State (§6.3).** Apply LoRA Set
+  needs no structural change for this: the controller's Push State button
+  sets each Apply LoRA Set node's `set` widget to a chosen state and
+  triggers a re-read. So one controller can keep any number of Apply LoRA
+  Set nodes on the same state at once — the owner's "multiple Apply LoRA
+  Set nodes all controlled by one controller, kept in sync" use case.
 
-### §6.3 `Power Lora Loader State Controller` (frontend-only virtual node)
+### §6.3 `Lora Loader State Controller` (frontend-only virtual node)
 
-Naming (owner, 2026-07-18c): the node's DISPLAY name is "Power Lora Loader
-State Controller" and every user-facing word in its UI says **state**, not
-set — widget label `state`, buttons `New State` (capture current rows as a
-new state), `Save State` (overwrite the selected state with current rows),
-`Delete State` (two-click confirm). The class id `LoraLibrarySetController`
-stays frozen (§8), and states ARE §4 set files — same storage, same routes,
-same files the Apply LoRA Set node reads; only the controller's vocabulary
-changes.
+Naming (owner 2026-07-18c, refined 2026-07-19): the node's DISPLAY name is
+**"Lora Loader State Controller"** (was "Power Lora Loader State
+Controller" — "Power" dropped) and every user-facing word in its UI says
+**state**, not set — widget label `state`, buttons `New State` (capture
+current rows as a new state), `Save State` (overwrite the selected state
+with current rows), `Delete State` (two-click confirm), and `Push State`
+(broadcast — below). The class id `LoraLibrarySetController` stays frozen
+(§8), and states ARE §4 set files — same storage, same routes, same files
+the Apply LoRA Set node reads; only the controller's vocabulary changes.
+
+**Push State** (owner ask 2026-07-19): sets EVERY `LoraLibraryApplySet`
+node in the graph to the controller's currently-selected state (writing
+each one's `set` widget through its real setter + firing its callback), so
+all of them switch together. This is the sync mechanism for the "one
+controller drives several Apply LoRA Set nodes" workflow. It also
+double-serves as an explicit re-apply, which matters because re-selecting
+the already-selected value in a combo does not fire its callback (see the
+strength-persistence fix below).
+
+**Strength persistence — 2026-07-19 bug fixes (owner: "Save State doesn't
+work; the loader isn't remembering strengths; re-picking reverts").** Two
+distinct causes, both fixed here:
+1. Re-selecting the SAME state in the `state` combo is a no-op on this
+   litegraph fork (the callback only fires when the value CHANGES), so
+   after Save State a re-pick never re-applied and looked like a revert.
+   Fix: apply must be invokable independently of a combo-value change —
+   `Save State` re-applies immediately after saving, and any state
+   selection (even to the current value) forces an apply. Verify the
+   fork's actual same-value callback behavior live and route around it.
+2. Capture must read the LIVE dragged strength. rgthree stores it at
+   `widget.value.strength` and mutates in place on step/drag
+   (power_lora_loader.js `stepStrength`: `this.value[prop] = …`), so a
+   live read is correct — VERIFY on the rig with a REAL strength drag
+   (not a programmatic value swap) against a real lora, since real loras
+   carry `loraInfo` (strengthMin/Max) that rgthree clamps against; confirm
+   capture and apply both preserve a hand-dragged value end to end. If the
+   real drag path stores strength anywhere other than `value.strength`,
+   read that and document it.
 
 Registered purely in JS (like core's MarkdownNote) under the type name
 `LoraLibrarySetController`; it never executes server-side and never blocks a
@@ -302,12 +352,14 @@ queue. It drives a **genuine, untouched `Power Lora Loader (rgthree)`**:
   (internal widget name `set`, displayed label `state`, options from §5
   sets routes — **choosing a state IS the apply**: the combo's callback
   applies immediately, there is NO Apply button; owner decision 2026-07-18
-  after the button read as broken), `name` (text), buttons: `New State`,
-  `Save State`, `Delete State` (two-click "Are you sure?" confirm; the
-  armed button is visually distinct, survives background cache refreshes
-  for its full window, and selection is slug-anchored so a mid-window
-  sets-poll cannot invalidate it — the 2026-07-18 "delete does nothing
-  during a running workflow" bug).
+  after the button read as broken; but see the strength-persistence fix —
+  selecting must force an apply even when the value is unchanged), `name`
+  (text), buttons: `New State`, `Save State`, `Delete State` (two-click
+  "Are you sure?" confirm; the armed button is visually distinct, survives
+  background cache refreshes for its full window, and selection is
+  slug-anchored so a mid-window sets-poll cannot invalidate it — the
+  2026-07-18 "delete does nothing during a running workflow" bug), and
+  `Push State` (§6.3 broadcast to all Apply LoRA Set nodes).
 - Multi-target semantics: with `All…` selected, APPLY writes the set to
   every PLL in the graph; CAPTURE reads from the lowest-node-id PLL (a
   deterministic, documented choice — capture needs one source of truth).
@@ -350,6 +402,18 @@ queue. It drives a **genuine, untouched `Power Lora Loader (rgthree)`**:
     single selection. All selected rows highlight; the EDITOR always shows
     the most recently clicked entry (the "active" one) — editing/saving
     touches only it. The `entry` widget holds the §6.1 newline-joined list.
+  - New-below (owner ask 2026-07-19): `＋ New` inserts the new entry
+    directly below the ACTIVE entry (via the §5 entry route's `after`),
+    in that entry's category — not at end-of-file. With nothing selected it
+    appends as before.
+  - Rename via the editor header (owner ask 2026-07-19): the editor pane
+    has a NAME field at its top showing the active item's name; editing it
+    and Saving renames (entries via the entry route's `rename_to`;
+    categories via a category-rename — see §6.3 note / add a `rename_to`
+    to the category route). This is the PRIMARY rename path because the
+    old double-click-inline rename was reported not working; double-click
+    now simply focuses this field. Duplicate names refused client-side
+    first, server authoritative.
   - Delete removes EVERY selected entry (owner amendment 2026-07-18c): the
     confirm label shows the count when >1 ("Are you sure? (3)"); deletion
     is sequential client-side over the §5 delete route, refreshing
@@ -361,22 +425,43 @@ queue. It drives a **genuine, untouched `Power Lora Loader (rgthree)`**:
   - Categories in the UI (owner ask 2026-07-19): `＋ New` with a name
     STARTING WITH `#` creates a category instead of an entry (the `#` and
     surrounding whitespace are stripped from the stored name). Category
-    headers are CLICKABLE: selecting one shows its §3.1 description in the
-    editor pane, and Save writes the description through the §5 category
-    route — the editor is contextual (entry selected ⇒ entry body;
-    category selected ⇒ category description; a visible mode hint says
-    which). Category selection is UI-only: it never touches the `entry`
-    widget, the selection set, or the node's outputs. Empty categories
-    render from the §5 `categories` list.
-  - File panel (owner amendment 2026-07-18c): the RESOLVED absolute path
-    of the notebook file is always visible (muted line under the widgets,
-    ellipsized middle-out, full path in its tooltip). Two buttons beside
-    it — `Browse…` (a server-filesystem picker dialog over §5 `fs/list`:
-    navigate dirs, pick a `.md` file → writes the `file` widget) and
-    `Open folder` (§5 `open_folder`) — both HIDDEN when the §5 config
-    reports `is_local: false`, and the `file` text widget becomes
-    read-only then too: a remote browser (the Mac viewing the PC) sees
-    where the file lives but defers to the host for changing it.
+    headers are CLICKABLE and do TWO things at once: (1) toggle
+    collapse/expand of that category's entries in the left list (owner ask
+    "single tap category name to collapse category"; collapse state is
+    UI-only, per-browser, not written to the file), and (2) make the
+    category active so the editor pane shows its §3.1 description. Save
+    writes the description (and rename via the header name field) through
+    the §5 category route — the editor is contextual (entry active ⇒ body;
+    category active ⇒ description; the mode hint says which). Category
+    selection is UI-only: it never touches the `entry` widget, the entry
+    selection set, or the node's outputs. Empty categories render from the
+    §5 `categories` list.
+  - Multi-select drag into a category (owner ask 2026-07-19): when 2+
+    entries are selected, dragging any one of them moves the WHOLE
+    selection to the drop target, in selection order (one §5 `/move` per
+    entry, or a batch — implementer's choice, but base_mtime is refreshed
+    between each so the run doesn't self-conflict).
+  - Drag a category header to move the whole category and its entries
+    (§3.4 Move category, §5 `/move_category`), with the same insertion
+    marker as entry drag.
+  - File panel (owner amendment 2026-07-18c, reworked 2026-07-19): the
+    panel IS the file control — the raw `file` STRING widget is HIDDEN
+    (kept only as the serialized value the node reads; §6.1) and the panel
+    replaces it. It shows the RESOLVED absolute path FULL-WIDTH (owner ask:
+    "make this full width so it doesn't need to be trimmed"); front-trim
+    (keeping the filename) only when the path genuinely overflows the bar,
+    full path in tooltip. `Browse…` (picker over §5 `fs/list`, now with
+    drive/UNC navigation and a type-a-path input — §5) and `Open folder`
+    (§5 `open_folder`). When §5 config reports `is_local: false`, both
+    buttons hide, the path becomes read-only, AND the host-machine notice
+    ("the host controls which file this node reads") shows on ITS OWN line
+    only then (owner ask: separate line, only when needed) — never inline,
+    never on load when local.
+  - Browse picker: a "type or paste a path" input (accepts any absolute
+    path incl. UNC `\\server\share`, applied on Enter/Go), a `..` row that
+    climbs to the drive list at a drive root (via §5 `dir="ROOTS"`), and
+    the drive list itself — so a NAS/other-drive target is always
+    reachable (the 2026-07-19 "couldn't leave C:\" fix).
   - Drag-reorder: rows drag within the list with a visible insertion
     marker; dropping emits one §5 `/notebook/move` (before = the row below
     the marker, or `category` append when dropped at a category's end/on

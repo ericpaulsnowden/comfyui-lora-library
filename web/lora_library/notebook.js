@@ -1,20 +1,29 @@
 /**
  * @file Prompt Notebook two-pane DOM widget (FORMAT.md §7.2) — attaches to
  * `LoraLibraryNotebook` nodes. Left pane: a scrollable, category-grouped,
- * multi-selectable, drag-to-reorder, double-click-to-rename entry list —
- * with CLICKABLE category headers (incl. empty ones — see "Categories"
- * below) and a ＋ New control that creates either an entry or (given a
- * `#`-prefixed name) a category, plus 🗑 Delete (entry-only). Right pane: a
- * `<textarea>` editor with a Save button and a status line (conflict
- * resolution per §3.5 lands there too) that's CONTEXTUAL — entry body or
- * category description, per whichever was last clicked, with a mode hint
- * saying which. Above both panes, a file panel shows the notebook's
- * RESOLVED absolute path plus Browse…/Open folder buttons — hidden (and the
- * `file` widget made effectively read-only) for a remote (`is_local: false`)
- * viewer. The node's own `file`/`entry` STRING widgets stay the serialized
- * truth (§6.1/§7.2) — this DOM widget only ever *reads* `file` and *writes*
- * `entry`/`file` through their normal widget setters; it never serializes
- * itself.
+ * multi-selectable, drag-to-reorder (including a multiselect dragged as one
+ * block, and a whole category dragged by its header) entry list — with
+ * CLICKABLE, COLLAPSIBLE category headers (single tap toggles collapse AND
+ * selects; incl. empty categories — see "Categories" below) and a ＋ New
+ * control that creates either an entry (landing directly below the active
+ * one — "New-below" below) or (given a `#`-prefixed name) a category, plus
+ * 🗑 Delete (entry-only). Right pane: a NAME field (the primary rename
+ * control — see "Rename via the editor's name field" below) above a
+ * `<textarea>` editor, a Save button, and a status line (conflict
+ * resolution per §3.5 lands there too) — both fields are CONTEXTUAL, entry
+ * body/name or category description/name, per whichever was last clicked,
+ * with a mode hint saying which. Above both panes, a file panel — now the
+ * ONLY visible file control, full-width — shows the notebook's RESOLVED
+ * absolute path plus Browse…/Open folder buttons; the raw `file` STRING
+ * widget itself is hidden outright (`.hidden`, not merely read-only) since
+ * this panel replaces it, and both panel buttons hide (and the panel
+ * becomes read-only in effect) for a remote (`is_local: false`) viewer, whose
+ * host-machine notice lives on its own line, never inline. The node's own
+ * `file`/`entry` STRING widgets stay the serialized truth (§6.1/§7.2) — this
+ * DOM widget only ever *reads* `file` and *writes* `entry`/`file` through
+ * their normal widget setters; it never serializes itself, and neither does
+ * the left list's collapse state (session/per-node UI only — see "Single-tap
+ * collapse" below).
  *
  * Multi-select (FORMAT.md §6.1/§7.2, owner amendment 2026-07-18): ctrl/
  * cmd+click toggles one entry in/out of the selection, shift+click extends
@@ -94,65 +103,102 @@
  * failed name with that one request forced (base_mtime omitted), then
  * continues normally. See performDeleteRun() below.
  *
- * Rename (FORMAT.md §7.2 amendment): double-clicking a row swaps its label
- * for an inline `<input>` (same `.llnb-input` styling family as the
- * New-entry row) with ✓/✕ buttons; Enter/✓ commits via the existing §5
- * entry route's `rename_to` + `base_mtime`, Esc/blur cancels. Click-vs-
- * drag-vs-double-click disambiguation: a browser's native `dblclick` only
- * ever fires *after* two complete click cycles on the same element, and
- * both of this file's own click handlers (onEntryPointerDown's
- * sub-threshold-movement path, dispatching to handleEntryClick) run
- * synchronously inside each of those two cycles — so by the time our
- * `dblclick` listener runs, both single-clicks have already resolved
- * (normally collapsing the selection to just this row, per selectSingle(),
- * which is also why the renamed row is always `state.activeName`). There
- * is therefore no "pending click" to race against the dblclick itself; the
- * real hazard is a LATER-resolving async side effect of one of those
- * clicks — specifically chooseSelection()'s load-failure rollback — calling
- * renderList() after rename mode has already opened. renderList() is what
- * renders `state.renamingName`'s row as the input in the first place
- * (rather than an imperative one-off DOM swap), so any such incidental
- * re-render regenerates the SAME rename input instead of destroying it.
- * Every other "something else wants the list/selection to change" entry
- * point (chooseSelection, openNewEntryRow, reloadNow) explicitly calls
- * closeRenameRow() first, exactly like they already do for
- * cancelDeleteConfirm()/closeNewEntryRow() — so clicking another row (or
- * anything else that mutates the list) deterministically cancels an
- * in-progress rename rather than leaving it to chance. The one case that
- * isn't one of those explicit call sites — focus simply leaving the input
- * (clicking Save, the splitter, outside the widget, tabbing away) — is
- * caught by the input's own `blur` handler, deferred by one tick so a
- * same-tick blur racing a successful commit's own renderList() (which
- * naturally blurs the about-to-be-removed input) sees `renamingName`
- * already cleared and no-ops. The confirm/cancel buttons call
- * `preventDefault()` on their OWN `mousedown` for the standard reason:
- * without it, clicking them would shift focus away from the input (firing
- * that same blur-cancel) before their `click` handler ever ran. See the
- * "Rename" section below (openRenameRow/closeRenameRow/buildRenameRow/
- * performRename) for the implementation.
+ * Rename via the editor's name field (FORMAT.md §7.2 amendment, owner ask
+ * 2026-07-19 — supersedes the double-click-inline-input scheme this
+ * paragraph used to describe, removed outright, "the old inline rename was
+ * reported not working"): a NAME field sits at the top of the right pane,
+ * above the mode hint (buildUi()'s `state.nameFieldEl`). It always shows
+ * the currently-active item's name (entry or category — populateEditor()
+ * sets it alongside the textarea, so the two never drift apart) and is
+ * plain-editable text; editing it dirties the SAME Save button the
+ * textarea does (refreshDirty() ORs both), and Save (performSave()/
+ * performSaveCategory()) sends the field's value as `rename_to` in the
+ * very same request as the body/description write WHEN it differs from
+ * the active name — one request does both, atomically, whenever both
+ * changed. Duplicate names are refused client-side first (checked against
+ * `state.entries`/`state.categories`), server authoritative same as every
+ * other write in this file. Double-clicking a row no longer opens an
+ * inline editor — it just moves focus (+select()) to this field via
+ * focusNameField(), relying on the SAME click-vs-drag-vs-double-click
+ * disambiguation already documented for onEntryPointerDown below (both
+ * single-clicks that precede a dblclick resolve to a selection change
+ * first, which is what makes the name field already show the right item's
+ * name by the time focus lands on it — modulo the harmless brief race
+ * described at focusNameField()'s own definition).
  *
- * File panel + remote gating (FORMAT.md §7.2 amendment): a muted bar
- * between the node's own widgets and the two panes shows the notebook's
- * RESOLVED absolute path (the `file` field of every `GET /notebook`
- * response — NOT the `file` WIDGET's possibly-relative value), truncated
- * from the front by `frontTruncate()` (keeps the tail — usually the
- * filename — visible instead of the head) and the full path in `title`. Its two
- * buttons: `Browse…` opens a small modal file picker (attached to
- * `document.body`, not nested inside this widget's own root — see
- * openBrowsePicker()'s doc comment for why) walking `GET /fs/list`;
+ * File panel (FORMAT.md §7.2 amendment, reworked 2026-07-19 — "why trim at
+ * all, make it full width; what's the point of the file field at top,
+ * replace it with this"): the raw `file` STRING widget is hidden outright
+ * via `widget.hidden = true` (hideFileWidget(), called once at attach) —
+ * the same first-class litegraph layout primitive controller.js's "Show
+ * status" toggle uses (see that file's header for the citations backing
+ * this: `.hidden` pulls a widget out of drawing AND layout AND size, unlike
+ * `.disabled`, which on this fork blanks a disabled TEXT widget's value
+ * outright instead of graying it out — wrong for a widget that must keep
+ * serializing the node's real value). This panel — a muted bar between the
+ * node's own widgets and the two panes — is what replaces it as the visible
+ * file control: a full-width row shows the notebook's RESOLVED absolute
+ * path (the `file` field of every `GET /notebook` response — NOT the
+ * `file` WIDGET's possibly-relative value) plus `Browse…`/`Open folder`;
+ * updateFilePanelPath() sets the FULL path first and only front-truncates
+ * (`frontTruncate()`, unchanged — keeps the tail, usually the filename,
+ * visible instead of the head) once a real DOM overflow check
+ * (`scrollWidth > clientWidth`) says it genuinely doesn't fit at the bar's
+ * CURRENT width, re-checked on resize via a `ResizeObserver` — never at a
+ * fixed character budget regardless of the node's actual size. The full
+ * path always sits in `title`. `Browse…` opens a small modal file picker
+ * (attached to `document.body`, not nested inside this widget's own root —
+ * see openBrowsePicker()'s doc comment for why) walking `GET /fs/list`;
  * `Open folder` fires `POST /notebook/open_folder` and reports failure on
- * the status line. `GET /config`'s `is_local` (fetched once per attach,
+ * the status line.
+ *
+ * Remote gating: `GET /config`'s `is_local` (fetched once per attach,
  * cached at MODULE scope with a short TTL so N attached nodes share one
- * fetch) hides both buttons and makes the `file` widget effectively
- * read-only for a remote (non-loopback) viewer — deliberately NOT via
- * `widget.disabled`, which on this litegraph fork blanks a disabled TEXT
- * widget's VALUE entirely rather than just graying it out (see
- * controller.js's header finding on its own `status` widget); instead the
- * `file` widget's callback (already wrapped by wireFileWidget below)
- * reverts any edit back to the last known-good value and posts a calm
- * status note. Every other feature in this file (browsing/editing/saving/
- * deleting/renaming/reordering entries) stays fully functional for a
- * remote viewer — only the FILE the node points at is host-controlled.
+ * fetch) hides both file-panel buttons and makes the panel's path
+ * effectively read-only for a remote (non-loopback) viewer — the panel is
+ * a `<div>`, not an input, so "read-only" here just means there's no
+ * control left that could change `file`. The host-machine notice
+ * ("the host controls which file this node reads") lives on its OWN line
+ * below the path/buttons row (`state.filePanelNoteEl`, its own block, not
+ * squeezed inline the way it used to be) and is populated ONLY when
+ * `is_local === false` — the element is empty (and `:empty { display:
+ * none }` collapses it to zero height) on every local load, never shown
+ * "just in case." The `file` widget's callback (already wrapped by
+ * wireFileWidget below) additionally reverts any programmatic edit back to
+ * the last known-good value for a remote viewer and posts that same calm
+ * status note — belt-and-suspenders now that hideFileWidget() means no UI
+ * surface should be able to trigger that edit at all. Every other feature
+ * in this file (browsing/editing/saving/deleting/renaming/reordering
+ * entries) stays fully functional for a remote viewer — only the FILE the
+ * node points at is host-controlled.
+ *
+ * New-below (owner ask 2026-07-19 "New makes an entry right below the
+ * selected one"): confirmNewEntry() passes `after: state.activeName` to
+ * `POST /notebook/entry` whenever an ENTRY is active (category mode off);
+ * with nothing active, or a CATEGORY active, it keeps the old end-of-file/
+ * end-of-category append (the server falls back to that same append on an
+ * omitted/unresolvable `after` regardless, so this is a request-shaping
+ * choice, not a safety one).
+ *
+ * Browse picker drive/UNC + path input (FORMAT.md §5 fix, owner's NAS
+ * case): the picker's `..` row already forwards whatever `parent` the
+ * server reports, which — since routes.py's `fs/list` now reports
+ * `parent: "ROOTS"` at a Windows drive root and `parent: null` only at an
+ * actual top (no sibling to climb to, e.g. a UNC share root or POSIX `/`)
+ * — already climbs correctly and already hides itself at a true top; the
+ * one real bug fixed here is navigating a drive-list ENTRY (`C:\`, listed
+ * when `dir` is the `FS_ROOTS` sentinel): that name is already a complete
+ * root, so it must be opened AS-IS, never joined onto the literal `"ROOTS"`
+ * string like a normal child (joinServerPath() would produce the nonsense
+ * path `"ROOTS/C:\"` — see renderPickerDialog()). A "type or paste a path"
+ * input pinned above the listing (openBrowsePicker()) accepts any absolute
+ * path, including a UNC share (`\\server\share`), on Enter/Go, and a
+ * failed lookup (400) reports inline right under that input — via its own
+ * `pathErrorEl`, never by blanking the whole dialog — leaving the picker
+ * open so the user can just fix the path and retry; every OTHER navigation
+ * (a folder row, the back row, the drive list) now reports through that
+ * same inline slot for the same reason, unifying what used to be a
+ * separate whole-dialog error view.
  *
  * Categories (FORMAT.md §7.2 amendment, owner ask 2026-07-19): typing a name
  * STARTING WITH `#` into the ＋ New row creates a CATEGORY instead of an
@@ -177,11 +223,57 @@
  * "active" one underneath category mode) and clicking a header always
  * enters it, but neither path ever calls setSelection()/syncEntryWidget().
  * Delete is entry-only and disabled outright in category mode
- * (updateDeleteButtonEnabled()); double-click-to-rename stays wired to entry
- * rows only, so it never applies to a header. Drag-reorder/drop-on-header
- * targeting is unaffected — headers were already valid drop targets
- * (computeDropTarget()) before category mode existed, and that geometry
- * doesn't know or care whether a header happens to be the active one.
+ * (updateDeleteButtonEnabled()); double-clicking a header focuses the name
+ * field exactly like double-clicking an entry row does (see "Rename via
+ * the editor's name field" above) — it never opens anything header-local.
+ *
+ * Single-tap collapse (owner ask 2026-07-19 "single tap category name to
+ * collapse category"): a plain tap on a header now does TWO things at once
+ * — toggleCategoryCollapse() flips its membership in
+ * `state.collapsedCategories` (a plain `Set<string>`, created once per
+ * node in createState() and never read by anything outside this file) and
+ * selectCategory() still enters category mode, exactly as before. Collapse
+ * state is deliberately NOT a node property and never touches
+ * `entry`/`file` — it lives only on this in-memory `Set`, so it is pure
+ * per-node, per-session UI state: it survives any number of renderList()
+ * redraws (renderList() reads the Set fresh every call and skips a
+ * collapsed category's entry rows, still rendering the header itself) but
+ * resets on a page reload, and — critically, given the file header's
+ * opening promise that "only `file` + `entry` persist" — it is NEVER
+ * serialized into the workflow. A collapsed category's entries are simply
+ * absent from `state.dragRows` too, so they're inert (no click, no drag
+ * source) until expanded again; the header itself stays a valid drop
+ * TARGET either way (computeDropTarget()'s category-append geometry
+ * degrades to "append after the header" when there's nothing visible
+ * under it, the same fallback an actually-empty category already used).
+ *
+ * Drag a category header (owner ask 2026-07-19 "drag category and
+ * everything in it"): a header is now ALSO a drag SOURCE, not just a drop
+ * target — onCategoryPointerDown() is the header's sibling of
+ * onEntryPointerDown() below, sharing the same pointerdown/move/up
+ * threshold-disambiguation gesture (beginDrag/endDragVisuals/positionMarker
+ * are kind-agnostic; updateDrag()/finishDrag() branch on `drag.kind`).
+ * Below the threshold it resolves to the tap behavior above (toggle
+ * collapse + selectCategory); at/past it, it commits to relocating the
+ * WHOLE category block via `POST /notebook/move_category`
+ * (performMoveCategory(), computeCategoryDropTarget() — valid targets are
+ * only "before another category header" or "end of file", never "into"
+ * anything, since §3.4 Move category has no such primitive).
+ *
+ * Multiselect drag into a category (owner ask 2026-07-19): dragging any
+ * ENTRY that's part of a 2+ selection moves the whole `state.selection`,
+ * in selection order, to wherever that one drag's pointer lands —
+ * dragMoveNames() decides the moving set, computeDropTarget() excludes all
+ * of them (not just the grabbed row) from the drop geometry, and
+ * performMoveRun() (performDeleteRun()'s sibling) sends one
+ * `/notebook/move` per name, refreshing `base_mtime` from each response so
+ * the run can't self-conflict, re-using the SAME resolved target for every
+ * entry — which is what keeps the moved block's relative order intact,
+ * since inserting each subsequent name "before the same sibling" (or
+ * "onto the same category's current end") naturally stacks them in
+ * selection order. See performMoveRun()'s own doc for the geometry
+ * argument in full. A single-entry drag is unaffected — it still resolves
+ * to plain performMove().
  *
  * Vanilla ES modules, no build step — DOM nodes are built with
  * `document.createElement` (see the local `el()` helper) rather than any
@@ -212,6 +304,10 @@ const FILE_CHANGE_DEBOUNCE_MS = 250
  * and the click never fires — see onEntryPointerDown().
  */
 const DRAG_THRESHOLD_PX = 4
+
+/** FORMAT.md §5's `fs/list` sentinel for "the top level" (drive list on
+ * Windows, filesystem root on POSIX) — mirrors routes.py's own `ROOTS`. */
+const FS_ROOTS = 'ROOTS'
 
 const STYLE_TAG_ID = 'lora-library-notebook-styles'
 
@@ -244,13 +340,20 @@ const CSS_TEXT = `
   color: var(--input-text, #ccc);
 }
 .llnb-filepanel {
+  /* Reworked 2026-07-19: a COLUMN of two rows now, not one — the path/
+     buttons row, then the host-machine note on its own full-width line
+     (only ever present when remote — see the file header). */
   flex: 0 0 auto;
   display: flex;
-  align-items: center;
-  gap: 6px;
+  flex-direction: column;
   padding: 3px 6px;
   border-bottom: 1px solid var(--border-color, #444);
   background: var(--comfy-menu-bg, #262626);
+}
+.llnb-filepanel-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .llnb-filepanel-path {
   flex: 1 1 auto;
@@ -258,15 +361,17 @@ const CSS_TEXT = `
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  /* Front-truncation is done in JS (see frontTruncate) — the CSS
-     direction:rtl hack it replaced was defeated by unicode-bidi. */
+  /* Front-truncation is done in JS (see frontTruncate/updateFilePanelPath)
+     only once a real overflow is measured — the CSS ellipsis here is a
+     tail-truncation safety net, not the primary mechanism; the CSS
+     direction:rtl hack this used to lean on was defeated by unicode-bidi. */
   color: var(--descrip-text, #999);
   font-size: 10px;
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 .llnb-filepanel-note {
-  flex: 0 1 auto;
-  min-width: 0;
+  flex: 0 0 auto;
+  padding-top: 2px;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
@@ -365,18 +470,6 @@ const CSS_TEXT = `
   box-shadow: inset 0 0 0 1px rgba(66, 133, 244, 0.55);
 }
 .llnb-entry-dragging { opacity: 0.4; }
-.llnb-entry-renaming {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  padding: 2px 4px;
-  margin: 1px 0;
-}
-.llnb-input-rename {
-  flex: 1 1 auto;
-  min-width: 0;
-  padding: 2px 4px;
-}
 .llnb-drag-marker {
   height: 2px;
   margin: 3px 4px;
@@ -426,6 +519,25 @@ const CSS_TEXT = `
   padding: 3px 5px;
   font-size: 11px;
 }
+.llnb-name-field {
+  /* Rename via the editor's name field (FORMAT.md §7.2 amendment, owner ask
+     2026-07-19) — sits above .llnb-mode-hint as the editor pane's own
+     "title bar"; full-width, no border-radius, so it reads as part of the
+     pane's header stack rather than a floating input. */
+  flex: 0 0 auto;
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  border-bottom: 1px solid var(--border-color, #444);
+  border-radius: 0;
+  background: var(--comfy-input-bg, #1e1e1e);
+  color: var(--input-text, #ccc);
+  padding: 4px 6px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.llnb-name-field:disabled { opacity: 0.5; }
+.llnb-name-field::placeholder { color: var(--descrip-text, #999); font-weight: normal; }
 .llnb-mode-hint {
   /* Categories in the UI (FORMAT.md §7.2 amendment): "entry selected ⇒
      entry body; category selected ⇒ category description; a visible mode
@@ -525,6 +637,32 @@ const CSS_TEXT = `
   font-size: 11px;
   color: var(--input-text, #ccc);
 }
+.llnb-picker-pathrow {
+  /* Type-or-paste-a-path input (FORMAT.md §5/§7.2, owner's NAS fix) — sits
+     above the listing, persistent across navigation (unlike .llnb-picker-
+     content below, which loadPickerDir() replaces on every navigation). */
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px 0;
+}
+.llnb-picker-patherror {
+  flex: 0 0 auto;
+  padding: 4px 10px 0;
+  color: var(--error-text, #ff4444);
+  font-size: 10.5px;
+}
+.llnb-picker-patherror:empty { display: none; }
+.llnb-picker-content {
+  /* Everything loadPickerDir()/renderPickerDialog() replace wholesale on
+     each navigation — kept out of the persistent path-input row above so
+     a failed lookup never wipes out what the user just typed. */
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
 .llnb-picker-header {
   flex: 0 0 auto;
   padding: 8px 10px;
@@ -557,7 +695,6 @@ const CSS_TEXT = `
   color: var(--descrip-text, #999);
   font-style: italic;
 }
-.llnb-picker-error { color: var(--error-text, #ff4444); font-style: normal; }
 .llnb-picker-footer {
   flex: 0 0 auto;
   display: flex;
@@ -658,6 +795,7 @@ export function attachNotebookWidget(node) {
 
     const state = createState(node, fileWidget, entryWidget)
     buildUi(state)
+    hideFileWidget(state)
     wireFileWidget(state)
     wireNodeCleanup(state)
 
@@ -691,6 +829,12 @@ function createState(node, fileWidget, entryWidget) {
     // category mode must never touch either.
     categories: [],
     activeCategory: null,
+    // Single-tap collapse (FORMAT.md §7.2 amendment, owner ask 2026-07-19)
+    // — category names currently collapsed in the left list. Pure UI/
+    // session state: never read outside this file, never serialized, reset
+    // on reload of the page (not on reloadNow()/renderList(), which read it
+    // fresh every call — see toggleCategoryCollapse()).
+    collapsedCategories: new Set(),
     // Selection model (§6.1/§7.2): `selection` is the ordered list of
     // selected entry names — exactly what gets newline-joined into the
     // `entry` widget. `activeName` is the most-recently-clicked selected
@@ -700,6 +844,10 @@ function createState(node, fileWidget, entryWidget) {
     activeName: null,
     baseMtime: null,
     lastSavedText: '',
+    // Rename via the editor's name field (FORMAT.md §7.2 amendment) — the
+    // baseline the name field is compared against for dirty-tracking,
+    // exactly like `lastSavedText` for the textarea; see refreshDirty().
+    lastSavedName: '',
     dirty: false,
     busy: false,
     loadToken: 0,
@@ -716,10 +864,6 @@ function createState(node, fileWidget, entryWidget) {
     // In-flight pointer gesture (pointerdown → move → up), or null between
     // gestures. See onEntryPointerDown().
     drag: null,
-    // FORMAT.md §7.2 amendment — name of the row currently showing the
-    // inline rename input (buildRenameRow), or null. See the file header's
-    // "Rename" paragraph.
-    renamingName: null,
     // FORMAT.md §7.2 amendment — the file panel's resolved absolute path
     // (the `file` field of the last `GET /notebook` response) and whether
     // THIS browser is local (`GET /config`'s `is_local`; null = not yet
@@ -740,6 +884,7 @@ function createState(node, fileWidget, entryWidget) {
     leftPane: null,
     listEl: null,
     footerEl: null,
+    nameFieldEl: null,
     modeHintEl: null,
     textarea: null,
     saveBtn: null,
@@ -750,7 +895,11 @@ function createState(node, fileWidget, entryWidget) {
     filePanelPathEl: null,
     filePanelNoteEl: null,
     browseBtn: null,
-    openFolderBtn: null
+    openFolderBtn: null,
+    // File panel rework (FORMAT.md §7.2 amendment) — re-fits the path bar's
+    // front-truncation on a node resize; see updateFilePanelPath(). Torn
+    // down in teardown().
+    filePanelResizeObserver: null
   }
 }
 
@@ -767,6 +916,12 @@ function buildUi(state) {
 
   const splitter = el('div', { className: 'llnb-splitter', attrs: { title: 'Drag to resize' } })
 
+  // Rename via the editor's name field (FORMAT.md §7.2 amendment, owner ask
+  // 2026-07-19) — the PRIMARY rename control now; see the file header.
+  state.nameFieldEl = el('input', {
+    className: 'llnb-name-field',
+    attrs: { type: 'text', placeholder: 'Name…', disabled: 'disabled' }
+  })
   // Categories in the UI (FORMAT.md §7.2 amendment): a muted line saying
   // which of the two contexts (entry body vs. category description) the
   // textarea/Save below currently target — see updateModeHint().
@@ -789,6 +944,7 @@ function buildUi(state) {
   ])
   const bottomRow = el('div', { className: 'llnb-bottom-row' }, [state.saveBtn, statusRow])
   const rightPane = el('div', { className: 'llnb-pane llnb-pane-right' }, [
+    state.nameFieldEl,
     state.modeHintEl,
     state.textarea,
     bottomRow
@@ -798,9 +954,15 @@ function buildUi(state) {
   const filePanel = buildFilePanel(state)
   state.root = el('div', { className: 'llnb-root' }, [filePanel, panesRow])
 
-  state.textarea.addEventListener('input', () => {
-    setDirty(state, state.textarea.value !== state.lastSavedText)
+  state.nameFieldEl.addEventListener('input', () => refreshDirty(state))
+  state.nameFieldEl.addEventListener('keydown', (event) => {
+    event.stopPropagation()
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      performSave(state).catch((error) => api.warn('save failed', error))
+    }
   })
+  state.textarea.addEventListener('input', () => refreshDirty(state))
   state.textarea.addEventListener('keydown', (event) => event.stopPropagation())
   state.saveBtn.addEventListener('click', () => {
     performSave(state).catch((error) => api.warn('save failed', error))
@@ -880,12 +1042,33 @@ function wireSplitter(state, splitter) {
 // ---------------------------------------------------------------------------
 
 /**
+ * File panel rework (FORMAT.md §7.2 amendment, owner ask 2026-07-19): hides
+ * the raw `file` STRING widget's on-canvas row via `.hidden` — a real
+ * litegraph layout primitive on this fork (controller.js's header carries
+ * the citations backing this: `LGraphNode.isWidgetVisible()`/
+ * `getLayoutWidgets()` both filter on it, so it pulls the widget out of
+ * drawing AND layout AND size, unlike `.disabled`, which blanks a disabled
+ * TEXT widget's value outright instead of graying it out — wrong for a
+ * widget that must keep serializing the node's real value). The file panel
+ * (buildFilePanel(), already built by buildUi() before this runs) is what
+ * replaces it as the visible control. `setDirtyCanvas` is enough to make it
+ * take effect immediately — no manual resize bookkeeping needed, since
+ * `drawNode()` already calls `node.arrange()` every frame.
+ */
+function hideFileWidget(state) {
+  state.fileWidget.hidden = true
+  state.node.graph?.setDirtyCanvas(true, true)
+}
+
+/**
  * Wraps the `file` widget's callback for two independent reasons that share
  * one seam: (1) the pre-existing debounced-reload-on-change
  * (onFileWidgetChanged), and (2) FORMAT.md §7.2's remote read-only guard —
  * a remote (`is_local: false`) viewer's edit is reverted here instead of
- * via `widget.disabled` (see the file header's "File panel + remote
- * gating" paragraph for why that flag is unusable for this).
+ * via `widget.disabled` (see the file header's "Remote gating" paragraph
+ * for why that flag is unusable for this; belt-and-suspenders now that
+ * hideFileWidget() above means no UI surface can reach this callback with
+ * a changed value at all).
  */
 function wireFileWidget(state) {
   const widget = state.fileWidget
@@ -950,6 +1133,8 @@ function wireNodeCleanup(state) {
 function teardown(state) {
   if (state.deleteConfirmTimer) clearTimeout(state.deleteConfirmTimer)
   if (state.fileChangeDebounceTimer) clearTimeout(state.fileChangeDebounceTimer)
+  // File panel rework (FORMAT.md §7.2 amendment) — see updateFilePanelPath().
+  state.filePanelResizeObserver?.disconnect()
   // A node removal mid-drag (e.g. undo, right-click delete) would otherwise
   // leak the drag's window-level pointermove/pointerup/pointercancel
   // listeners forever — see onEntryPointerDown().
@@ -1058,12 +1243,31 @@ function buildFilePanel(state) {
   })
 
   const actions = el('div', { className: 'llnb-filepanel-actions' }, [state.browseBtn, state.openFolderBtn])
-  return el('div', { className: 'llnb-filepanel' }, [state.filePanelPathEl, state.filePanelNoteEl, actions])
+  // Reworked 2026-07-19: path + buttons share one row (full-width path
+  // control, "what's the point of the file field at top, replace it with
+  // this"); the host-machine note (populated only when remote — see
+  // updateRemoteGatingUi()) gets its OWN row below, never squeezed inline.
+  const row = el('div', { className: 'llnb-filepanel-row' }, [state.filePanelPathEl, actions])
+  const panel = el('div', { className: 'llnb-filepanel' }, [row, state.filePanelNoteEl])
+
+  // Re-fit the path's front-truncation on a node resize too — "full width"
+  // is a live property of the bar's current size, not just its size at
+  // load time. Harmless if this frontend's runtime lacks ResizeObserver
+  // (this file's usual "never throw, degrade gracefully" posture) —
+  // updateFilePanelPath() just keeps whatever it last computed.
+  if (typeof ResizeObserver === 'function') {
+    state.filePanelResizeObserver = new ResizeObserver(() => updateFilePanelPath(state))
+    state.filePanelResizeObserver.observe(state.filePanelPathEl)
+  }
+
+  return panel
 }
 
 /**
  * `text` shortened from the FRONT, so the tail — the filename, the part
  * that identifies which notebook this is — survives (FORMAT.md §7.2).
+ * `maxChars` is a CHARACTER budget, not a pixel one — updateFilePanelPath()
+ * below is what turns the bar's actual pixel width into one.
  *
  * Done in JS rather than with the `direction: rtl` CSS hack this file
  * originally used: that hack was paired with `unicode-bidi: plaintext`,
@@ -1078,11 +1282,31 @@ function frontTruncate(text, maxChars = 56) {
   return `…${value.slice(-(maxChars - 1))}`
 }
 
+/** Average glyph width (px) of `.llnb-filepanel-path`'s monospace font at
+ * its 10px font-size — enough precision to estimate "how many characters
+ * fit," not to hit an exact pixel width. */
+const FILEPANEL_PATH_AVG_CHAR_PX = 6.4
+
+/**
+ * File panel rework (FORMAT.md §7.2 amendment, owner ask 2026-07-19 "make
+ * this full width so it doesn't need to be trimmed"): always sets the FULL
+ * resolved path first, then only front-truncates once a real DOM overflow
+ * (`scrollWidth > clientWidth`) says it genuinely doesn't fit at the bar's
+ * CURRENT width — never at a fixed character budget regardless of the
+ * node's actual size. Re-run on every reload (via updateFilePanelPath()'s
+ * callers) and on a node resize (the ResizeObserver buildFilePanel() wires
+ * up), so "genuinely overflows" stays true to whatever the bar's width
+ * actually is right now.
+ */
 function updateFilePanelPath(state) {
   if (!state.filePanelPathEl) return
   const path = state.resolvedFile || ''
-  state.filePanelPathEl.textContent = frontTruncate(path)
-  state.filePanelPathEl.title = path
+  const pathEl = state.filePanelPathEl
+  pathEl.title = path
+  pathEl.textContent = path
+  if (!path || pathEl.scrollWidth <= pathEl.clientWidth + 1) return // fits (or empty) as-is
+  const budget = Math.max(8, Math.floor(pathEl.clientWidth / FILEPANEL_PATH_AVG_CHAR_PX))
+  pathEl.textContent = frontTruncate(path, budget)
 }
 
 async function onOpenFolderClick(state) {
@@ -1157,41 +1381,88 @@ function openBrowsePicker(state) {
   }
   window.addEventListener('keydown', state.pickerKeydownHandler)
 
-  loadPickerDir(state, dialog, dirnameOfServerPath(state.resolvedFile))
+  // Type-or-paste-a-path input (FORMAT.md §5/§7.2, owner's NAS fix) — a
+  // PERSISTENT row above the listing (unlike `contentEl` below, which every
+  // navigation replaces wholesale), so a failed lookup never wipes out what
+  // the user just typed; its error reports into `pathErrorEl`, its own
+  // inline slot, right under the input.
+  const pathInput = el('input', {
+    className: 'llnb-input',
+    attrs: { type: 'text', placeholder: 'Type or paste an absolute path (incl. \\\\server\\share)…' }
+  })
+  const goBtn = el('button', { className: 'llnb-btn llnb-btn-small', text: 'Go' })
+  const pathErrorEl = el('div', { className: 'llnb-picker-patherror' })
+  const contentEl = el('div', { className: 'llnb-picker-content' })
+
+  const goToTypedPath = () => {
+    const typed = pathInput.value.trim()
+    if (!typed) return
+    loadPickerDir(state, dialog, contentEl, pathErrorEl, typed)
+  }
+  goBtn.addEventListener('click', goToTypedPath)
+  pathInput.addEventListener('keydown', (event) => {
+    event.stopPropagation()
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      goToTypedPath()
+    }
+  })
+
+  const pathRow = el('div', { className: 'llnb-picker-pathrow' }, [pathInput, goBtn])
+  dialog.append(pathRow, pathErrorEl, contentEl)
+
+  loadPickerDir(state, dialog, contentEl, pathErrorEl, dirnameOfServerPath(state.resolvedFile))
 }
 
-async function loadPickerDir(state, dialog, dir) {
-  dialog.replaceChildren(el('div', { className: 'llnb-picker-status', text: 'Loading…' }))
+/**
+ * Loads `dir` (or the library default, when falsy) into `contentEl` — every
+ * navigation in the picker goes through here: the initial load, a folder/
+ * drive/`..` row click (renderPickerDialog()), and the path input's Enter/
+ * Go (openBrowsePicker()). A failed lookup (400 — an unreadable/nonexistent
+ * path, most commonly from the typed-path input) reports INLINE into
+ * `pathErrorEl`, right under the path input, rather than blanking the
+ * whole dialog — "keeps dialog open" per the owner ask — leaving the path
+ * input itself untouched so the user can just fix it and retry.
+ */
+async function loadPickerDir(state, dialog, contentEl, pathErrorEl, dir) {
+  pathErrorEl.textContent = ''
+  contentEl.replaceChildren(el('div', { className: 'llnb-picker-status', text: 'Loading…' }))
   let data
   try {
     data = await api.getJson('/lora_library/fs/list', dir ? { dir } : undefined)
   } catch (error) {
     api.warn('fs/list failed', error)
-    dialog.replaceChildren(
+    pathErrorEl.textContent = error.message || 'Could not list that path.'
+    contentEl.replaceChildren(
       el('div', { className: 'llnb-picker-header', text: 'Browse' }),
-      el('div', {
-        className: 'llnb-picker-status llnb-picker-error',
-        text: `Could not list folder: ${error.message}`
-      }),
       buildPickerFooter(state)
     )
     return
   }
-  renderPickerDialog(state, dialog, data)
+  renderPickerDialog(state, dialog, contentEl, pathErrorEl, data)
 }
 
-function renderPickerDialog(state, dialog, data) {
-  const header = el('div', { className: 'llnb-picker-header', text: data.dir, attrs: { title: data.dir } })
+function renderPickerDialog(state, dialog, contentEl, pathErrorEl, data) {
+  // FS_ROOTS ("ROOTS", FORMAT.md §5's fs/list sentinel): the synthetic
+  // drive-list level on Windows — "Drives" reads better than the raw
+  // sentinel string as a header.
+  const headerText = data.dir === FS_ROOTS ? 'Drives' : data.dir
+  const header = el('div', { className: 'llnb-picker-header', text: headerText, attrs: { title: data.dir } })
   const list = el('div', { className: 'llnb-picker-list' })
 
   if (data.parent) {
     const upRow = el('div', { className: 'llnb-picker-row', text: '.. (parent folder)' })
-    upRow.addEventListener('click', () => loadPickerDir(state, dialog, data.parent))
+    upRow.addEventListener('click', () => loadPickerDir(state, dialog, contentEl, pathErrorEl, data.parent))
     list.append(upRow)
   }
   for (const name of data.dirs || []) {
     const row = el('div', { className: 'llnb-picker-row', text: `📁 ${name}` })
-    row.addEventListener('click', () => loadPickerDir(state, dialog, joinServerPath(data.dir, name)))
+    // At the ROOTS level, each `name` (e.g. `C:\`) IS ALREADY a complete
+    // drive root — joining it onto the literal "ROOTS" sentinel like a
+    // normal child would produce the nonsense path "ROOTS/C:\" (the bug
+    // this fixes); navigate straight to the drive itself instead.
+    const target = data.dir === FS_ROOTS ? name : joinServerPath(data.dir, name)
+    row.addEventListener('click', () => loadPickerDir(state, dialog, contentEl, pathErrorEl, target))
     list.append(row)
   }
   for (const name of data.files || []) {
@@ -1206,7 +1477,7 @@ function renderPickerDialog(state, dialog, data) {
     list.append(el('div', { className: 'llnb-picker-empty', text: 'No subfolders or .md files here.' }))
   }
 
-  dialog.replaceChildren(header, list, buildPickerFooter(state))
+  contentEl.replaceChildren(header, list, buildPickerFooter(state))
 }
 
 function buildPickerFooter(state) {
@@ -1241,7 +1512,6 @@ async function reloadNow(state) {
   const token = ++state.loadToken
   cancelDeleteConfirm(state)
   closeNewEntryRow(state)
-  closeRenameRow(state)
   clearConflict(state)
 
   // FORMAT.md §7.2 remote gating: opportunistic re-check on every reload, on
@@ -1391,8 +1661,11 @@ function lastOrNull(items) {
 function resetEditorDom(state) {
   state.textarea.value = ''
   state.lastSavedText = ''
+  state.nameFieldEl.value = ''
+  state.lastSavedName = ''
   state.baseMtime = null
   state.textarea.disabled = true
+  state.nameFieldEl.disabled = true
   setDirty(state, false)
 }
 
@@ -1454,12 +1727,20 @@ function fetchCategory(state, name) {
 /** Shared by entry mode and category mode (FORMAT.md §7.2 amendment): both
  * are "one editable text blob + an mtime for the §3.5 conflict check", so
  * one function populates the shared textarea/dirty/baseMtime state for
- * either — callers just pass the right pair. */
-function populateEditor(state, text, mtime) {
+ * either — callers just pass the right pair. `name` (the entry or category
+ * name this text belongs to) also seeds the name field (FORMAT.md §7.2
+ * rename-via-header amendment) — omitted only by callers that manage the
+ * name field themselves right after (confirmNewEntry()'s inline path). */
+function populateEditor(state, text, mtime, name) {
   state.textarea.value = text ?? ''
   state.lastSavedText = state.textarea.value
   state.baseMtime = typeof mtime === 'number' ? mtime : null
   state.textarea.disabled = false
+  if (name !== undefined) {
+    state.nameFieldEl.value = name ?? ''
+    state.lastSavedName = currentNameFieldValue(state)
+    state.nameFieldEl.disabled = false
+  }
   setDirty(state, false)
   updateDeleteButtonEnabled(state)
   clearConflict(state)
@@ -1487,7 +1768,7 @@ async function loadEntryText(state, name) {
     return 'failed'
   }
   if (loadToken !== state.loadToken || selectToken !== state.selectToken) return 'stale'
-  populateEditor(state, data.text, data.mtime)
+  populateEditor(state, data.text, data.mtime, name)
   return 'ok'
 }
 
@@ -1507,7 +1788,7 @@ async function loadCategoryDescription(state, name) {
     return 'failed'
   }
   if (loadToken !== state.loadToken || selectToken !== state.selectToken) return 'stale'
-  populateEditor(state, data.description, data.mtime)
+  populateEditor(state, data.description, data.mtime, name)
   return 'ok'
 }
 
@@ -1533,7 +1814,6 @@ async function loadCategoryDescription(state, name) {
 async function chooseSelection(state, names, active) {
   cancelDeleteConfirm(state)
   closeNewEntryRow(state)
-  closeRenameRow(state)
 
   const wasInCategoryMode = state.activeCategory != null
   state.activeCategory = null
@@ -1641,7 +1921,6 @@ async function selectCategory(state, name) {
   if (state.busy) return
   cancelDeleteConfirm(state)
   closeNewEntryRow(state)
-  closeRenameRow(state)
   if (state.activeCategory === name) return
 
   const previousCategory = state.activeCategory
@@ -1712,15 +1991,15 @@ function renderList(state) {
 
   let entryIndex = 0
   const appendEntry = (entry) => {
-    const row =
-      state.renamingName === entry.name ? buildRenameRow(state, entry) : buildEntryRow(state, entry)
+    const row = buildEntryRow(state, entry)
     state.listEl.append(row)
     state.dragRows.push({ el: row, kind: 'entry', name: entry.name, category: entry.category || '' })
     entryIndex += 1
   }
 
   // The leading, un-headed "" region (FORMAT.md §3.1: entries before the
-  // first H1) never gets a category row of its own.
+  // first H1) never gets a category row of its own, so it's never
+  // collapsible either.
   while (entryIndex < entries.length && (entries[entryIndex].category || '') === '') {
     appendEntry(entries[entryIndex])
   }
@@ -1730,8 +2009,15 @@ function renderList(state) {
     state.listEl.append(headerEl)
     state.dragRows.push({ el: headerEl, kind: 'header', category })
 
+    // Single-tap collapse (FORMAT.md §7.2 amendment): a collapsed
+    // category's entries are skipped entirely — not rendered, not added to
+    // `dragRows` — so they're visually gone AND inert (no click, no drag
+    // source) until expanded again; the header row itself still renders
+    // and stays a valid drop target either way.
+    const collapsed = state.collapsedCategories.has(category)
     while (entryIndex < entries.length && (entries[entryIndex].category || '') === category) {
-      appendEntry(entries[entryIndex])
+      if (collapsed) entryIndex += 1
+      else appendEntry(entries[entryIndex])
     }
   }
 
@@ -1769,31 +2055,54 @@ function buildEntryRow(state, entry) {
 }
 
 /**
- * A category header row (FORMAT.md §7.2 amendment): plain click/Enter/Space
- * enters category mode via selectCategory() — no drag-threshold
- * disambiguation needed here (unlike buildEntryRow() above), since headers
- * are never themselves a drag SOURCE, only a drop TARGET (computeDropTarget()
- * reads this row's geometry back out of `state.dragRows`, unaffected by
- * anything below).
+ * A category header row (FORMAT.md §7.2 amendment): a tap toggles collapse
+ * AND enters category mode (see the file header's "Single-tap collapse"
+ * paragraph); a drag relocates the whole category (see "Drag a category
+ * header"). Both share onCategoryPointerDown()'s threshold-disambiguation
+ * gesture below, the header's sibling of buildEntryRow()'s pointerdown —
+ * headers are now a drag SOURCE as well as a drop TARGET
+ * (computeDropTarget()/computeCategoryDropTarget() both read this row's
+ * geometry back out of `state.dragRows`).
  */
 function buildCategoryHeaderRow(state, category) {
   const classes = ['llnb-category']
   if (state.activeCategory === category) classes.push('llnb-category-active')
+  const collapsed = state.collapsedCategories.has(category)
 
   const headerEl = el('div', {
     className: classes.join(' '),
-    text: category,
+    text: `${collapsed ? '▸' : '▾'} ${category}`,
     attrs: { tabindex: '0', title: category }
   })
-  headerEl.addEventListener('click', () => {
-    selectCategory(state, category).catch((error) => api.warn('select category failed', error))
+  headerEl.addEventListener('pointerdown', (event) => onCategoryPointerDown(state, event, category))
+  headerEl.addEventListener('dblclick', (event) => {
+    event.preventDefault()
+    event.stopPropagation()
+    focusNameField(state)
   })
   headerEl.addEventListener('keydown', (event) => {
     if (event.key !== 'Enter' && event.key !== ' ') return
     event.preventDefault()
+    toggleCategoryCollapse(state, category)
     selectCategory(state, category).catch((error) => api.warn('select category failed', error))
   })
   return headerEl
+}
+
+/** Single-tap collapse (FORMAT.md §7.2 amendment, owner ask 2026-07-19) —
+ * flips `category`'s membership in the session-only `state.collapsedCategories`
+ * Set and re-renders; see the file header for why this never touches
+ * serialization. Called unconditionally on every tap (see
+ * onCategoryPointerDown()/the header's own keydown handler above) — even
+ * when the category is already active, since re-selecting it is a no-op
+ * for selectCategory() but the collapse toggle must still happen. */
+function toggleCategoryCollapse(state, category) {
+  if (state.collapsedCategories.has(category)) {
+    state.collapsedCategories.delete(category)
+  } else {
+    state.collapsedCategories.add(category)
+  }
+  renderList(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -1805,9 +2114,19 @@ function buildCategoryHeaderRow(state, category) {
 // (or even the list's) bounds still tracks. A single pointerdown starts a
 // tentative gesture that resolves ONE of two ways on pointerup:
 //  - moved < DRAG_THRESHOLD_PX the whole time → a click; dispatched to the
-//    plain/ctrl/shift selection logic above.
+//    plain/ctrl/shift selection logic above (entries) or the collapse-
+//    toggle+select logic (categories, "Categories in the UI" above).
 //  - moved >= DRAG_THRESHOLD_PX at any point → a drag; commits to reorder
 //    and the click never fires.
+//
+// Two drag SOURCES share this gesture — an entry row (onEntryPointerDown,
+// `drag.kind === 'entry'`) and a category header (onCategoryPointerDown,
+// `drag.kind === 'category'`, FORMAT.md §7.2 amendment "drag a category
+// header"). beginDrag()/endDragVisuals()/positionMarker()/cancelDrag() are
+// kind-agnostic (pure pointer-capture/visual bookkeeping); updateDrag()/
+// finishDrag() branch on `drag.kind` for the parts that actually differ:
+// which geometry function computes a drop target, and which §5 route
+// commits it.
 // ---------------------------------------------------------------------------
 
 function onEntryPointerDown(state, event, name) {
@@ -1815,6 +2134,7 @@ function onEntryPointerDown(state, event, name) {
   cancelDeleteConfirm(state)
 
   const drag = {
+    kind: 'entry',
     pointerId: event.pointerId,
     name,
     startX: event.clientX,
@@ -1880,11 +2200,30 @@ function beginDrag(state, drag) {
     // cover the drag either way.
   }
   drag.rowEl.classList.add('llnb-entry-dragging')
+  // Multiselect drag into a category (FORMAT.md §7.2 amendment): dim every
+  // OTHER selected row too, so the drag visually reads as "this whole
+  // group is moving" — dragMoveNames() is the same decision finishDrag()
+  // uses for the actual move. Tracked on `drag` itself (not looked up
+  // again) so endDragVisuals() can undo exactly these, no more, no less.
+  drag.dimmedEls = []
+  if (drag.kind === 'entry') {
+    for (const name of dragMoveNames(state, drag)) {
+      if (name === drag.name) continue
+      const row = state.dragRows.find((r) => r.kind === 'entry' && r.name === name)
+      if (row) {
+        row.el.classList.add('llnb-entry-dragging')
+        drag.dimmedEls.push(row.el)
+      }
+    }
+  }
   drag.marker = el('div', { className: 'llnb-drag-marker' })
 }
 
 function updateDrag(state, drag, clientY) {
-  drag.target = computeDropTarget(state, clientY, drag.name)
+  drag.target =
+    drag.kind === 'category'
+      ? computeCategoryDropTarget(state, clientY, drag.category)
+      : computeDropTarget(state, clientY, dragMoveNames(state, drag))
   positionMarker(drag)
 }
 
@@ -1906,13 +2245,35 @@ function endDragVisuals(drag) {
     // Already released, or never captured.
   }
   drag.rowEl.classList.remove('llnb-entry-dragging')
+  for (const dimmedEl of drag.dimmedEls || []) dimmedEl.classList.remove('llnb-entry-dragging')
   drag.marker?.remove()
+}
+
+/** The full set of names one drag gesture is moving (FORMAT.md §7.2
+ * amendment, "Multiselect drag into a category") — the WHOLE selection, in
+ * selection order, when the dragged row is itself part of a 2+ selection;
+ * otherwise just the single dragged row, exactly like before multiselect
+ * drag existed. Shared by updateDrag()'s drop-target exclusion and
+ * finishDrag()'s move dispatch, so the two always agree on what's moving. */
+function dragMoveNames(state, drag) {
+  if (state.selection.length >= 2 && isSelected(state, drag.name)) return state.selection
+  return [drag.name]
 }
 
 function finishDrag(state, drag) {
   endDragVisuals(drag)
   const target = drag.target
   if (!target) return
+  if (drag.kind === 'category') {
+    if (isNoopCategoryMove(state, drag.category, target)) return
+    performMoveCategory(state, drag.category, target).catch((error) => api.warn('move category failed', error))
+    return
+  }
+  const names = dragMoveNames(state, drag)
+  if (names.length > 1) {
+    performMoveRun(state, names, target, 0).catch((error) => api.warn('move failed', error))
+    return
+  }
   if (isNoopMove(state, drag.name, target)) return
   performMove(state, drag.name, target).catch((error) => api.warn('move failed', error))
 }
@@ -1940,11 +2301,16 @@ function cancelDrag(state, drag) {
  *    category's end" — the marker is placed at that category's actual last
  *    row so it never visually promises a landing spot other than where the
  *    entry will really go.
+ * `excludeNames` (FORMAT.md §7.2 amendment: multiselect drag into a
+ * category) leaves out every row currently being dragged, not just one —
+ * see dragMoveNames() — so a multi-drag can never resolve to "before" a
+ * row that's part of the same moving group.
  * @returns {{kind:'before', before:string, markerBeforeEl:HTMLElement} |
  *           {kind:'category', category:string, markerAfterEl:HTMLElement} | null}
  */
-function computeDropTarget(state, clientY, excludeName) {
-  const rows = state.dragRows.filter((row) => row.kind !== 'entry' || row.name !== excludeName)
+function computeDropTarget(state, clientY, excludeNames) {
+  const excluded = new Set(excludeNames)
+  const rows = state.dragRows.filter((row) => row.kind !== 'entry' || !excluded.has(row.name))
   if (!rows.length) return null
 
   let bestIndex = -1
@@ -1988,6 +2354,65 @@ function lastRowElOfCategory(rows, headerIndex) {
     lastEl = rows[i].el
   }
   return lastEl
+}
+
+/**
+ * computeDropTarget()'s sibling for a whole-category drag (FORMAT.md §3.4
+ * Move category, §7.2 amendment "drag a category header"): valid targets
+ * are only "before another category header" or "end of file" — §3.4 has no
+ * "into"/"before an entry" primitive for a category block, unlike an
+ * entry's drop geometry above. Hit-tests against category headers ONLY
+ * (excluding the one being dragged); past the last header, or when there's
+ * no other category at all, falls to "end", anchored at the actual last
+ * row so the marker never promises a landing spot other than where the
+ * block will really go (same reasoning lastRowElOfCategory() documents for
+ * an empty category above).
+ * @returns {{kind:'before', before:string, markerBeforeEl:HTMLElement} |
+ *           {kind:'end', markerAfterEl:HTMLElement} | null}
+ */
+function computeCategoryDropTarget(state, clientY, excludeCategory) {
+  const rows = state.dragRows
+  if (!rows.length) return null
+  const headers = rows.filter((row) => row.kind === 'header' && row.category !== excludeCategory)
+  if (!headers.length) {
+    return { kind: 'end', markerAfterEl: rows[rows.length - 1].el }
+  }
+
+  let bestIndex = -1
+  let bestMid = 0
+  let bestDist = Infinity
+  for (let i = 0; i < headers.length; i++) {
+    const rect = headers[i].el.getBoundingClientRect()
+    const mid = rect.top + rect.height / 2
+    const dist = Math.abs(clientY - mid)
+    if (dist < bestDist) {
+      bestDist = dist
+      bestIndex = i
+      bestMid = mid
+    }
+  }
+  const best = headers[bestIndex]
+  if (clientY < bestMid) {
+    return { kind: 'before', before: best.category, markerBeforeEl: best.el }
+  }
+  const next = headers[bestIndex + 1]
+  if (next) {
+    return { kind: 'before', before: next.category, markerBeforeEl: next.el }
+  }
+  return { kind: 'end', markerAfterEl: rows[rows.length - 1].el }
+}
+
+/** isNoopMove()'s sibling for a whole-category drag: true when `target`
+ * already describes where `draggedCategory` sits (adjacent, in file
+ * order). Like isNoopMove(), this is purely an optimization — a drop that
+ * turns out to be a no-op position is otherwise harmless to send anyway. */
+function isNoopCategoryMove(state, draggedCategory, target) {
+  const categories = state.categories
+  const index = categories.indexOf(draggedCategory)
+  if (index === -1) return false
+  const next = categories[index + 1]
+  if (target.kind === 'before') return !!next && next === target.before
+  return next == null
 }
 
 /** True when `target` describes the position `draggedName` is already in —
@@ -2062,146 +2487,100 @@ async function performMove(state, name, target, { force = false } = {}) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Rename (FORMAT.md §7.2 amendment) — double-click a row to edit its name
-// inline. See the file header's "Rename" paragraph for the full writeup of
-// how this avoids fighting the click/drag disambiguation above; this
-// section is the implementation it describes.
-// ---------------------------------------------------------------------------
-
-function openRenameRow(state, name) {
-  if (state.renamingName === name) return
-  state.renamingName = name
-  renderList(state)
-}
-
-function closeRenameRow(state) {
-  if (state.renamingName == null) return
-  state.renamingName = null
-  renderList(state)
-}
-
-/** Native `dblclick` only ever follows two complete click cycles on the
- * same element — see the file header — so both single-clicks have already
- * run by the time this fires. */
-function onEntryDoubleClick(state, event, name) {
-  event.preventDefault()
-  event.stopPropagation()
-  if (state.busy) return
-  // Belt-and-suspenders: a real drag can't produce a dblclick (a drag
-  // commits via finishDrag()/pointerup, never a click), but a stray
-  // in-flight drag object from some other pointer sequence should never
-  // survive into rename mode.
-  state.drag?.cleanup?.()
-  state.drag = null
-  cancelDeleteConfirm(state)
-  closeNewEntryRow(state)
-  openRenameRow(state, name)
-}
-
-function buildRenameRow(state, entry) {
-  const input = el('input', {
-    className: 'llnb-input llnb-input-rename',
-    attrs: { type: 'text', value: entry.name }
-  })
-  const confirmBtn = el('button', { className: 'llnb-btn llnb-btn-small', text: '✓', attrs: { title: 'Rename' } })
-  const cancelBtn = el('button', { className: 'llnb-btn llnb-btn-small', text: '✕', attrs: { title: 'Cancel' } })
-
-  const commit = () => {
-    performRename(state, entry.name, input.value).catch((error) => api.warn('rename entry failed', error))
-  }
-  const cancel = () => closeRenameRow(state)
-
-  // Without preventDefault on mousedown, clicking either button would shift
-  // focus off `input` first, firing the blur handler below and tearing this
-  // row down before the button's own `click` ever ran (see file header).
-  confirmBtn.addEventListener('mousedown', (event) => event.preventDefault())
-  cancelBtn.addEventListener('mousedown', (event) => event.preventDefault())
-  confirmBtn.addEventListener('click', commit)
-  cancelBtn.addEventListener('click', cancel)
-
-  input.addEventListener('keydown', (event) => {
-    event.stopPropagation()
-    if (event.key === 'Enter') {
-      event.preventDefault()
-      commit()
-    } else if (event.key === 'Escape') {
-      event.preventDefault()
-      cancel()
-    }
-  })
-  // Catch-all for every other way focus can leave the input (Save, the
-  // splitter, outside the widget, tabbing away...). Deferred one tick so a
-  // same-tick blur racing a commit's own renderList() — which naturally
-  // blurs the about-to-be-removed input — sees `renamingName` already
-  // cleared and no-ops instead of double-cancelling (see file header).
-  input.addEventListener('blur', () => {
-    setTimeout(() => {
-      if (state.renamingName === entry.name) cancel()
-    }, 0)
-  })
-
-  const row = el('div', { className: 'llnb-entry-renaming', attrs: { title: entry.name } }, [
-    input,
-    confirmBtn,
-    cancelBtn
-  ])
-
-  requestAnimationFrame(() => {
-    input.focus()
-    input.select()
-  })
-
-  return row
-}
-
 /**
- * Commits a rename via the existing §5 entry route's `rename_to` (FORMAT.md
- * has no dedicated rename endpoint). Always refetches `name`'s CURRENT
- * server-side text first rather than trusting anything already in the
- * editor pane, so a rename can never silently rewrite the entry's body —
- * whether because the row being renamed isn't the active one (in practice
- * it always is — see the file header — but this doesn't rely on that) or
- * because the active entry has unsaved edits (those stay unsaved; renaming
- * is a heading-only operation, same as §3.4 promises for a plain update).
+ * Multiselect drag into a category (FORMAT.md §7.2 amendment, owner ask
+ * 2026-07-19): performMove()'s sibling for moving MULTIPLE entries as one
+ * unit — `names` (selection order) each get their own §5 `/notebook/move`
+ * against the SAME `target`, sequentially, refreshing `base_mtime` between
+ * requests so the run can't self-conflict. Re-using one `target` for every
+ * entry — rather than recomputing it per-step — is what keeps the moved
+ * block's relative order intact: a `before` target lands each subsequent
+ * entry immediately ahead of that same sibling (so the entry moved LAST
+ * ends up closest to it), and a `category` target appends each subsequent
+ * entry after the previous one's new position — either way, processing in
+ * selection order reproduces selection order at the destination. Mirrors
+ * performDeleteRun()'s sequential-with-conflict-resume shape: a 409 stops
+ * the run exactly where it is (everything moved so far stays moved) and
+ * shows the standard Reload/Overwrite conflict UI, Overwrite resuming at
+ * the failed index with that one request's `base_mtime` check skipped.
  */
-async function performRename(state, name, rawNewName, { force = false } = {}) {
-  if (state.renamingName !== name) return // superseded by another close/open already
-
-  const newName = (rawNewName || '').trim()
-  if (!newName) {
-    setStatus(state, 'Enter a name for this entry.')
-    return
-  }
-  if (newName === name) {
-    closeRenameRow(state)
-    return
-  }
-  if (state.entries.some((entry) => entry.name === newName)) {
-    setStatus(state, `An entry named "${newName}" already exists.`)
-    return
-  }
-
+async function performMoveRun(state, names, target, startIndex, { force = false } = {}) {
   state.busy = true
   updateSaveButtonEnabled(state)
   updateDeleteButtonEnabled(state)
-  setStatus(state, `Renaming to "${newName}"…`)
-  try {
-    const current = await fetchEntry(state, name)
-    const body = { file: state.file, name, text: current.text ?? '', rename_to: newName }
-    if (!force && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
+  setStatus(state, `Moving ${names.length} entries…`)
 
-    const data = await api.postJson('/lora_library/notebook/entry', body)
-    state.busy = false
+  for (let index = startIndex; index < names.length; index++) {
+    const name = names[index]
+    let data
+    try {
+      const body = { file: state.file, name }
+      if (target.kind === 'before') body.before = target.before
+      else body.category = target.category
+      const skipCheck = force && index === startIndex
+      if (!skipCheck && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
+      data = await api.postJson('/lora_library/notebook/move', body)
+    } catch (error) {
+      state.busy = false
+      updateSaveButtonEnabled(state)
+      updateDeleteButtonEnabled(state)
+      if (error?.status === 409) {
+        showConflict(state, 'File changed on disk', {
+          onReload: () => reloadNow(state),
+          onOverwrite: () => performMoveRun(state, names, target, index, { force: true })
+        })
+      } else {
+        api.warn('failed to move notebook entry', error)
+        try {
+          await reloadNow(state)
+        } catch (reloadError) {
+          api.warn('notebook reload after move failure failed', reloadError)
+        }
+        setStatus(state, `Move failed: ${error.message}`)
+      }
+      return
+    }
     state.entries = Array.isArray(data.entries) ? data.entries : state.entries
     state.baseMtime = typeof data.mtime === 'number' ? data.mtime : state.baseMtime
-    state.renamingName = null
+  }
 
-    const nextSelection = state.selection.map((n) => (n === name ? newName : n))
-    const nextActive = state.activeName === name ? newName : state.activeName
-    setSelection(state, nextSelection, nextActive)
+  state.busy = false
+  // Same reasoning as performMove()'s own tail: a move never adds/removes
+  // entries, so selection/active stay as they were — just re-render.
+  setSelection(state, state.selection, state.activeName)
+  updateSaveButtonEnabled(state)
+  setStatus(state, `Moved ${names.length} entries.`)
+}
+
+/**
+ * Drag a category header (FORMAT.md §3.4 Move category, §7.2 amendment):
+ * performMove()'s sibling for relocating a WHOLE category block via §5
+ * `/notebook/move_category`. Same conflict/force-retry shape; unlike an
+ * entry move, `state.categories`/`state.entries` both come back fresh in
+ * one response (the block's entries don't change identity, just position),
+ * and neither `state.selection` nor `state.activeName`/`activeCategory`
+ * need reconciling — names are untouched by a move, only their position.
+ */
+async function performMoveCategory(state, category, target, { force = false } = {}) {
+  if (state.busy) return
+  state.busy = true
+  updateSaveButtonEnabled(state)
+  updateDeleteButtonEnabled(state)
+  setStatus(state, 'Moving category…')
+  try {
+    const body = { file: state.file, name: category }
+    if (target.kind === 'before') body.before = target.before
+    if (!force && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
+
+    const data = await api.postJson('/lora_library/notebook/move_category', body)
+    state.busy = false
+    state.entries = Array.isArray(data.entries) ? data.entries : state.entries
+    state.categories = Array.isArray(data.categories) ? data.categories : state.categories
+    state.baseMtime = typeof data.mtime === 'number' ? data.mtime : state.baseMtime
+    renderList(state)
     updateSaveButtonEnabled(state)
-    setStatus(state, `Renamed to "${newName}".`)
+    updateDeleteButtonEnabled(state)
+    setStatus(state, 'Moved category.')
   } catch (error) {
     state.busy = false
     updateSaveButtonEnabled(state)
@@ -2209,13 +2588,123 @@ async function performRename(state, name, rawNewName, { force = false } = {}) {
     if (error?.status === 409) {
       showConflict(state, 'File changed on disk', {
         onReload: () => reloadNow(state),
-        onOverwrite: () => performRename(state, name, newName, { force: true })
+        onOverwrite: () => performMoveCategory(state, category, target, { force: true })
       })
     } else {
-      api.warn('failed to rename notebook entry', error)
-      setStatus(state, `Could not rename "${name}" to "${newName}": ${error.message}`)
+      api.warn('failed to move notebook category', error)
+      try {
+        await reloadNow(state)
+      } catch (reloadError) {
+        api.warn('notebook reload after move-category failure failed', reloadError)
+      }
+      setStatus(state, `Move failed: ${error.message}`)
     }
   }
+}
+
+/**
+ * onEntryPointerDown()'s sibling for a category header (FORMAT.md §7.2
+ * amendment "drag a category header"): same threshold-disambiguation
+ * gesture, `drag.kind = 'category'` instead of `'entry'` so updateDrag()/
+ * finishDrag() route to the category-shaped geometry/commit. Below the
+ * drag threshold, pointerup resolves to the header's tap behavior (toggle
+ * collapse + selectCategory) — see buildCategoryHeaderRow()'s doc.
+ */
+function onCategoryPointerDown(state, event, category) {
+  if (event.button !== 0) return // primary button/touch only
+  cancelDeleteConfirm(state)
+
+  const drag = {
+    kind: 'category',
+    pointerId: event.pointerId,
+    category,
+    startX: event.clientX,
+    startY: event.clientY,
+    active: false,
+    rowEl: event.currentTarget,
+    marker: null,
+    target: null
+  }
+  state.drag = drag
+
+  const onMove = (moveEvent) => {
+    if (moveEvent.pointerId !== drag.pointerId) return
+    if (!drag.active) {
+      if (state.busy) return // don't start reordering mid-save/delete/move
+      const dx = moveEvent.clientX - drag.startX
+      const dy = moveEvent.clientY - drag.startY
+      if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return
+      beginDrag(state, drag)
+    }
+    updateDrag(state, drag, moveEvent.clientY)
+  }
+  const onUp = (upEvent) => {
+    if (upEvent.pointerId !== drag.pointerId) return
+    detach()
+    if (drag.active) {
+      finishDrag(state, drag)
+    } else {
+      toggleCategoryCollapse(state, category)
+      selectCategory(state, category).catch((error) => api.warn('select category failed', error))
+    }
+    state.drag = null
+  }
+  const onCancel = (cancelEvent) => {
+    if (cancelEvent.pointerId !== drag.pointerId) return
+    detach()
+    if (drag.active) cancelDrag(state, drag)
+    state.drag = null
+  }
+  function detach() {
+    window.removeEventListener('pointermove', onMove)
+    window.removeEventListener('pointerup', onUp)
+    window.removeEventListener('pointercancel', onCancel)
+  }
+  drag.cleanup = () => {
+    detach()
+    if (drag.active) cancelDrag(state, drag)
+  }
+
+  window.addEventListener('pointermove', onMove)
+  window.addEventListener('pointerup', onUp)
+  window.addEventListener('pointercancel', onCancel)
+}
+
+// ---------------------------------------------------------------------------
+// Rename via the editor's name field (FORMAT.md §7.2 amendment) — double-
+// click a row to focus it; see the file header's "Rename via the editor's
+// name field" paragraph for the full writeup, and performSave()/
+// performSaveCategory() (below, "Save") for where the actual rename
+// request gets sent.
+// ---------------------------------------------------------------------------
+
+/** Focuses (+selects) the name field, unless there's nothing loaded into
+ * it yet (disabled — see resetEditorDom()/populateEditor()). */
+function focusNameField(state) {
+  if (!state.nameFieldEl || state.nameFieldEl.disabled) return
+  state.nameFieldEl.focus()
+  state.nameFieldEl.select()
+}
+
+/**
+ * Rename via the editor's name field (FORMAT.md §7.2 amendment): native
+ * `dblclick` only ever follows two complete click cycles on the same
+ * element — see the file header — so by the time this fires, `name`'s row
+ * has already become `state.activeName` via the two preceding single-
+ * clicks (selectSingle()/chooseSelection()), which is what makes "focus
+ * the name field" land on the right item without this handler needing to
+ * touch selection itself.
+ */
+function onEntryDoubleClick(state, event, _name) {
+  event.preventDefault()
+  event.stopPropagation()
+  // Belt-and-suspenders: a real drag can't produce a dblclick (a drag
+  // commits via finishDrag()/pointerup, never a click), but a stray
+  // in-flight drag object from some other pointer sequence should never
+  // survive past this point.
+  state.drag?.cleanup?.()
+  state.drag = null
+  focusNameField(state)
 }
 
 // ---------------------------------------------------------------------------
@@ -2275,7 +2764,6 @@ function renderFooter(state) {
 function openNewEntryRow(state) {
   if (state.busy || state.creatingNew) return
   cancelDeleteConfirm(state)
-  closeRenameRow(state)
   state.creatingNew = true
   renderFooter(state)
 }
@@ -2316,11 +2804,16 @@ async function confirmNewEntry(state, rawName) {
   state.busy = true
   setStatus(state, 'Creating…')
   try {
-    const data = await api.postJson('/lora_library/notebook/entry', {
-      file: state.file,
-      name,
-      text: ''
-    })
+    const body = { file: state.file, name, text: '' }
+    // New-below (FORMAT.md §3.4/§7.2, owner ask 2026-07-19): with an ENTRY
+    // active (category mode off), the new one lands directly below it via
+    // `after`, same category. Nothing active, or only a category active,
+    // keeps the old end-of-file/end-of-category append — see the file
+    // header's "New-below" paragraph.
+    if (state.activeCategory == null && state.activeName) {
+      body.after = state.activeName
+    }
+    const data = await api.postJson('/lora_library/notebook/entry', body)
     state.busy = false
     state.entries = Array.isArray(data.entries) ? data.entries : state.entries
     state.exists = true
@@ -2334,8 +2827,11 @@ async function confirmNewEntry(state, rawName) {
     setSelection(state, [name], name)
     state.textarea.value = ''
     state.lastSavedText = ''
+    state.nameFieldEl.value = name
+    state.lastSavedName = name
     state.baseMtime = typeof data.mtime === 'number' ? data.mtime : null
     state.textarea.disabled = false
+    state.nameFieldEl.disabled = false
     setDirty(state, false)
     updateModeHint(state)
     setStatus(state, `Created "${name}".`)
@@ -2386,7 +2882,7 @@ async function confirmNewCategory(state, name) {
     state.activeCategory = name
     renderList(state)
     updateDeleteButtonEnabled(state)
-    populateEditor(state, '', data.mtime)
+    populateEditor(state, '', data.mtime, name)
     updateModeHint(state)
     setStatus(state, `Created category "${name}".`)
   } catch (error) {
@@ -2406,7 +2902,6 @@ function onDeleteClick(state) {
   // path that could invoke the handler despite that (FORMAT.md §7.2
   // amendment).
   if (!state.selection.length || state.busy || state.activeCategory != null) return
-  closeRenameRow(state)
 
   if (!state.deleteConfirmActive) {
     state.deleteConfirmActive = true
@@ -2531,28 +3026,54 @@ async function performSave(state, { force = false } = {}) {
 
   const name = state.activeName
   const text = state.textarea.value
+  // Rename via the editor's name field (FORMAT.md §7.2 amendment): Save
+  // commits a rename in the SAME request whenever the name field's value
+  // differs from the active entry's current name — client-side duplicate
+  // check first, server authoritative.
+  const requestedName = currentNameFieldValue(state)
+  if (!requestedName) {
+    setStatus(state, 'Enter a name for this entry.')
+    return
+  }
+  let renameTo = null
+  if (requestedName !== name) {
+    if (state.entries.some((entry) => entry.name === requestedName)) {
+      setStatus(state, `An entry named "${requestedName}" already exists.`)
+      return
+    }
+    renameTo = requestedName
+  }
 
   state.busy = true
   updateSaveButtonEnabled(state)
   setStatus(state, 'Saving…')
   try {
     const body = { file: state.file, name, text }
+    if (renameTo) body.rename_to = renameTo
     if (!force && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
 
     const data = await api.postJson('/lora_library/notebook/entry', body)
     state.busy = false
     if (state.activeName !== name) {
       // Selection moved on while the request was in flight; nothing left to
-      // reconcile against the (now stale) textarea contents.
+      // reconcile against the (now stale) textarea/name-field contents.
       updateSaveButtonEnabled(state)
       return
     }
     state.lastSavedText = text
     state.baseMtime = typeof data.mtime === 'number' ? data.mtime : state.baseMtime
     state.entries = Array.isArray(data.entries) ? data.entries : state.entries
-    setDirty(state, state.textarea.value !== state.lastSavedText)
-    renderList(state)
-    setStatus(state, 'Saved.')
+    if (renameTo) {
+      const nextSelection = state.selection.map((n) => (n === name ? renameTo : n))
+      setSelection(state, nextSelection, renameTo) // also re-renders the list
+      state.nameFieldEl.value = renameTo
+    } else {
+      renderList(state)
+    }
+    state.lastSavedName = currentNameFieldValue(state)
+    refreshDirty(state)
+    updateModeHint(state)
+    setStatus(state, renameTo ? `Saved. Renamed to "${renameTo}".` : 'Saved.')
   } catch (error) {
     state.busy = false
     updateSaveButtonEnabled(state)
@@ -2584,12 +3105,29 @@ async function performSaveCategory(state, { force = false } = {}) {
   if (!name || state.busy) return
 
   const description = state.textarea.value
+  // Rename via the editor's name field (FORMAT.md §7.2 amendment) — same
+  // one-request rule as performSave() above, against `state.categories`
+  // instead of `state.entries`.
+  const requestedName = currentNameFieldValue(state)
+  if (!requestedName) {
+    setStatus(state, 'Enter a name for this category.')
+    return
+  }
+  let renameTo = null
+  if (requestedName !== name) {
+    if (state.categories.includes(requestedName)) {
+      setStatus(state, `A category named "${requestedName}" already exists.`)
+      return
+    }
+    renameTo = requestedName
+  }
 
   state.busy = true
   updateSaveButtonEnabled(state)
   setStatus(state, 'Saving…')
   try {
     const body = { file: state.file, name, description }
+    if (renameTo) body.rename_to = renameTo
     if (!force && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
 
     const data = await api.postJson('/lora_library/notebook/category', body)
@@ -2602,9 +3140,22 @@ async function performSaveCategory(state, { force = false } = {}) {
     state.baseMtime = typeof data.mtime === 'number' ? data.mtime : state.baseMtime
     state.entries = Array.isArray(data.entries) ? data.entries : state.entries
     state.categories = Array.isArray(data.categories) ? data.categories : state.categories
-    setDirty(state, state.textarea.value !== state.lastSavedText)
+    if (renameTo) {
+      state.activeCategory = renameTo
+      state.nameFieldEl.value = renameTo
+      // Single-tap collapse (FORMAT.md §7.2 amendment) tracks collapse by
+      // NAME (state.collapsedCategories is a bare Set<string>) — without
+      // this, a renamed category that was collapsed would silently render
+      // expanded post-rename, since the Set still holds the OLD string.
+      if (state.collapsedCategories.delete(name)) {
+        state.collapsedCategories.add(renameTo)
+      }
+    }
+    state.lastSavedName = currentNameFieldValue(state)
+    refreshDirty(state)
     renderList(state)
-    setStatus(state, 'Saved.')
+    updateModeHint(state)
+    setStatus(state, renameTo ? `Saved. Renamed to "${renameTo}".` : 'Saved.')
   } catch (error) {
     state.busy = false
     updateSaveButtonEnabled(state)
@@ -2627,6 +3178,22 @@ async function performSaveCategory(state, { force = false } = {}) {
 function setDirty(state, value) {
   state.dirty = value
   updateSaveButtonEnabled(state)
+}
+
+/** Trimmed current value of the editor's name field (FORMAT.md §7.2
+ * amendment) — shared by dirty-tracking and Save's rename detection. */
+function currentNameFieldValue(state) {
+  return (state.nameFieldEl.value || '').trim()
+}
+
+/** Recomputes `state.dirty` from BOTH the textarea (body/description) and
+ * the name field — Save now commits whichever of the two changed, in one
+ * request (performSave()/performSaveCategory()), so either one alone must
+ * enable it. Called from both fields' `input` listeners (buildUi()). */
+function refreshDirty(state) {
+  const textChanged = state.textarea.value !== state.lastSavedText
+  const nameChanged = currentNameFieldValue(state) !== state.lastSavedName
+  setDirty(state, textChanged || nameChanged)
 }
 
 function updateSaveButtonEnabled(state) {

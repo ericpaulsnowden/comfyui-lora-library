@@ -1,5 +1,5 @@
 /**
- * @file Power Lora Loader State Controller — frontend-only virtual node
+ * @file Lora Loader State Controller — frontend-only virtual node
  * (FORMAT.md §6.3) that drives a genuine, untouched `Power Lora Loader
  * (rgthree)` node elsewhere in the graph. Registered purely in JS (like
  * core's MarkdownNote/NoteNode) — never executes, never appears in the API
@@ -15,6 +15,26 @@
  * DELIBERATELY left alone so this stays a pure vocabulary change with zero
  * behavioral or serialization risk. See the `label` vs `name` bullet below
  * for the one widget where that distinction is load-bearing.
+ *
+ * Renamed AGAIN 2026-07-19 (owner: drop "Power" — "Power Lora Loader State
+ * Controller" -> "Lora Loader State Controller"). Only `NODE_TITLE` changed:
+ * the TARGET node this file drives is still genuinely titled "Power Lora
+ * Loader (rgthree)", so every other "Power Lora Loader" string below
+ * describes THAT node, not this one. Same owner report, two more fixes in
+ * this same pass:
+ *  (1) "Save State doesn't work; re-picking reverts to original strengths" —
+ *      root-caused and fixed as two parts, LIVE-VERIFIED against the rig
+ *      (comfyui-test, port 8199): see `_hookSetValueForReselect()` (a
+ *      same-value re-pick in the `set` combo provably never reaches its
+ *      callback on this fork — confirmed by reading the exact installed
+ *      `BaseWidget.setValue` in comfyui-frontend-package 1.45.21) and
+ *      `_doUpdate()`'s post-save re-apply. Capture itself was NOT at fault —
+ *      `captureRows()` already reads the live, in-place-mutated
+ *      `widget.value.strength`/`.strengthTwo` rgthree's real strength-drag
+ *      handler writes (`power_lora_loader.js` `doOnStrengthAnyMove`/
+ *      `stepStrength`), confirmed with an actual pointer drag on the rig.
+ *  (2) Added the `Push State` button — broadcasts the selected state to
+ *      every `LoraLibraryApplySet` node in the graph; see `_doPush()`.
  *
  * This file binds to rgthree internals it does not own. Every binding is
  * cited below with the exact file + lines read (rgthree-comfy's COMPILED
@@ -128,10 +148,11 @@
  *    only agree if every `serialize:false` widget sits AFTER every normally
  *    serialized widget — an interleaved layout would misread values on
  *    reload. This is why `target`/`set`/`name` are declared first and
- *    `status` + all 3 buttons (all `serialize:false`) are declared last.
- *    Do not reorder without re-checking this. (Was 4 buttons before the
- *    2026-07-18 owner change removed the standalone Apply button — see
- *    `_onSetSelected`.)
+ *    `status` + all 4 buttons (all `serialize:false`) are declared last.
+ *    Do not reorder without re-checking this. Button count history: 4 → 3
+ *    when the 2026-07-18 owner change removed the standalone Apply button
+ *    (see `_onSetSelected`) → 4 again on 2026-07-19 with Push State added
+ *    (see `_doPush`).
  *  - `ComboWidget` supports `options.values` as a function
  *    (ComboWidget.ts:59-64, `getValues()`) — but it's deprecated as of
  *    v0.14.5 and logs a console warning on every dropdown open
@@ -210,7 +231,7 @@ import * as api from './api.js'
 // ---------------------------------------------------------------- constants
 
 const NODE_TYPE = 'LoraLibrarySetController'
-const NODE_TITLE = 'Power Lora Loader State Controller'
+const NODE_TITLE = 'Lora Loader State Controller'
 const NODE_CATEGORY = 'EPSNodes'
 
 /** Exact rgthree type/title/comfyClass string — constants.js addRgthree("Power Lora Loader"). */
@@ -220,6 +241,15 @@ const PROP_SHOW_STRENGTHS = 'Show Strengths'
 const PROP_SHOW_STRENGTHS_DUAL = 'Separate Model & Clip'
 /** rgthree row widgets are named lora_<counter>; counter never reuses numbers. */
 const LORA_ROW_NAME_RE = /^lora_\d+$/
+
+/**
+ * FORMAT.md §6.3 Push State: the Apply LoRA Set node's class id + its `set`
+ * widget's internal name (lora_library/nodes_sets.py `LoraLibraryApplySet`;
+ * web/lora_library/sets.js `WIDGET_NAME`) — same literals, kept in sync by
+ * hand since neither file imports the other.
+ */
+const APPLY_SET_NODE_CLASS = 'LoraLibraryApplySet'
+const APPLY_SET_WIDGET_NAME = 'set'
 
 /** FORMAT.md §6.3: our OWN node property — default false, revealed via right-click Properties. */
 const PROP_SHOW_STATUS = 'Show status'
@@ -241,6 +271,7 @@ const ALL_TARGETS_RE = /^All Power Lora Loaders \(\d+\)$/
 const LABEL_CAPTURE = 'New State'
 const LABEL_UPDATE = 'Save State'
 const LABEL_DELETE = 'Delete State'
+const LABEL_PUSH = 'Push State'
 const LABEL_DELETE_CONFIRM = 'Are you sure?'
 const DELETE_CONFIRM_MS = 4000
 /**
@@ -554,6 +585,54 @@ function applySetToTargets(nodes, setData) {
   for (const node of nodes) applySetToTarget(node, setData)
 }
 
+/**
+ * FORMAT.md §6.3 Push State: every `LoraLibraryApplySet` node in the current
+ * graph, found by `comfyClass` — the exact lookup the spec calls out, with
+ * the same instance-or-constructor fallback `sets.js`'
+ * `attachApplySetBehavior()` already uses for this same node type.
+ */
+function findApplySetNodes() {
+  const nodes = app.graph?._nodes || app.graph?.nodes || []
+  return nodes.filter((node) => (node?.comfyClass ?? node?.constructor?.comfyClass) === APPLY_SET_NODE_CLASS)
+}
+
+/**
+ * Write `slug` to one Apply LoRA Set node's `set` widget through its REAL
+ * setter — `BaseWidget.setValue()`, not a plain `.value =` assignment — so
+ * its `callback`/`node.onWidgetChanged` fire exactly like a genuine user
+ * pick. ApplySet's `set` widget is a stock litegraph ComboWidget (built from
+ * the node's Python INPUT_TYPES, never touched by this file otherwise), same
+ * class hierarchy as our own `set` combo — see `_hookSetValueForReselect()`
+ * for the verified `setValue` mechanics this relies on. Falls back to a
+ * manual value+callback+onWidgetChanged sequence if `setValue` isn't there
+ * (shape drift on some future core), so Push State degrades gracefully
+ * instead of throwing. Always dirties the node's canvas so the combo's
+ * on-screen text updates immediately.
+ */
+function pushStateToNode(node, slug) {
+  const widget = (node.widgets || []).find((w) => w && w.name === APPLY_SET_WIDGET_NAME)
+  if (!widget) return false
+  if (typeof widget.setValue === 'function') {
+    widget.setValue(slug, { node, canvas: app.canvas })
+  } else {
+    const old = widget.value
+    widget.value = slug
+    widget.callback?.(slug, app.canvas, node, undefined, undefined)
+    node.onWidgetChanged?.(widget.name, slug, old, widget)
+  }
+  node.setDirtyCanvas(true, true)
+  return true
+}
+
+/** Push `slug` to every Apply LoRA Set node in the graph; returns how many were touched. */
+function pushStateToApplySetNodes(slug) {
+  let count = 0
+  for (const node of findApplySetNodes()) {
+    if (pushStateToNode(node, slug)) count++
+  }
+  return count
+}
+
 // ------------------------------------------------------------ node registration
 
 /**
@@ -684,7 +763,7 @@ export function registerControllerNode() {
 
       _buildWidgets() {
         // Order matters beyond layout: every serialize:false widget below
-        // (status + 3 buttons) MUST stay after every normally-serialized one
+        // (status + 4 buttons) MUST stay after every normally-serialized one
         // (target/set/name) — see the litegraph save/restore note in the
         // file header for why an interleaved order would corrupt reload.
         this._w.target = this.addWidget(
@@ -705,15 +784,7 @@ export function registerControllerNode() {
           'combo',
           'set',
           '',
-          () =>
-            this._guarded('set changed', () => {
-              if (this._isRestoring || this._silentSetWrite) return
-              // A genuine user reselect means any pending delete-confirm is
-              // now about a DIFFERENT entry than what's on screen — disarm
-              // rather than let a stale confirm click land on the old pick.
-              this._disarmDeleteButton()
-              this._onSetSelected()
-            }),
+          () => this._onSetComboCallback(),
           { values: () => this._setComboValues() }
         )
         // 2026-07-18c rename: display-only. `name` stays 'set' (serialize +
@@ -721,6 +792,10 @@ export function registerControllerNode() {
         // `label` vs `name` citation for the BaseWidget mechanics this relies
         // on. VERIFY(live).
         this._w.set.label = 'state'
+        // 2026-07-19 strength-persistence fix, cause A: force an apply even
+        // when a re-pick doesn't change the combo's value (see
+        // _hookSetValueForReselect for the confirmed root cause).
+        this._hookSetValueForReselect(this._w.set)
 
         this._w.name = this.addWidget('text', 'name', '', () => {}, {})
 
@@ -751,6 +826,12 @@ export function registerControllerNode() {
         // bookkeeping — Object.defineProperty et al — so it gets the same
         // never-throw belt-and-suspenders. 2026-07-18c delete-bug fix.
         this._w.deleteBtn = this._addButton(LABEL_DELETE, () => this._guarded('delete click', () => this._onDeleteClick()))
+        // FORMAT.md §6.3 Push State (2026-07-19): broadcasts to Apply LoRA
+        // Set nodes, entirely independent of the rgthree target/probe this
+        // pack drives above — deliberately NOT in `_actionButtons` below, so
+        // it stays clickable even with no Power Lora Loader in the graph (or
+        // rgthree not installed at all); see `_doPush()`.
+        this._w.pushBtn = this._addButton(LABEL_PUSH, () => this._onPushClick())
         this._actionButtons = [this._w.captureBtn, this._w.updateBtn, this._w.deleteBtn]
 
         this._refreshTargetCombo()
@@ -954,6 +1035,54 @@ export function registerControllerNode() {
         }
       }
 
+      /**
+       * FORMAT.md §6.3 strength-persistence fix, cause A (owner report:
+       * "Save State doesn't work; re-picking reverts to original
+       * strengths"). VERIFIED against the exact frontend bundle running on
+       * Eric's rig (comfyui-test, port 8199 — comfyui-frontend-package
+       * 1.45.21, static/assets/api-BqIxvqZ8.js; the hashed filename will
+       * differ on other installs, but the mechanism below is stock
+       * `BaseWidget`, not something rgthree or this pack controls):
+       *
+       *   setValue(v, {node, canvas}) {
+       *     const old = this.value
+       *     if (v === this.value) return          // <- exactly this guard
+       *     this.value = v
+       *     ...
+       *     this.callback?.(this.value, canvas, node, canvas.graph_mouse, event)
+       *     node.onWidgetChanged?.(this.name, v, old, this)
+       *     ...
+       *   }
+       *
+       * and separately, `ComboWidget.onClick`'s dropdown `ContextMenu` item
+       * callback calls `this.setValue(clickedItem, ...)` UNCONDITIONALLY for
+       * whichever item the user clicks — including the already-selected one.
+       * So a real user re-picking the current state hits the `v ===
+       * this.value` branch above and `setValue` returns before invoking
+       * `callback` at all: the `set` combo's apply-on-select callback (see
+       * `_onSetComboCallback`) provably never runs. Confirmed live by
+       * reselecting the current state in the running app and observing zero
+       * effect until this fix — not a hypothesis.
+       *
+       * Fix: shadow `setValue` on this ONE widget INSTANCE — the same
+       * per-instance-shadowing trick `_armDeleteButtonColor()` uses for
+       * `background_color`/`text_color` (file header citation) — so a
+       * same-value pick still forces our apply path, while a genuine value
+       * change still runs the ORIGINAL method completely unmodified
+       * (identical property-sync/callback/onWidgetChanged/version-bump side
+       * effects to before this fix).
+       */
+      _hookSetValueForReselect(widget) {
+        const baseSetValue = widget.setValue
+        if (typeof baseSetValue !== 'function') return // shape drift — the normal callback-on-change path still works
+        widget.setValue = (value, opts) => {
+          const unchanged = value === widget.value
+          baseSetValue.call(widget, value, opts)
+          if (!unchanged) return // the call above already ran `callback` -> `_onSetComboCallback()`
+          this._onSetComboCallback()
+        }
+      }
+
       _toast(severity, summary, detail) {
         try {
           app.extensionManager?.toast?.add?.({
@@ -978,6 +1107,24 @@ export function registerControllerNode() {
 
       // -------------------------------------------------------- button actions
 
+      /**
+       * The `set` combo's callback (fires on a genuine value CHANGE) and
+       * `_hookSetValueForReselect()`'s forced path (fires on a same-value
+       * RECLICK, which never reaches a real callback on this fork — see that
+       * method's citation) both funnel through here, so a reselect behaves
+       * identically to a real change no matter which of the two triggered it.
+       */
+      _onSetComboCallback() {
+        this._guarded('set changed', () => {
+          if (this._isRestoring || this._silentSetWrite) return
+          // A genuine user reselect means any pending delete-confirm is now
+          // about a DIFFERENT entry than what's on screen — disarm rather
+          // than let a stale confirm click land on the old pick.
+          this._disarmDeleteButton()
+          this._onSetSelected()
+        })
+      }
+
       /** Fired by the `set` combo's callback (see _buildWidgets) — not a button. */
       _onSetSelected() {
         this._runAction('Apply State', () => this._doApply())
@@ -994,6 +1141,12 @@ export function registerControllerNode() {
       _onUpdateClick() {
         this._disarmDeleteButton()
         this._runAction(LABEL_UPDATE, () => this._doUpdate())
+      }
+
+      /** FORMAT.md §6.3 Push State — broadcasts to Apply LoRA Set nodes, see `_doPush()`. */
+      _onPushClick() {
+        this._disarmDeleteButton()
+        this._runAction(LABEL_PUSH, () => this._doPush())
       }
 
       /**
@@ -1159,6 +1312,17 @@ export function registerControllerNode() {
         this._applySetsResponse(response)
         announceSetsChanged()
         this._selectSetBySlug(entry.slug)
+        // FORMAT.md §6.3 strength-persistence fix, cause A: re-apply the
+        // just-saved rows to every target immediately, unconditionally.
+        // Redundant for the single-target case (we just captured these exact
+        // rows FROM the target), but it's what keeps every OTHER target in
+        // sync in "All Power Lora Loaders" mode, and — the actual point —
+        // it's what makes Save State visibly "take" without depending on the
+        // `set` combo's value ever changing, since the combo's value here
+        // never does (see `_hookSetValueForReselect` for why a later
+        // same-value re-pick alone would otherwise silently no-op).
+        applySetToTargets(targets, { loras })
+        this._probeAndUpdateStatus()
         const sourceNote =
           targets.length > 1 ? ` from ${source.title || source.type} #${source.id} (lowest id of ${targets.length})` : ''
         this._toast('success', NODE_TITLE, `Updated "${name}" (${loras.length} rows)${sourceNote}.`)
@@ -1177,6 +1341,37 @@ export function registerControllerNode() {
         this._selectedSlug = nextEntry?.slug || null
         this._setSetValueSilently(nextEntry?.label || '')
         this._toast('success', NODE_TITLE, `Deleted "${entry.name}".`)
+      }
+
+      /**
+       * FORMAT.md §6.3 Push State: broadcast the currently-selected state to
+       * EVERY `LoraLibraryApplySet` node in the graph — the sync mechanism
+       * for "one controller drives several Apply LoRA Set nodes." Entirely
+       * independent of `probeTargets()`/the rgthree target above: this can
+       * run with zero Power Lora Loaders in the graph, or rgthree not even
+       * installed. Writes the state's SLUG, not its (possibly
+       * dedup-suffixed) combo label — ApplySet's own `set` combo is built
+       * server-side from `["None"] + sorted slugs`
+       * (lora_library/nodes_sets.py `_slug_options()`), and its frontend
+       * cache (sets.js `refreshSetsCache`) mirrors that: slugs only, never
+       * names/labels.
+       */
+      async _doPush() {
+        const entry = this._selectedSetEntry()
+        if (!entry) {
+          this._toast('warn', NODE_TITLE, 'Pick a saved state first.')
+          return
+        }
+        const count = pushStateToApplySetNodes(entry.slug)
+        if (count === 0) {
+          this._toast('warn', NODE_TITLE, 'No Apply LoRA Set nodes in this graph.')
+          return
+        }
+        this._toast(
+          'success',
+          NODE_TITLE,
+          `Pushed "${entry.name}" to ${count} Apply LoRA Set node${count === 1 ? '' : 's'}.`
+        )
       }
     }
 

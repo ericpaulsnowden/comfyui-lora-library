@@ -107,10 +107,12 @@ def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
     async def post_notebook_category(request: web.Request) -> web.Response:
         """FORMAT.md §5's create-or-describe row: an unknown ``name`` CREATEs
         the category (§3.4's Create category, with the given description
-        applied atomically); a known one replaces its description (Set
-        category description). Same guard/conflict/error shape as
-        ``post_notebook_entry`` above — see that handler for the parallel
-        structure."""
+        applied atomically; ``after`` positions the new heading right after
+        that entry/category instead of appending at end-of-file); a known
+        one replaces its description (Set category description) and, when
+        ``rename_to`` is given, renames its heading too. Same
+        guard/conflict/error shape as ``post_notebook_entry`` above — see
+        that handler for the parallel structure."""
         try:
             body = await request.json()
         except Exception:  # broad: malformed body is a client error
@@ -133,6 +135,15 @@ def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
         description = body.get("description")
         if description is not None and not isinstance(description, str):
             return error_response(400, "'description' must be a string")
+        # after is CREATE-only (positions the new heading, FORMAT.md §3.4);
+        # rename_to is known-name-only (nothing to rename on a create) — the
+        # branches below use only the one that applies to each.
+        after = body.get("after")
+        if after is not None and not isinstance(after, str):
+            return error_response(400, "'after' must be a string")
+        rename_to = body.get("rename_to")
+        if rename_to is not None and not isinstance(rename_to, str):
+            return error_response(400, "'rename_to' must be a string")
         base_mtime = body.get("base_mtime")
         if base_mtime is not None and not isinstance(base_mtime, (int, float)):
             return error_response(400, "'base_mtime' must be a number")
@@ -145,9 +156,11 @@ def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
 
         try:
             if markdown_store.get_category_description(parsed, name) is None:
-                markdown_store.create_category(parsed, name, description or "")
+                markdown_store.create_category(parsed, name, description or "", after=after)
             else:
                 markdown_store.set_category_description(parsed, name, description or "")
+                if rename_to and rename_to.strip():
+                    markdown_store.set_category_name(parsed, name, rename_to)
         except markdown_store.MarkdownStoreError as exc:
             return error_response(400, str(exc))
 
@@ -209,6 +222,12 @@ def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
         rename_to = body.get("rename_to")
         if rename_to is not None and not isinstance(rename_to, str):
             return error_response(400, "'rename_to' must be a string")
+        # after is CREATE-only (FORMAT.md §3.4 Create after): positions a
+        # brand-new entry right below the named one; ignored once `name`
+        # already exists — see markdown_store.upsert_entry.
+        after = body.get("after")
+        if after is not None and not isinstance(after, str):
+            return error_response(400, "'after' must be a string")
         base_mtime = body.get("base_mtime")
         if base_mtime is not None and not isinstance(base_mtime, (int, float)):
             return error_response(400, "'base_mtime' must be a number")
@@ -221,7 +240,7 @@ def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
 
         try:
             markdown_store.upsert_entry(
-                parsed, name, text, category=category, rename_to=rename_to
+                parsed, name, text, category=category, rename_to=rename_to, after=after
             )
         except markdown_store.MarkdownStoreError as exc:
             return error_response(400, str(exc))
@@ -320,6 +339,61 @@ def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
         new_mtime = markdown_store.save_notebook(path, parsed, line_ending)
         return web.json_response(
             {"ok": True, "mtime": new_mtime, "entries": markdown_store.list_entries(parsed)}
+        )
+
+    @routes.post("/lora_library/notebook/move_category")
+    async def post_notebook_move_category(request: web.Request) -> web.Response:
+        """FORMAT.md §5's move_category row / §3.4 Move category: relocate a
+        whole category block (heading + §3.1 description + all its entries)
+        before another named category, or to end-of-file when ``before`` is
+        omitted. Same guard/conflict shape as ``post_notebook_move`` above;
+        unknown ``name``/``before`` — including the un-movable uncategorized
+        head region — is 404 via ``markdown_store.CategoryNotFoundError``."""
+        try:
+            body = await request.json()
+        except Exception:  # broad: malformed body is a client error
+            return error_response(400, "body must be JSON")
+        if not isinstance(body, dict):
+            return error_response(400, "body must be a JSON object")
+
+        path, err = _resolve_path(context, body.get("file"))
+        if err is not None:
+            return err
+        guard = notebook_path_error(
+            context, path, loopback=request_is_loopback(request), writing=True
+        )
+        if guard:
+            return error_response(403, guard)
+
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return error_response(400, "'name' is required")
+        before = body.get("before")
+        if before is not None and not isinstance(before, str):
+            return error_response(400, "'before' must be a string")
+        base_mtime = body.get("base_mtime")
+        if base_mtime is not None and not isinstance(base_mtime, (int, float)):
+            return error_response(400, "'base_mtime' must be a number")
+
+        parsed, current_mtime, line_ending = markdown_store.load_notebook(path)
+        try:
+            markdown_store.check_conflict(base_mtime, current_mtime)
+        except markdown_store.ConflictError as exc:
+            return web.json_response({"error": str(exc), "mtime": exc.current_mtime}, status=409)
+
+        try:
+            markdown_store.move_category(parsed, name, before=before)
+        except markdown_store.CategoryNotFoundError as exc:
+            return error_response(404, str(exc))
+
+        new_mtime = markdown_store.save_notebook(path, parsed, line_ending)
+        return web.json_response(
+            {
+                "ok": True,
+                "mtime": new_mtime,
+                "entries": markdown_store.list_entries(parsed),
+                "categories": markdown_store.list_categories(parsed),
+            }
         )
 
     @routes.post("/lora_library/notebook/open_folder")

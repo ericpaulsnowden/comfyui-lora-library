@@ -449,6 +449,100 @@ async def test_post_category_preserves_crlf_line_endings(
     assert raw == "# Cat A\r\nNew.\r\n## E1\r\nB1\r\n"
 
 
+async def test_post_category_create_with_after_positions_new_heading(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat A"})
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat B"})
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "New Cat", "after": "Cat A"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["categories"] == ["Cat A", "New Cat", "Cat B"]
+
+
+async def test_post_category_rename_changes_heading_and_keeps_entries(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E1", "text": "body1", "category": "Cat A"},
+    )
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Cat A", "description": "d", "rename_to": "Cat A2"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["categories"] == ["Cat A2"]
+    assert body["entries"] == [{"name": "E1", "category": "Cat A2"}]
+    fetched = await client.get(
+        "/lora_library/notebook/entry", params={"file": "loras.md", "name": "E1"}
+    )
+    assert (await fetched.json())["text"] == "body1"
+
+
+async def test_post_category_rename_to_duplicate_name_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat A"})
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat B"})
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Cat A", "rename_to": "Cat B"},
+    )
+    assert resp.status == 400
+    assert "error" in await resp.json()
+    # Unchanged after the refused rename.
+    fetched = await client.get("/lora_library/notebook", params={"file": "loras.md"})
+    assert (await fetched.json())["categories"] == ["Cat A", "Cat B"]
+
+
+async def test_post_category_rename_to_is_ignored_when_creating(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Brand New", "rename_to": "Something Else"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # `rename_to` only applies to a known (existing) name — on create it's
+    # silently ignored, so the category is created under its given name.
+    assert body["categories"] == ["Brand New"]
+
+
+async def test_post_category_non_string_after_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "after": 5},
+    )
+    assert resp.status == 400
+
+
+async def test_post_category_non_string_rename_to_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/category", json={"file": "loras.md", "name": "Styles"}
+    )
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "rename_to": 5},
+    )
+    assert resp.status == 400
+
+
 # ----------------------------------------------------- GET /notebook/entry
 
 
@@ -732,6 +826,84 @@ async def test_post_entry_omitted_base_mtime_skips_conflict_check(
         "/lora_library/notebook/entry", json={"file": "loras.md", "name": "Foo", "text": "updated"}
     )
     assert resp.status == 200
+
+
+async def test_post_entry_create_with_after_inserts_below_named_entry(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    for n in ("E1", "E2"):
+        await client.post(
+            "/lora_library/notebook/entry",
+            json={"file": "loras.md", "name": n, "text": n, "category": "Cat A"},
+        )
+    resp = await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "New", "text": "n", "after": "E1"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["entries"] == [
+        {"name": "E1", "category": "Cat A"},
+        {"name": "New", "category": "Cat A"},
+        {"name": "E2", "category": "Cat A"},
+    ]
+
+
+async def test_post_entry_create_with_unknown_after_falls_back_to_append(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/entry", json={"file": "loras.md", "name": "E1", "text": "b1"}
+    )
+    resp = await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "New", "text": "n", "after": "does-not-exist"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["entries"] == [
+        {"name": "E1", "category": ""},
+        {"name": "New", "category": ""},
+    ]
+
+
+async def test_post_entry_after_is_ignored_on_update(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/entry", json={"file": "loras.md", "name": "E1", "text": "b1"}
+    )
+    await client.post(
+        "/lora_library/notebook/entry", json={"file": "loras.md", "name": "E2", "text": "b2"}
+    )
+    resp = await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E1", "text": "updated", "after": "E2"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    # E1 already existed: `after` never applies to an update — position is
+    # unchanged, only the text changed.
+    assert body["entries"] == [
+        {"name": "E1", "category": ""},
+        {"name": "E2", "category": ""},
+    ]
+    fetched = await client.get(
+        "/lora_library/notebook/entry", params={"file": "loras.md", "name": "E1"}
+    )
+    assert (await fetched.json())["text"] == "updated"
+
+
+async def test_post_entry_non_string_after_is_400(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "Foo", "text": "x", "after": 5},
+    )
+    assert resp.status == 400
 
 
 # --------------------------------------------------- POST /notebook/delete
@@ -1079,6 +1251,243 @@ async def test_post_move_matching_base_mtime_succeeds(
     resp = await client.post(
         "/lora_library/notebook/move",
         json={"file": "loras.md", "name": "E2", "before": "E1", "base_mtime": real_mtime},
+    )
+    assert resp.status == 200
+
+
+# --------------------------------------------- POST /notebook/move_category
+
+
+async def test_post_move_category_before_another_category(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E1", "text": "b1", "category": "Cat A"},
+    )
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E2", "text": "b2", "category": "Cat B"},
+    )
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={"file": "loras.md", "name": "Cat B", "before": "Cat A"},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["categories"] == ["Cat B", "Cat A"]
+    assert body["entries"] == [
+        {"name": "E2", "category": "Cat B"},
+        {"name": "E1", "category": "Cat A"},
+    ]
+
+
+async def test_post_move_category_to_end_of_file_when_before_omitted(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E1", "text": "b1", "category": "Cat A"},
+    )
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E2", "text": "b2", "category": "Cat B"},
+    )
+    resp = await client.post(
+        "/lora_library/notebook/move_category", json={"file": "loras.md", "name": "Cat A"}
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["categories"] == ["Cat B", "Cat A"]
+
+
+async def test_post_move_category_description_and_entries_persist_through_disk(
+    context: LibraryContext, library_dir: Path, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat B"})
+    await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Cat A", "description": "Prose."},
+    )
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E1", "text": "body1", "category": "Cat A"},
+    )
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={"file": "loras.md", "name": "Cat A", "before": "Cat B"},
+    )
+    assert resp.status == 200
+    raw = (library_dir / "loras.md").read_text(encoding="utf-8")
+    assert raw == "# Cat A\nProse.\n## E1\nbody1\n# Cat B\n"
+
+
+async def test_post_move_category_unknown_name_is_404(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat A"})
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={"file": "loras.md", "name": "does-not-exist"},
+    )
+    assert resp.status == 404
+
+
+async def test_post_move_category_unknown_before_is_404(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat A"})
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={"file": "loras.md", "name": "Cat A", "before": "does-not-exist"},
+    )
+    assert resp.status == 404
+
+
+async def test_post_move_category_missing_file_is_404(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/move_category", json={"file": "loras.md", "name": "Cat A"}
+    )
+    assert resp.status == 404
+
+
+async def test_post_move_category_missing_name_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/notebook/move_category", json={"file": "loras.md"})
+    assert resp.status == 400
+
+
+async def test_post_move_category_blank_name_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    # FORMAT.md §3.4: the uncategorized head region ("") is never a movable
+    # category — this is the observable-at-the-route-layer half of that
+    # rule (blank required fields are uniformly 400 here, same as every
+    # sibling route); markdown_store.move_category's own direct rejection
+    # is exercised at the store-test layer.
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/move_category", json={"file": "loras.md", "name": "   "}
+    )
+    assert resp.status == 400
+
+
+async def test_post_move_category_non_string_before_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat A"})
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={"file": "loras.md", "name": "Cat A", "before": 5},
+    )
+    assert resp.status == 400
+
+
+async def test_post_move_category_malformed_json_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        data="not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 400
+
+
+async def test_post_move_category_non_object_body_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/notebook/move_category", json=["nope"])
+    assert resp.status == 400
+
+
+async def test_post_move_category_requires_md_suffix_even_for_loopback(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={"file": "notes.txt", "name": "Cat A"},
+    )
+    assert resp.status == 403
+
+
+async def test_post_move_category_remote_outside_library_dir_is_403(
+    context: LibraryContext, tmp_path: Path, aiohttp_client
+) -> None:
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("# Cat A\n## E1\nb1\n# Cat B\n", encoding="utf-8")
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={"file": str(outside), "name": "Cat A", "before": "Cat B"},
+        headers=REMOTE,
+    )
+    assert resp.status == 403
+    raw = outside.read_text(encoding="utf-8")
+    assert raw.index("Cat A") < raw.index("Cat B")  # untouched — original order preserved
+
+
+async def test_post_move_category_stale_base_mtime_is_409_and_file_untouched(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat A"})
+    created = await client.post(
+        "/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat B"}
+    )
+    real_mtime = (await created.json())["mtime"]
+
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={
+            "file": "loras.md",
+            "name": "Cat B",
+            "before": "Cat A",
+            "base_mtime": real_mtime - 100.0,
+        },
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert body["mtime"] == real_mtime
+
+    listing = await (
+        await client.get("/lora_library/notebook", params={"file": "loras.md"})
+    ).json()
+    assert listing["categories"] == ["Cat A", "Cat B"]
+
+
+async def test_post_move_category_matching_base_mtime_succeeds(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat A"})
+    created = await client.post(
+        "/lora_library/notebook/category", json={"file": "loras.md", "name": "Cat B"}
+    )
+    real_mtime = (await created.json())["mtime"]
+    resp = await client.post(
+        "/lora_library/notebook/move_category",
+        json={
+            "file": "loras.md",
+            "name": "Cat B",
+            "before": "Cat A",
+            "base_mtime": real_mtime,
+        },
     )
     assert resp.status == 200
 
