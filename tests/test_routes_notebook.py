@@ -106,6 +106,349 @@ async def test_get_notebook_non_string_file_query_is_still_a_string_from_query_p
     assert resp.status == 200
 
 
+async def test_get_notebook_missing_file_categories_is_empty_list(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.get("/lora_library/notebook", params={"file": "loras.md"})
+    assert (await resp.json())["categories"] == []
+
+
+async def test_get_notebook_categories_in_file_order(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E1", "text": "b1", "category": "Cat A"},
+    )
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E2", "text": "b2", "category": "Cat B"},
+    )
+    resp = await client.get("/lora_library/notebook", params={"file": "loras.md"})
+    assert (await resp.json())["categories"] == ["Cat A", "Cat B"]
+
+
+async def test_get_notebook_categories_includes_an_empty_category(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/category", json={"file": "loras.md", "name": "Empty Cat"}
+    )
+    resp = await client.get("/lora_library/notebook", params={"file": "loras.md"})
+    body = await resp.json()
+    assert body["categories"] == ["Empty Cat"]
+    assert body["entries"] == []
+
+
+# --------------------------------------------------- GET /notebook/category
+
+
+async def test_get_notebook_category_success(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "description": "Prose about styles."},
+    )
+    resp = await client.get(
+        "/lora_library/notebook/category", params={"file": "loras.md", "name": "Styles"}
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["name"] == "Styles"
+    assert body["description"] == "Prose about styles."
+    assert isinstance(body["mtime"], float)
+
+
+async def test_get_notebook_category_with_no_description_is_empty_string(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Bare"})
+    resp = await client.get(
+        "/lora_library/notebook/category", params={"file": "loras.md", "name": "Bare"}
+    )
+    assert (await resp.json())["description"] == ""
+
+
+async def test_get_notebook_category_missing_category_is_404(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post("/lora_library/notebook/category", json={"file": "loras.md", "name": "Real"})
+    resp = await client.get(
+        "/lora_library/notebook/category", params={"file": "loras.md", "name": "does-not-exist"}
+    )
+    assert resp.status == 404
+    assert "error" in await resp.json()
+
+
+async def test_get_notebook_category_missing_file_is_404(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.get(
+        "/lora_library/notebook/category", params={"file": "loras.md", "name": "Styles"}
+    )
+    assert resp.status == 404
+
+
+async def test_get_notebook_category_remote_outside_library_dir_is_403(
+    context: LibraryContext, tmp_path: Path, aiohttp_client
+) -> None:
+    outside = tmp_path / "elsewhere.md"
+    outside.write_text("# Styles\nprose\n", encoding="utf-8")
+    client = await aiohttp_client(make_app(context))
+    resp = await client.get(
+        "/lora_library/notebook/category",
+        params={"file": str(outside), "name": "Styles"},
+        headers=REMOTE,
+    )
+    assert resp.status == 403
+
+
+# -------------------------------------------------- POST /notebook/category
+
+
+async def test_post_category_create_unknown_name_with_description(
+    context: LibraryContext, library_dir: Path, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "description": "Prose about styles."},
+    )
+    assert resp.status == 200
+    body = await resp.json()
+    assert body["ok"] is True
+    assert body["categories"] == ["Styles"]
+    assert body["entries"] == []
+    assert isinstance(body["mtime"], float)
+    raw = (library_dir / "loras.md").read_text(encoding="utf-8")
+    assert raw == "# Styles\nProse about styles.\n"
+
+
+async def test_post_category_create_unknown_name_without_description(
+    context: LibraryContext, library_dir: Path, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category", json={"file": "loras.md", "name": "Bare"}
+    )
+    assert resp.status == 200
+    raw = (library_dir / "loras.md").read_text(encoding="utf-8")
+    assert raw == "# Bare\n"
+
+
+async def test_post_category_create_appends_after_existing_entries(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/entry", json={"file": "loras.md", "name": "E1", "text": "b1"}
+    )
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "description": "d"},
+    )
+    body = await resp.json()
+    assert body["entries"] == [{"name": "E1", "category": ""}]
+    assert body["categories"] == ["Styles"]
+
+
+async def test_post_category_known_name_replaces_description(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "description": "old"},
+    )
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "description": "new"},
+    )
+    assert resp.status == 200
+    fetched = await client.get(
+        "/lora_library/notebook/category", params={"file": "loras.md", "name": "Styles"}
+    )
+    assert (await fetched.json())["description"] == "new"
+
+
+async def test_post_category_replace_does_not_disturb_its_entries(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    await client.post(
+        "/lora_library/notebook/entry",
+        json={"file": "loras.md", "name": "E1", "text": "body1", "category": "Cat A"},
+    )
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Cat A", "description": "new description"},
+    )
+    body = await resp.json()
+    assert body["entries"] == [{"name": "E1", "category": "Cat A"}]
+    fetched = await client.get(
+        "/lora_library/notebook/entry", params={"file": "loras.md", "name": "E1"}
+    )
+    assert (await fetched.json())["text"] == "body1"
+
+
+async def test_post_category_missing_name_is_400(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/notebook/category", json={"file": "loras.md"})
+    assert resp.status == 400
+
+
+async def test_post_category_blank_name_is_400(context: LibraryContext, aiohttp_client) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category", json={"file": "loras.md", "name": "   "}
+    )
+    assert resp.status == 400
+
+
+async def test_post_category_non_string_description_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "description": 5},
+    )
+    assert resp.status == 400
+
+
+async def test_post_category_description_with_heading_line_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "description": "line\n## looks like heading"},
+    )
+    assert resp.status == 400
+    body = await resp.json()
+    assert "error" in body
+
+
+async def test_post_category_malformed_json_body_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        data="not json",
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status == 400
+
+
+async def test_post_category_non_object_body_is_400(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post("/lora_library/notebook/category", json=["nope"])
+    assert resp.status == 400
+
+
+async def test_post_category_requires_md_suffix_even_for_loopback(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category", json={"file": "notes.txt", "name": "Styles"}
+    )
+    assert resp.status == 403
+    assert "error" in await resp.json()
+
+
+async def test_post_category_remote_outside_library_dir_is_403(
+    context: LibraryContext, tmp_path: Path, aiohttp_client
+) -> None:
+    outside = tmp_path / "elsewhere.md"
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": str(outside), "name": "Styles"},
+        headers=REMOTE,
+    )
+    assert resp.status == 403
+    assert not outside.exists()
+
+
+async def test_post_category_stale_base_mtime_is_409_and_file_untouched(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    created = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Styles", "description": "orig"},
+    )
+    real_mtime = (await created.json())["mtime"]
+
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={
+            "file": "loras.md",
+            "name": "Styles",
+            "description": "hijacked",
+            "base_mtime": real_mtime - 100.0,
+        },
+    )
+    assert resp.status == 409
+    body = await resp.json()
+    assert "error" in body
+    assert body["mtime"] == real_mtime
+
+    fetched = await client.get(
+        "/lora_library/notebook/category", params={"file": "loras.md", "name": "Styles"}
+    )
+    assert (await fetched.json())["description"] == "orig"
+
+
+async def test_post_category_matching_base_mtime_succeeds(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    client = await aiohttp_client(make_app(context))
+    created = await client.post(
+        "/lora_library/notebook/category", json={"file": "loras.md", "name": "Styles"}
+    )
+    real_mtime = (await created.json())["mtime"]
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={
+            "file": "loras.md",
+            "name": "Styles",
+            "description": "updated",
+            "base_mtime": real_mtime,
+        },
+    )
+    assert resp.status == 200
+
+
+async def test_post_category_preserves_crlf_line_endings(
+    context: LibraryContext, library_dir: Path, aiohttp_client
+) -> None:
+    (library_dir / "loras.md").write_bytes(b"# Cat A\r\n## E1\r\nB1\r\n")
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/notebook/category",
+        json={"file": "loras.md", "name": "Cat A", "description": "New."},
+    )
+    assert resp.status == 200
+    # newline="" so Python's own universal-newline translation doesn't hide
+    # the very thing being asserted on (see markdown_store.load_notebook's
+    # own doc comment for why it reads this way too).
+    with open(library_dir / "loras.md", encoding="utf-8", newline="") as fh:
+        raw = fh.read()
+    assert raw.count("\n") == raw.count("\r\n")
+    assert raw == "# Cat A\r\nNew.\r\n## E1\r\nB1\r\n"
+
+
 # ----------------------------------------------------- GET /notebook/entry
 
 

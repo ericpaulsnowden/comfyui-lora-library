@@ -42,6 +42,12 @@ captions).
 - **Drag to reorder:** drag entries within the list (an insertion line
   shows the landing spot); drop onto a category header to move an entry
   into that category — the file is rewritten to match, byte-safe.
+- **Categories, made in the UI:** click `＋ New` and type a name starting
+  with `#` (e.g. `# Styles`) to create a category instead of a prompt.
+  Click any category header and the editor switches to that category's
+  **description** — the prose that lives under its `# heading` in the
+  markdown, so it reads naturally in any text editor too. A hint above the
+  editor always says whether you're editing a prompt or a category.
 
 - **Plain Markdown, yours:** one `## Entry Name` per entry in a file you
   point the node at — relative names live in the library folder, absolute

@@ -76,7 +76,88 @@ def register(context: LibraryContext, routes: web.RouteTableDef) -> None:
                 "exists": mtime is not None,
                 "mtime": mtime,
                 "entries": markdown_store.list_entries(parsed),
+                # FORMAT.md §5: names in file order, INCLUDING empty
+                # categories — the one thing `entries` alone can't reveal. A
+                # missing file parses to zero blocks-with-headings, so this
+                # is already `[]` without any special-casing here.
+                "categories": markdown_store.list_categories(parsed),
                 "problems": parsed.problems,
+            }
+        )
+
+    @routes.get("/lora_library/notebook/category")
+    async def get_notebook_category(request: web.Request) -> web.Response:
+        path, err = _resolve_path(context, request.query.get("file", ""))
+        if err is not None:
+            return err
+        guard = notebook_path_error(
+            context, path, loopback=request_is_loopback(request), writing=False
+        )
+        if guard:
+            return error_response(403, guard)
+
+        name = request.query.get("name", "")
+        parsed, mtime, _line_ending = markdown_store.load_notebook(path)
+        description = markdown_store.get_category_description(parsed, name)
+        if description is None:
+            return error_response(404, f"no such category {name!r} in {path}")
+        return web.json_response({"name": name.strip(), "description": description, "mtime": mtime})
+
+    @routes.post("/lora_library/notebook/category")
+    async def post_notebook_category(request: web.Request) -> web.Response:
+        """FORMAT.md §5's create-or-describe row: an unknown ``name`` CREATEs
+        the category (§3.4's Create category, with the given description
+        applied atomically); a known one replaces its description (Set
+        category description). Same guard/conflict/error shape as
+        ``post_notebook_entry`` above — see that handler for the parallel
+        structure."""
+        try:
+            body = await request.json()
+        except Exception:  # broad: malformed body is a client error
+            return error_response(400, "body must be JSON")
+        if not isinstance(body, dict):
+            return error_response(400, "body must be a JSON object")
+
+        path, err = _resolve_path(context, body.get("file"))
+        if err is not None:
+            return err
+        guard = notebook_path_error(
+            context, path, loopback=request_is_loopback(request), writing=True
+        )
+        if guard:
+            return error_response(403, guard)
+
+        name = body.get("name")
+        if not isinstance(name, str) or not name.strip():
+            return error_response(400, "'name' is required")
+        description = body.get("description")
+        if description is not None and not isinstance(description, str):
+            return error_response(400, "'description' must be a string")
+        base_mtime = body.get("base_mtime")
+        if base_mtime is not None and not isinstance(base_mtime, (int, float)):
+            return error_response(400, "'base_mtime' must be a number")
+
+        parsed, current_mtime, line_ending = markdown_store.load_notebook(path)
+        try:
+            markdown_store.check_conflict(base_mtime, current_mtime)
+        except markdown_store.ConflictError as exc:
+            return web.json_response({"error": str(exc), "mtime": exc.current_mtime}, status=409)
+
+        try:
+            if markdown_store.get_category_description(parsed, name) is None:
+                markdown_store.create_category(parsed, name, description or "")
+            else:
+                markdown_store.set_category_description(parsed, name, description or "")
+        except markdown_store.MarkdownStoreError as exc:
+            return error_response(400, str(exc))
+
+        new_mtime = markdown_store.save_notebook(path, parsed, line_ending)
+        return web.json_response(
+            {
+                "ok": True,
+                "mtime": new_mtime,
+                "entries": markdown_store.list_entries(parsed),
+                "categories": markdown_store.list_categories(parsed),
             }
         )
 

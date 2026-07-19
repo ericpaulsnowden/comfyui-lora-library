@@ -91,6 +91,11 @@ entry body …             ← everything until the next H1/H2 heading
 - `## ` (H2) starts an entry; the heading text (trimmed) is the entry name.
 - `# ` (H1) starts a category; entries that follow belong to it until the
   next H1. Entries before any H1 have category `""`.
+- **Category description** (owner ask 2026-07-19): the prose between a
+  `# Category` heading and its first `## entry` (or the next heading) is
+  that category's DESCRIPTION — plain text, preserved verbatim on
+  round-trip, empty when absent. It is presentation/reference prose only:
+  it is never an entry, never appears in the node's outputs.
 - `###` and deeper headings belong to the entry body (they do NOT split).
 - Fenced code blocks (``` … ```) are respected: heading-looking lines inside
   a fence are body text, not boundaries.
@@ -126,6 +131,11 @@ Writers re-emit the file from the parse, with these guarantees:
 - A body line that itself starts with `# ` or `## ` (outside a fence) cannot
   be represented; saves containing one are refused with 400 and a message
   telling the user to use `###`, indentation, or a code fence.
+- **Create category** appends a new `# Name` heading at end-of-file (name
+  must be unique among categories, non-empty after trimming, no newlines);
+  **Set category description** replaces the §3.1 description block under
+  an existing heading (same un-representable-line rule as entry bodies:
+  a description line starting with `# `/`## ` outside a fence is refused).
 - **Move** relocates one entry (drag-reorder's primitive): to just before a
   named sibling entry, or to the END of a named category (creating that
   category heading at end-of-file when new), or to the end of the file
@@ -199,7 +209,9 @@ message>"}` with a 4xx status. `mtime` values are float POSIX seconds.
 | `POST /lora_library/notebook/open_folder` `{"file"}` | **loopback-only** (403 remote): reveals the resolved notebook file's folder in the OS file manager ON THE SERVER MACHINE (Explorer/Finder). Missing folder ⇒ 404; `{"ok": true}` |
 | `POST /lora_library/config` `{"library_dir"}` | validates (absolute, creatable, writable), persists; `{"ok", "library_dir"}` |
 | `GET /lora_library/loras` | `{"loras": [".."]}` — installed loras for pickers |
-| `GET /lora_library/notebook?file=` | `{"file": <resolved abs>, "exists": bool, "mtime", "entries": [{"name","category"}], "problems": [".."]}` (missing file ⇒ `exists:false`, empty entries — NOT an error) |
+| `GET /lora_library/notebook?file=` | `{"file": <resolved abs>, "exists": bool, "mtime", "entries": [{"name","category"}], "categories": [names in file order — includes EMPTY categories, which `entries` alone can't reveal], "problems": [".."]}` (missing file ⇒ `exists:false`, empty lists — NOT an error) |
+| `GET /lora_library/notebook/category?file=&name=` | `{"name","description","mtime"}`; 404 if no such category |
+| `POST /lora_library/notebook/category` `{"file","name","description"?,"base_mtime"?}` | §3.4 create-or-describe: unknown `name` ⇒ CREATE the category (at end-of-file) with the given description; known `name` ⇒ replace its description. §3.5 conflicts ⇒ 409; un-representable description lines ⇒ 400. → `{"ok","mtime","entries","categories"}` |
 | `GET /lora_library/notebook/entry?file=&name=` | `{"name","category","text","mtime"}`; 404 if absent |
 | `POST /lora_library/notebook/entry` `{"file","name","text","category"?,"rename_to"?,"base_mtime"?}` | create-or-update per §3.4/§3.5; `{"ok","mtime","entries"}` (fresh list) |
 | `POST /lora_library/notebook/delete` `{"file","name","base_mtime"?}` | `{"ok","mtime","entries"}` |
@@ -346,6 +358,16 @@ queue. It drives a **genuine, untouched `Power Lora Loader (rgthree)`**:
   - Rename: double-click an entry row to edit its name inline (Enter/✓
     commits via the §5 entry route's `rename_to`, Esc cancels; duplicate
     names are refused client-side first, server remains the authority).
+  - Categories in the UI (owner ask 2026-07-19): `＋ New` with a name
+    STARTING WITH `#` creates a category instead of an entry (the `#` and
+    surrounding whitespace are stripped from the stored name). Category
+    headers are CLICKABLE: selecting one shows its §3.1 description in the
+    editor pane, and Save writes the description through the §5 category
+    route — the editor is contextual (entry selected ⇒ entry body;
+    category selected ⇒ category description; a visible mode hint says
+    which). Category selection is UI-only: it never touches the `entry`
+    widget, the selection set, or the node's outputs. Empty categories
+    render from the §5 `categories` list.
   - File panel (owner amendment 2026-07-18c): the RESOLVED absolute path
     of the notebook file is always visible (muted line under the widgets,
     ellipsized middle-out, full path in its tooltip). Two buttons beside

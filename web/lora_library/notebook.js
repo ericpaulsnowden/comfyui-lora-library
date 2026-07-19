@@ -1,15 +1,18 @@
 /**
  * @file Prompt Notebook two-pane DOM widget (FORMAT.md §7.2) — attaches to
  * `LoraLibraryNotebook` nodes. Left pane: a scrollable, category-grouped,
- * multi-selectable, drag-to-reorder, double-click-to-rename entry list with
- * New/Delete controls (Delete removes every selected entry, not just the
- * active one). Right pane: a `<textarea>` editor with a Save button and a
- * status line (conflict resolution per §3.5 lands there too). Above both
- * panes, a file panel shows the notebook's RESOLVED absolute path plus
- * Browse…/Open folder buttons — hidden (and the `file` widget made
- * effectively read-only) for a remote (`is_local: false`) viewer. The
- * node's own `file`/`entry` STRING widgets stay the serialized truth
- * (§6.1/§7.2) — this DOM widget only ever *reads* `file` and *writes*
+ * multi-selectable, drag-to-reorder, double-click-to-rename entry list —
+ * with CLICKABLE category headers (incl. empty ones — see "Categories"
+ * below) and a ＋ New control that creates either an entry or (given a
+ * `#`-prefixed name) a category, plus 🗑 Delete (entry-only). Right pane: a
+ * `<textarea>` editor with a Save button and a status line (conflict
+ * resolution per §3.5 lands there too) that's CONTEXTUAL — entry body or
+ * category description, per whichever was last clicked, with a mode hint
+ * saying which. Above both panes, a file panel shows the notebook's
+ * RESOLVED absolute path plus Browse…/Open folder buttons — hidden (and the
+ * `file` widget made effectively read-only) for a remote (`is_local: false`)
+ * viewer. The node's own `file`/`entry` STRING widgets stay the serialized
+ * truth (§6.1/§7.2) — this DOM widget only ever *reads* `file` and *writes*
  * `entry`/`file` through their normal widget setters; it never serializes
  * itself.
  *
@@ -150,6 +153,35 @@
  * status note. Every other feature in this file (browsing/editing/saving/
  * deleting/renaming/reordering entries) stays fully functional for a
  * remote viewer — only the FILE the node points at is host-controlled.
+ *
+ * Categories (FORMAT.md §7.2 amendment, owner ask 2026-07-19): typing a name
+ * STARTING WITH `#` into the ＋ New row creates a CATEGORY instead of an
+ * entry (POST `/notebook/category`; the `#`s + surrounding whitespace are
+ * stripped from the stored name — see isCategoryNameInput()/
+ * categoryNameFromInput()). Category headers, rendered from the §5
+ * `categories` list rather than derived from `entries` (so an EMPTY
+ * category still shows — see renderList()'s two-pointer merge of
+ * `categories` and `entries`, both already in file order), are CLICKABLE:
+ * selecting one (selectCategory()) enters "category mode" —
+ * `state.activeCategory` holds its name, the header highlights, and the
+ * SAME editor pane/textarea/Save button/dirty-tracking/base_mtime-conflict
+ * machinery entry-editing already used now targets that category's §3.1
+ * description (GET/POST `/notebook/category`) instead — see
+ * performSaveCategory(), the category-mode sibling of performSave().
+ * `state.modeHintEl` (a muted line directly above the textarea) always says
+ * which of the two the editor currently targets. Category mode is
+ * deliberately UI-only: it is never allowed to touch `state.selection`,
+ * `state.activeName`, the `entry` widget, or multi-select — clicking an
+ * entry always exits it (chooseSelection() clears `activeCategory`, and
+ * reloads the entry pane even if the clicked entry was already the
+ * "active" one underneath category mode) and clicking a header always
+ * enters it, but neither path ever calls setSelection()/syncEntryWidget().
+ * Delete is entry-only and disabled outright in category mode
+ * (updateDeleteButtonEnabled()); double-click-to-rename stays wired to entry
+ * rows only, so it never applies to a header. Drag-reorder/drop-on-header
+ * targeting is unaffected — headers were already valid drop targets
+ * (computeDropTarget()) before category mode existed, and that geometry
+ * doesn't know or care whether a header happens to be the active one.
  *
  * Vanilla ES modules, no build step — DOM nodes are built with
  * `document.createElement` (see the local `el()` helper) rather than any
@@ -292,6 +324,19 @@ const CSS_TEXT = `
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* Categories in the UI (FORMAT.md §7.2 amendment): headers are clickable
+     (selectCategory()) to enter "category mode" — same affordance language
+     as an entry row below. */
+  cursor: pointer;
+  border-radius: 3px;
+  outline: none;
+}
+.llnb-category:hover { background: var(--content-hover-bg, #2a2a2a); }
+.llnb-category:focus-visible { box-shadow: inset 0 0 0 1px var(--border-color, #444); }
+.llnb-category-active,
+.llnb-category-active:hover {
+  background: rgba(66, 133, 244, 0.22);
+  color: var(--input-text, #ccc);
 }
 .llnb-entry {
   padding: 3px 7px;
@@ -386,6 +431,22 @@ const CSS_TEXT = `
   padding: 3px 5px;
   font-size: 11px;
 }
+.llnb-mode-hint {
+  /* Categories in the UI (FORMAT.md §7.2 amendment): "entry selected ⇒
+     entry body; category selected ⇒ category description; a visible mode
+     hint says which" — updateModeHint(). Sits directly above the textarea
+     so it reads as "what Save is about to write", not a status message. */
+  flex: 0 0 auto;
+  padding: 3px 6px;
+  font-size: 10px;
+  font-style: italic;
+  color: var(--descrip-text, #999);
+  border-bottom: 1px solid var(--border-color, #444);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.llnb-mode-hint:empty { display: none; }
 .llnb-textarea {
   flex: 1 1 auto;
   min-height: 0;
@@ -630,6 +691,14 @@ function createState(node, fileWidget, entryWidget) {
     file: null,
     exists: true,
     entries: [],
+    // Categories in the UI (FORMAT.md §7.2 amendment) — the §5 `categories`
+    // list (file order, may include empty/repeated names) and the name of
+    // the category currently shown in the editor ("category mode"), or
+    // null. Deliberately independent of `selection`/`activeName` below —
+    // see the file header's "Categories" paragraph for why entering/exiting
+    // category mode must never touch either.
+    categories: [],
+    activeCategory: null,
     // Selection model (§6.1/§7.2): `selection` is the ordered list of
     // selected entry names — exactly what gets newline-joined into the
     // `entry` widget. `activeName` is the most-recently-clicked selected
@@ -679,6 +748,7 @@ function createState(node, fileWidget, entryWidget) {
     leftPane: null,
     listEl: null,
     footerEl: null,
+    modeHintEl: null,
     textarea: null,
     saveBtn: null,
     statusTextEl: null,
@@ -705,10 +775,14 @@ function buildUi(state) {
 
   const splitter = el('div', { className: 'llnb-splitter', attrs: { title: 'Drag to resize' } })
 
+  // Categories in the UI (FORMAT.md §7.2 amendment): a muted line saying
+  // which of the two contexts (entry body vs. category description) the
+  // textarea/Save below currently target — see updateModeHint().
+  state.modeHintEl = el('div', { className: 'llnb-mode-hint' })
   state.textarea = el('textarea', {
     className: 'llnb-textarea',
     attrs: {
-      placeholder: 'Select an entry on the left, or click ＋ New to create one.',
+      placeholder: 'Select an entry or category on the left, or click ＋ New to create one.',
       spellcheck: 'false'
     }
   })
@@ -722,7 +796,11 @@ function buildUi(state) {
     state.statusHintEl
   ])
   const bottomRow = el('div', { className: 'llnb-bottom-row' }, [state.saveBtn, statusRow])
-  const rightPane = el('div', { className: 'llnb-pane llnb-pane-right' }, [state.textarea, bottomRow])
+  const rightPane = el('div', { className: 'llnb-pane llnb-pane-right' }, [
+    state.modeHintEl,
+    state.textarea,
+    bottomRow
+  ])
 
   const panesRow = el('div', { className: 'llnb-panes' }, [state.leftPane, splitter, rightPane])
   const filePanel = buildFilePanel(state)
@@ -1176,6 +1254,9 @@ async function reloadNow(state) {
 
   state.file = file
   state.entries = Array.isArray(data.entries) ? data.entries : []
+  // FORMAT.md §5/§7.2: named categories in file order, incl. empty ones —
+  // see renderList()'s merge of this against `entries`.
+  state.categories = Array.isArray(data.categories) ? data.categories : []
   state.exists = data.exists !== false
   // FORMAT.md §7.2 file panel: the RESOLVED absolute path, distinct from
   // the (possibly relative) `file` WIDGET value above.
@@ -1198,11 +1279,23 @@ async function reloadNow(state) {
   const survivors = restoreSelectionFromWidget(state)
   state.selection = survivors
   state.activeName = survivors.length ? survivors[0] : null
+  // Category mode survives a reload the same way entry selection does
+  // (above): kept only if the category is still there, dropped silently
+  // otherwise (FORMAT.md §7.2 amendment) — independent of the entry
+  // selection restore, per the file header's "never touches `selection`"
+  // rule for category mode.
+  if (state.activeCategory != null && !state.categories.includes(state.activeCategory)) {
+    state.activeCategory = null
+  }
   renderList(state)
   updateDeleteButtonEnabled(state)
   updateSelectionHint(state)
+  updateModeHint(state)
 
-  if (state.activeName) {
+  if (state.activeCategory != null) {
+    const result = await loadCategoryDescription(state, state.activeCategory)
+    if (result === 'failed') resetEditorDom(state)
+  } else if (state.activeName) {
     const result = await loadEntryText(state, state.activeName)
     if (result === 'failed') resetEditorDom(state)
   } else {
@@ -1299,10 +1392,12 @@ function resetEditorDom(state) {
 function clearEditor(state) {
   state.selection = []
   state.activeName = null
+  state.activeCategory = null
   resetEditorDom(state)
   renderList(state)
   updateDeleteButtonEnabled(state)
   updateSelectionHint(state)
+  updateModeHint(state)
 }
 
 /**
@@ -1343,10 +1438,18 @@ function fetchEntry(state, name) {
   return api.getJson('/lora_library/notebook/entry', { file: state.file, name })
 }
 
-function populateEditor(state, data) {
-  state.textarea.value = data.text ?? ''
+function fetchCategory(state, name) {
+  return api.getJson('/lora_library/notebook/category', { file: state.file, name })
+}
+
+/** Shared by entry mode and category mode (FORMAT.md §7.2 amendment): both
+ * are "one editable text blob + an mtime for the §3.5 conflict check", so
+ * one function populates the shared textarea/dirty/baseMtime state for
+ * either — callers just pass the right pair. */
+function populateEditor(state, text, mtime) {
+  state.textarea.value = text ?? ''
   state.lastSavedText = state.textarea.value
-  state.baseMtime = typeof data.mtime === 'number' ? data.mtime : null
+  state.baseMtime = typeof mtime === 'number' ? mtime : null
   state.textarea.disabled = false
   setDirty(state, false)
   updateDeleteButtonEnabled(state)
@@ -1375,7 +1478,27 @@ async function loadEntryText(state, name) {
     return 'failed'
   }
   if (loadToken !== state.loadToken || selectToken !== state.selectToken) return 'stale'
-  populateEditor(state, data)
+  populateEditor(state, data.text, data.mtime)
+  return 'ok'
+}
+
+/** Category-mode sibling of loadEntryText() above — same token-guard/return
+ * contract, fetching the §5 category route instead (FORMAT.md §7.2
+ * amendment). */
+async function loadCategoryDescription(state, name) {
+  const loadToken = state.loadToken
+  const selectToken = ++state.selectToken
+  let data
+  try {
+    data = await fetchCategory(state, name)
+  } catch (error) {
+    if (loadToken !== state.loadToken || selectToken !== state.selectToken) return 'stale'
+    api.warn('failed to load category description', error)
+    setStatus(state, `Could not load category "${name}": ${error.message}`)
+    return 'failed'
+  }
+  if (loadToken !== state.loadToken || selectToken !== state.selectToken) return 'stale'
+  populateEditor(state, data.description, data.mtime)
   return 'ok'
 }
 
@@ -1385,6 +1508,16 @@ async function loadEntryText(state, name) {
  * clicking around a multi-selection must never clobber unsaved edits in the
  * entry that's already open). A failed load rolls back to the selection
  * that was in effect before this call.
+ *
+ * Also the ONE place that exits category mode on behalf of an entry click
+ * (FORMAT.md §7.2 amendment, file header's "Categories" paragraph): clearing
+ * `activeCategory` here — never touching `selection`/`activeName` to do it —
+ * is what makes "clicking any entry exits category mode" true regardless of
+ * which of selectSingle/toggleEntry/selectRange dispatched here. Because
+ * category mode is independent of `activeName`, exiting it can require a
+ * reload even when `active === previousActive` (the entry that was already
+ * "active" underneath category mode) — `wasInCategoryMode` covers exactly
+ * that one case.
  * @param {string[]} names
  * @param {string|null} active
  */
@@ -1393,10 +1526,14 @@ async function chooseSelection(state, names, active) {
   closeNewEntryRow(state)
   closeRenameRow(state)
 
+  const wasInCategoryMode = state.activeCategory != null
+  state.activeCategory = null
+
   const previousSelection = state.selection
   const previousActive = state.activeName
   setSelection(state, names, active)
-  if (active === previousActive) return
+  updateModeHint(state)
+  if (active === previousActive && !wasInCategoryMode) return
 
   if (active == null) {
     resetEditorDom(state)
@@ -1471,14 +1608,90 @@ function updateSelectionHint(state) {
 }
 
 // ---------------------------------------------------------------------------
+// Categories in the UI (FORMAT.md §7.2 amendment) — see the file header's
+// "Categories" paragraph for the overall design. This is the category-mode
+// counterpart of the "Selection model" section above: selectCategory() is
+// its chooseSelection() — the interactive "click a header" entry point
+// (confirmNewCategory() also sets `state.activeCategory` directly, for the
+// "just created it" case, same relationship confirmNewEntry() has to
+// setSelection()). Neither ever calls setSelection()/syncEntryWidget(),
+// which is what keeps category mode from touching the entry selection or
+// the `entry` widget.
+// ---------------------------------------------------------------------------
+
+/**
+ * Clicking a category header: enters "category mode" for *name*, loading its
+ * §3.1 description into the shared editor pane. Deliberately mirrors
+ * chooseSelection()'s shape (immediate UI update, then an async load, then a
+ * rollback-on-failure so a failed click reads as "didn't happen") but never
+ * touches `state.selection`/`state.activeName`/the `entry` widget — see the
+ * file header. Re-clicking the already-active category is a no-op (nothing
+ * changed, so nothing to reload).
+ */
+async function selectCategory(state, name) {
+  if (state.busy) return
+  cancelDeleteConfirm(state)
+  closeNewEntryRow(state)
+  closeRenameRow(state)
+  if (state.activeCategory === name) return
+
+  const previousCategory = state.activeCategory
+  state.activeCategory = name
+  renderList(state)
+  updateDeleteButtonEnabled(state)
+  updateModeHint(state)
+
+  const result = await loadCategoryDescription(state, name)
+  if (result === 'failed') {
+    // Roll back exactly like chooseSelection() does on a failed entry load —
+    // the editor's own content was never touched by the failed fetch, so
+    // restoring just the pointer is enough to undo the click.
+    state.activeCategory = previousCategory
+    renderList(state)
+    updateDeleteButtonEnabled(state)
+    updateModeHint(state)
+  }
+}
+
+/** FORMAT.md §7.2 amendment: "the editor is contextual … a visible mode
+ * hint says which" — updates `state.modeHintEl`, directly above the
+ * textarea. Category mode wins when both are technically set (selection
+ * survives entering category mode — see the file header), since it's what
+ * the editor is actually showing. */
+function updateModeHint(state) {
+  if (!state.modeHintEl) return
+  if (state.activeCategory != null) {
+    state.modeHintEl.textContent = `Editing category description: ${state.activeCategory}`
+  } else if (state.activeName) {
+    state.modeHintEl.textContent = `Editing entry: ${state.activeName}`
+  } else {
+    state.modeHintEl.textContent = ''
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Entry list rendering
 // ---------------------------------------------------------------------------
 
+/**
+ * Renders headers from `state.categories` (FORMAT.md §5's file-order list,
+ * NOT derived from `entries`) merged with `state.entries` by a single
+ * forward walk over both — both arrays are already in file order from the
+ * same parse, so this is a two-pointer merge, not a group-by-name: entries
+ * are appended while they keep matching the CURRENT category, and a header
+ * with nothing following it (an empty category) still renders. This is what
+ * lets an empty category show at all, and keeps a hand-edited file's
+ * repeated category name as two separate headers rather than one merged
+ * group (see list_categories()'s doc comment on the Python side).
+ */
 function renderList(state) {
   state.listEl.replaceChildren()
   state.dragRows = []
 
-  if (!state.entries.length) {
+  const categories = Array.isArray(state.categories) ? state.categories : []
+  const entries = state.entries
+
+  if (!entries.length && !categories.length) {
     state.listEl.append(
       el('div', {
         className: 'llnb-empty',
@@ -1488,22 +1701,36 @@ function renderList(state) {
     return
   }
 
-  let lastCategory
-  for (const entry of state.entries) {
-    const category = entry.category || ''
-    if (category !== lastCategory) {
-      lastCategory = category
-      if (category) {
-        const headerEl = el('div', { className: 'llnb-category', text: category })
-        state.listEl.append(headerEl)
-        state.dragRows.push({ el: headerEl, kind: 'header', category })
-      }
-    }
-
+  let entryIndex = 0
+  const appendEntry = (entry) => {
     const row =
       state.renamingName === entry.name ? buildRenameRow(state, entry) : buildEntryRow(state, entry)
     state.listEl.append(row)
-    state.dragRows.push({ el: row, kind: 'entry', name: entry.name, category })
+    state.dragRows.push({ el: row, kind: 'entry', name: entry.name, category: entry.category || '' })
+    entryIndex += 1
+  }
+
+  // The leading, un-headed "" region (FORMAT.md §3.1: entries before the
+  // first H1) never gets a category row of its own.
+  while (entryIndex < entries.length && (entries[entryIndex].category || '') === '') {
+    appendEntry(entries[entryIndex])
+  }
+
+  for (const category of categories) {
+    const headerEl = buildCategoryHeaderRow(state, category)
+    state.listEl.append(headerEl)
+    state.dragRows.push({ el: headerEl, kind: 'header', category })
+
+    while (entryIndex < entries.length && (entries[entryIndex].category || '') === category) {
+      appendEntry(entries[entryIndex])
+    }
+  }
+
+  // Defensive fallback: an entry reporting a category `categories` didn't
+  // list (shouldn't happen — both come from the same parse) still renders,
+  // just without a header of its own, rather than silently vanishing.
+  while (entryIndex < entries.length) {
+    appendEntry(entries[entryIndex])
   }
 }
 
@@ -1530,6 +1757,34 @@ function buildEntryRow(state, entry) {
     handleEntryClick(state, entry.name, { shiftKey: event.shiftKey, toggleKey: event.ctrlKey || event.metaKey })
   })
   return row
+}
+
+/**
+ * A category header row (FORMAT.md §7.2 amendment): plain click/Enter/Space
+ * enters category mode via selectCategory() — no drag-threshold
+ * disambiguation needed here (unlike buildEntryRow() above), since headers
+ * are never themselves a drag SOURCE, only a drop TARGET (computeDropTarget()
+ * reads this row's geometry back out of `state.dragRows`, unaffected by
+ * anything below).
+ */
+function buildCategoryHeaderRow(state, category) {
+  const classes = ['llnb-category']
+  if (state.activeCategory === category) classes.push('llnb-category-active')
+
+  const headerEl = el('div', {
+    className: classes.join(' '),
+    text: category,
+    attrs: { tabindex: '0', title: category }
+  })
+  headerEl.addEventListener('click', () => {
+    selectCategory(state, category).catch((error) => api.warn('select category failed', error))
+  })
+  headerEl.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    selectCategory(state, category).catch((error) => api.warn('select category failed', error))
+  })
+  return headerEl
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,7 +2219,7 @@ function renderFooter(state) {
   if (state.creatingNew) {
     const input = el('input', {
       className: 'llnb-input',
-      attrs: { type: 'text', placeholder: 'Entry name…' }
+      attrs: { type: 'text', placeholder: 'Entry name… (or #Category name)' }
     })
     const confirmBtn = el('button', {
       className: 'llnb-btn llnb-btn-small',
@@ -2022,7 +2277,23 @@ function closeNewEntryRow(state) {
   renderFooter(state)
 }
 
+/** A ＋ New input starting with `#` (after trim) creates a CATEGORY instead
+ * of an entry (FORMAT.md §7.2 amendment, owner ask 2026-07-19). */
+function isCategoryNameInput(rawName) {
+  return (rawName || '').trim().startsWith('#')
+}
+
+/** The stored category name: leading `#`s + whitespace stripped. */
+function categoryNameFromInput(rawName) {
+  return (rawName || '').trim().replace(/^#+\s*/, '').trim()
+}
+
 async function confirmNewEntry(state, rawName) {
+  if (isCategoryNameInput(rawName)) {
+    await confirmNewCategory(state, categoryNameFromInput(rawName))
+    return
+  }
+
   const name = (rawName || '').trim()
   if (!name) {
     setStatus(state, 'Enter a name for the new entry.')
@@ -2048,13 +2319,16 @@ async function confirmNewEntry(state, rawName) {
 
     // A new entry is created empty and already known (no need to re-fetch
     // it) — becomes the sole active selection, replacing whatever
-    // multi-selection existed before.
+    // multi-selection existed before. Also exits category mode (FORMAT.md
+    // §7.2 amendment): the newly created entry is what the editor shows now.
+    state.activeCategory = null
     setSelection(state, [name], name)
     state.textarea.value = ''
     state.lastSavedText = ''
     state.baseMtime = typeof data.mtime === 'number' ? data.mtime : null
     state.textarea.disabled = false
     setDirty(state, false)
+    updateModeHint(state)
     setStatus(state, `Created "${name}".`)
   } catch (error) {
     state.busy = false
@@ -2063,12 +2337,66 @@ async function confirmNewEntry(state, rawName) {
   }
 }
 
+/**
+ * ＋ New with a `#`-prefixed name (FORMAT.md §7.2 amendment): creates a
+ * category via the §5 category route instead of an entry. Mirrors
+ * confirmNewEntry() above closely, including skipping `base_mtime` (a
+ * create is additive, never destructive, so — like confirmNewEntry() — it
+ * doesn't defend against a concurrent edit elsewhere). On success the newly
+ * created (empty-description) category becomes the active one, entering
+ * category mode — the category-mode equivalent of confirmNewEntry()'s
+ * "becomes the sole active selection".
+ */
+async function confirmNewCategory(state, name) {
+  if (!name) {
+    setStatus(state, 'Enter a name for the new category (after the "#").')
+    return
+  }
+  if (state.categories.includes(name)) {
+    setStatus(state, `A category named "${name}" already exists.`)
+    return
+  }
+
+  state.busy = true
+  setStatus(state, 'Creating category…')
+  try {
+    const data = await api.postJson('/lora_library/notebook/category', {
+      file: state.file,
+      name,
+      description: ''
+    })
+    state.busy = false
+    state.entries = Array.isArray(data.entries) ? data.entries : state.entries
+    state.categories = Array.isArray(data.categories) ? data.categories : state.categories
+    state.exists = true
+    closeNewEntryRow(state)
+
+    // A new category is created with an empty description and already
+    // known (no need to re-fetch it) — enters category mode for it,
+    // untouched entry selection and all (see the file header).
+    state.activeCategory = name
+    renderList(state)
+    updateDeleteButtonEnabled(state)
+    populateEditor(state, '', data.mtime)
+    updateModeHint(state)
+    setStatus(state, `Created category "${name}".`)
+  } catch (error) {
+    state.busy = false
+    api.warn('failed to create notebook category', error)
+    setStatus(state, `Could not create category "${name}": ${error.message}`)
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Delete (two-step inline confirm)
 // ---------------------------------------------------------------------------
 
 function onDeleteClick(state) {
-  if (!state.selection.length || state.busy) return
+  // Delete is entry-only — disabled outright in category mode
+  // (updateDeleteButtonEnabled()); this is belt-and-suspenders against any
+  // path that could invoke the handler despite that (FORMAT.md §7.2
+  // amendment).
+  if (!state.selection.length || state.busy || state.activeCategory != null) return
   closeRenameRow(state)
 
   if (!state.deleteConfirmActive) {
@@ -2181,6 +2509,15 @@ async function performDeleteRun(state, names, startIndex, { force = false } = {}
 // ---------------------------------------------------------------------------
 
 async function performSave(state, { force = false } = {}) {
+  // The editor is contextual (FORMAT.md §7.2 amendment): category mode owns
+  // Save whenever it's active, entirely independent of `activeName` (which
+  // may still name an entry underneath — see the file header). This is the
+  // ONE branch point between the two; everything else about category-mode
+  // saving lives in performSaveCategory() below.
+  if (state.activeCategory != null) {
+    await performSaveCategory(state, { force })
+    return
+  }
   if (!state.activeName || state.busy) return
 
   const name = state.activeName
@@ -2222,6 +2559,58 @@ async function performSave(state, { force = false } = {}) {
   }
 }
 
+/**
+ * Category-mode sibling of performSave() above (FORMAT.md §7.2 amendment):
+ * saves `state.activeCategory`'s description through the §5 category
+ * route, sharing the same textarea/dirty/baseMtime/busy/conflict-UI
+ * machinery entry-saving already used — only the endpoint and the field
+ * name (`description` vs. `text`) differ. Always the "known name" branch of
+ * that route: `state.activeCategory` only ever holds a category that's
+ * either already in `state.categories` (clicked from the rendered list) or
+ * was just created by confirmNewCategory(), so it never hits the create
+ * branch here.
+ */
+async function performSaveCategory(state, { force = false } = {}) {
+  const name = state.activeCategory
+  if (!name || state.busy) return
+
+  const description = state.textarea.value
+
+  state.busy = true
+  updateSaveButtonEnabled(state)
+  setStatus(state, 'Saving…')
+  try {
+    const body = { file: state.file, name, description }
+    if (!force && typeof state.baseMtime === 'number') body.base_mtime = state.baseMtime
+
+    const data = await api.postJson('/lora_library/notebook/category', body)
+    state.busy = false
+    if (state.activeCategory !== name) {
+      updateSaveButtonEnabled(state)
+      return
+    }
+    state.lastSavedText = description
+    state.baseMtime = typeof data.mtime === 'number' ? data.mtime : state.baseMtime
+    state.entries = Array.isArray(data.entries) ? data.entries : state.entries
+    state.categories = Array.isArray(data.categories) ? data.categories : state.categories
+    setDirty(state, state.textarea.value !== state.lastSavedText)
+    renderList(state)
+    setStatus(state, 'Saved.')
+  } catch (error) {
+    state.busy = false
+    updateSaveButtonEnabled(state)
+    if (error?.status === 409) {
+      showConflict(state, 'File changed on disk', {
+        onReload: () => reloadNow(state),
+        onOverwrite: () => performSaveCategory(state, { force: true })
+      })
+    } else {
+      api.warn('failed to save category description', error)
+      setStatus(state, `Save failed: ${error.message}`)
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Dirty / button enablement
 // ---------------------------------------------------------------------------
@@ -2233,12 +2622,18 @@ function setDirty(state, value) {
 
 function updateSaveButtonEnabled(state) {
   if (!state.saveBtn) return
-  state.saveBtn.disabled = state.busy || !state.activeName || !state.dirty
+  // FORMAT.md §7.2 amendment: Save targets whichever of the two contextual
+  // modes is active (category mode or entry mode — see performSave()).
+  const hasTarget = state.activeCategory != null || Boolean(state.activeName)
+  state.saveBtn.disabled = state.busy || !hasTarget || !state.dirty
 }
 
 function updateDeleteButtonEnabled(state) {
   if (!state.deleteBtn) return
-  state.deleteBtn.disabled = state.busy || state.selection.length === 0
+  // Delete stays entry-only — disabled outright in category mode (FORMAT.md
+  // §7.2 amendment).
+  state.deleteBtn.disabled =
+    state.busy || state.selection.length === 0 || state.activeCategory != null
 }
 
 // ---------------------------------------------------------------------------

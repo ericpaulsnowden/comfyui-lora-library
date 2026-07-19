@@ -295,6 +295,204 @@ class TestRemoveEntry:
         assert ms.serialize(parsed) == ["# Cat A", "## E2", "B2"]
 
 
+# ---------------------------------------------------------------- categories
+
+
+class TestListCategories:
+    def test_empty_file_has_no_categories(self) -> None:
+        assert ms.list_categories(ms.parse("")) == []
+
+    def test_entries_with_no_h1_have_no_categories(self) -> None:
+        assert ms.list_categories(ms.parse("## E1\nB1\n")) == []
+
+    def test_lists_named_categories_in_file_order(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n")
+        assert ms.list_categories(parsed) == ["Cat A", "Cat B"]
+
+    def test_includes_a_category_with_zero_entries(self) -> None:
+        parsed = ms.parse("# Empty Cat\n# Cat A\n## E1\nB1\n")
+        assert ms.list_categories(parsed) == ["Empty Cat", "Cat A"]
+        assert ms.list_entries(parsed) == [{"name": "E1", "category": "Cat A"}]
+
+    def test_a_trailing_empty_category_is_included(self) -> None:
+        parsed = ms.parse("## E1\nB1\n# Trailing Empty\n")
+        assert ms.list_categories(parsed) == ["Trailing Empty"]
+
+    def test_duplicate_category_name_is_reported_once_per_occurrence(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n# Cat B\n## E2\nB2\n# Cat A\n## E3\nB3\n")
+        assert ms.list_categories(parsed) == ["Cat A", "Cat B", "Cat A"]
+
+
+class TestGetCategoryDescription:
+    def test_missing_category_is_none(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        assert ms.get_category_description(parsed, "Nope") is None
+
+    def test_blank_name_is_none(self) -> None:
+        parsed = ms.parse("## E1\nB1\n")
+        assert ms.get_category_description(parsed, "") is None
+        assert ms.get_category_description(parsed, "   ") is None
+
+    def test_category_with_no_description_is_empty_string(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        assert ms.get_category_description(parsed, "Cat A") == ""
+
+    def test_category_with_a_description_returns_it_trimmed(self) -> None:
+        parsed = ms.parse("# Cat A\n\nSome prose about this category.\n\n## E1\nB1\n")
+        assert ms.get_category_description(parsed, "Cat A") == "Some prose about this category."
+
+    def test_multiline_description_preserves_interior_blank_lines(self) -> None:
+        parsed = ms.parse("# Cat A\nLine1\n\nLine2\n## E1\nB1\n")
+        assert ms.get_category_description(parsed, "Cat A") == "Line1\n\nLine2"
+
+    def test_empty_category_with_description_and_no_entries(self) -> None:
+        parsed = ms.parse("# Cat A\nJust description, no entries at all.\n")
+        assert ms.get_category_description(parsed, "Cat A") == (
+            "Just description, no entries at all."
+        )
+        assert ms.list_entries(parsed) == []
+
+    def test_repeated_name_targets_the_last_block(self) -> None:
+        parsed = ms.parse("# Cat A\nFirst.\n## E1\nB1\n# Cat A\nSecond.\n## E2\nB2\n")
+        assert ms.get_category_description(parsed, "Cat A") == "Second."
+
+
+class TestCreateCategory:
+    def test_create_into_empty_file_with_no_description(self) -> None:
+        parsed = ms.parse("")
+        result = ms.create_category(parsed, "Styles")
+        assert result == {"name": "Styles", "description": ""}
+        assert ms.list_categories(parsed) == ["Styles"]
+        assert ms.get_category_description(parsed, "Styles") == ""
+        assert ms.serialize(parsed) == ["# Styles"]
+
+    def test_create_with_a_description(self) -> None:
+        parsed = ms.parse("")
+        result = ms.create_category(parsed, "Styles", "Prose about styles.")
+        assert result == {"name": "Styles", "description": "Prose about styles."}
+        assert ms.get_category_description(parsed, "Styles") == "Prose about styles."
+        assert ms.serialize(parsed) == ["# Styles", "Prose about styles."]
+
+    def test_create_appends_at_eof_after_existing_content_byte_safely(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        ms.create_category(parsed, "Cat B", "New category.")
+        assert ms.serialize(parsed) == ["# Cat A", "## E1", "B1", "# Cat B", "New category."]
+        # Existing entry is untouched.
+        assert ms.get_entry(parsed, "E1")["text"] == "B1"
+
+    def test_create_strips_the_name(self) -> None:
+        parsed = ms.parse("")
+        ms.create_category(parsed, "  Styles  ")
+        assert ms.list_categories(parsed) == ["Styles"]
+
+    def test_create_duplicate_name_raises_and_leaves_notebook_unmodified(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        with pytest.raises(ms.NameCollisionError):
+            ms.create_category(parsed, "Cat A")
+        assert ms.list_categories(parsed) == ["Cat A"]
+        assert ms.serialize(parsed) == ["# Cat A", "## E1", "B1"]
+
+    def test_create_blank_name_raises(self) -> None:
+        parsed = ms.parse("")
+        with pytest.raises(ms.InvalidEntryNameError):
+            ms.create_category(parsed, "   ")
+
+    def test_create_name_with_newline_raises(self) -> None:
+        parsed = ms.parse("")
+        with pytest.raises(ms.InvalidEntryNameError):
+            ms.create_category(parsed, "Cat\nA")
+
+    def test_create_rejects_description_with_heading_line(self) -> None:
+        parsed = ms.parse("")
+        with pytest.raises(ms.InvalidEntryTextError):
+            ms.create_category(parsed, "Styles", "line one\n## oops")
+        assert ms.list_categories(parsed) == []
+
+
+class TestSetCategoryDescription:
+    def test_replace_description_on_a_bare_heading(self) -> None:
+        parsed = ms.parse("# Cat A\n## E1\nB1\n")
+        result = ms.set_category_description(parsed, "Cat A", "New prose.")
+        assert result == {"name": "Cat A", "description": "New prose."}
+        assert ms.get_category_description(parsed, "Cat A") == "New prose."
+        assert ms.list_entries(parsed) == [{"name": "E1", "category": "Cat A"}]
+
+    def test_replace_an_existing_description(self) -> None:
+        parsed = ms.parse("# Cat A\nOld prose.\n## E1\nB1\n")
+        ms.set_category_description(parsed, "Cat A", "Updated prose.")
+        assert ms.get_category_description(parsed, "Cat A") == "Updated prose."
+
+    def test_clear_a_description_back_to_empty(self) -> None:
+        parsed = ms.parse("# Cat A\nOld prose.\n## E1\nB1\n")
+        ms.set_category_description(parsed, "Cat A", "")
+        assert ms.get_category_description(parsed, "Cat A") == ""
+
+    def test_replace_preserves_surrounding_blocks_byte_identically(self) -> None:
+        text = "Preamble.\n\n## Head1\nH1body\n# Cat A\nOld.\n## E1\nB1\n# Cat B\n## E2\nB2\n"
+        parsed = ms.parse(text)
+        ms.set_category_description(parsed, "Cat A", "New.")
+        assert ms.serialize(parsed) == [
+            "Preamble.",
+            "",
+            "## Head1",
+            "H1body",
+            "# Cat A",
+            "New.",
+            "## E1",
+            "B1",
+            "# Cat B",
+            "## E2",
+            "B2",
+        ]
+
+    def test_repeated_name_replaces_the_last_block_only(self) -> None:
+        parsed = ms.parse("# Cat A\nFirst.\n## E1\nB1\n# Cat A\nSecond.\n## E2\nB2\n")
+        ms.set_category_description(parsed, "Cat A", "Replaced.")
+        assert ms.serialize(parsed) == [
+            "# Cat A",
+            "First.",
+            "## E1",
+            "B1",
+            "# Cat A",
+            "Replaced.",
+            "## E2",
+            "B2",
+        ]
+
+    def test_missing_category_raises_category_not_found(self) -> None:
+        parsed = ms.parse("## E1\nB1\n")
+        with pytest.raises(ms.CategoryNotFoundError):
+            ms.set_category_description(parsed, "Nope", "text")
+
+    def test_blank_name_raises_category_not_found(self) -> None:
+        parsed = ms.parse("## E1\nB1\n")
+        with pytest.raises(ms.CategoryNotFoundError):
+            ms.set_category_description(parsed, "", "text")
+
+    def test_rejects_description_with_heading_line_and_leaves_it_untouched(self) -> None:
+        parsed = ms.parse("# Cat A\nOriginal.\n## E1\nB1\n")
+        with pytest.raises(ms.InvalidEntryTextError):
+            ms.set_category_description(parsed, "Cat A", "# oops")
+        assert ms.get_category_description(parsed, "Cat A") == "Original."
+
+    def test_set_description_on_crlf_file_round_trips_and_stays_crlf(self, tmp_path: Path) -> None:
+        path = tmp_path / "loras.md"
+        raw = "# Cat A\r\nOld.\r\n## E1\r\nB1\r\n# Cat B\r\n## E2\r\nB2\r\n"
+        path.write_bytes(raw.encode("utf-8"))
+
+        parsed, _mtime, line_ending = ms.load_notebook(path)
+        assert line_ending == "\r\n"
+        ms.set_category_description(parsed, "Cat A", "New.")
+        ms.save_notebook(path, parsed, line_ending)
+
+        with open(path, encoding="utf-8", newline="") as fh:
+            rewritten = fh.read()
+        assert rewritten.count("\n") == rewritten.count("\r\n")  # every \n is part of \r\n
+        assert "# Cat A\r\nNew.\r\n## E1\r\nB1\r\n" in rewritten
+        # The untouched sibling category + entry are still present byte-for-byte.
+        assert "# Cat B\r\n## E2\r\nB2\r\n" in rewritten
+
+
 class TestMoveEntry:
     def test_move_before_an_earlier_sibling_within_a_category(self) -> None:
         parsed = ms.parse("# Cat A\n## E1\nB1\n## E2\nB2\n## E3\nB3\n")

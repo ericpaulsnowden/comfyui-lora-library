@@ -25,21 +25,35 @@ class MarkdownStoreError(Exception):
 
 
 class InvalidEntryNameError(MarkdownStoreError):
-    """Raised when a create is attempted with a blank/whitespace-only name."""
+    """Raised when a create is attempted with a blank/whitespace-only name —
+    also reused by :func:`create_category` for the same problem with a
+    category name (FORMAT.md §3.4), plus one a category name has that an
+    entry name doesn't: no embedded newlines (a category name is exactly one
+    heading line, like an entry name, per FORMAT.md §3.2)."""
 
 
 class InvalidEntryTextError(MarkdownStoreError):
     """Entry text contains a line that would be read back as a heading
-    (FORMAT.md §3.4's "cannot be represented" rule)."""
+    (FORMAT.md §3.4's "cannot be represented" rule) — also reused by
+    :func:`create_category`/:func:`set_category_description` for the same
+    problem in a category's §3.1 description text."""
 
 
 class NameCollisionError(MarkdownStoreError):
-    """``rename_to`` names a different entry that already exists."""
+    """``rename_to`` names a different entry that already exists — also
+    reused by :func:`create_category` when *name* already names a category
+    (FORMAT.md §3.4's "must be unique among categories")."""
 
 
 class EntryNotFoundError(MarkdownStoreError):
     """``move_entry``'s *name* or *before* names no existing addressable
     entry (FORMAT.md §3.2) — the route layer maps this to 404."""
+
+
+class CategoryNotFoundError(MarkdownStoreError):
+    """``set_category_description``'s *name* addresses no existing category
+    (FORMAT.md §3.2's sibling of :class:`EntryNotFoundError` for categories —
+    the route layer maps this to 404 the same way)."""
 
 
 class ConflictError(MarkdownStoreError):
@@ -193,16 +207,23 @@ def serialize(parsed: ParsedNotebook) -> list[str]:
     return lines
 
 
+def _trimmed_text(lines: list[str]) -> str:
+    """*lines* minus leading/trailing blank lines, joined with ``\\n`` — the
+    FORMAT.md §3.3 entry-text normalization, reused as-is for §3.1 category
+    descriptions (:func:`get_category_description` et al.): both are "prose
+    between two headings" under the same grammar."""
+    start, end = 0, len(lines)
+    while start < end and lines[start].strip() == "":
+        start += 1
+    while end > start and lines[end - 1].strip() == "":
+        end -= 1
+    return "\n".join(lines[start:end])
+
+
 def entry_text(entry: Entry) -> str:
     """*entry*'s body minus leading/trailing blank lines, joined with ``\\n``
     (FORMAT.md §3.3 — this exact string is the node's STRING output)."""
-    body = entry.body
-    start, end = 0, len(body)
-    while start < end and body[start].strip() == "":
-        start += 1
-    while end > start and body[end - 1].strip() == "":
-        end -= 1
-    return "\n".join(body[start:end])
+    return _trimmed_text(entry.body)
 
 
 def find_unrepresentable_heading_line(text: str) -> int | None:
@@ -251,6 +272,41 @@ def get_entry(parsed: ParsedNotebook, name: str) -> dict | None:
         return None
     block, entry = found
     return {"name": entry.name, "category": block.name, "text": entry_text(entry)}
+
+
+def list_categories(parsed: ParsedNotebook) -> list[str]:
+    """Every named (``# ...``) category block's name, in file order
+    (FORMAT.md §5's ``categories`` field on ``GET /lora_library/notebook`` —
+    the one thing ``list_entries`` alone can't reveal: a category with zero
+    entries). The always-present implicit leading block (category ``""``,
+    FORMAT.md §3.1's "entries before any H1") is deliberately excluded —
+    it isn't a "category" in the create/describe sense. A hand-edited file's
+    repeated category name is reported once per occurrence, unmerged (there
+    is no "addressable" concept here to dedupe against, unlike
+    :func:`list_entries`) — :func:`create_category`/
+    :func:`set_category_description`/:func:`get_category_description` all
+    document how a repeat is targeted.
+    """
+    return [block.name for block in parsed.blocks if block.heading_line is not None]
+
+
+def get_category_description(parsed: ParsedNotebook, name: str) -> str | None:
+    """FORMAT.md §3.1's description text for the category *name* — the LAST
+    block with that name wins when a hand-edited file repeats it (mirrors
+    ``move_entry``'s documented "repeated category name -> last one"
+    convention). ``None`` means no such category exists — including the
+    blank name ``""``, which can only ever address the implicit leading
+    block (see :func:`list_categories`), never a describable category.
+    ``""`` means the category exists with no description (FORMAT.md §3.1:
+    "empty when absent").
+    """
+    name = (name or "").strip()
+    if not name:
+        return None
+    block = _find_last_block(parsed, name)
+    if block is None:
+        return None
+    return _trimmed_text(block.preamble)
 
 
 # ------------------------------------------------------------------ mutation
@@ -330,6 +386,88 @@ def remove_entry(parsed: ParsedNotebook, name: str) -> bool:
     block, entry = found
     block.entries.remove(entry)
     return True
+
+
+def create_category(parsed: ParsedNotebook, name: str, description: str = "") -> dict:
+    """Append a brand-new ``# name`` heading at end-of-file, with
+    *description* as its FORMAT.md §3.1 description block — the CREATE-ONLY
+    primitive behind §3.4's "Create category" (``POST
+    /lora_library/notebook/category``, FORMAT.md §5, is the create-OR-
+    describe composition of this and :func:`set_category_description`; the
+    route picks one by checking whether *name* is already in
+    :func:`list_categories`). Mutates *parsed*; returns
+    ``{"name","description"}``.
+
+    *name* must be unique among existing categories, non-empty after
+    trimming, and free of embedded newlines (a category name is exactly one
+    heading line, like an entry name — FORMAT.md §3.2). A non-empty
+    *description* is stored like an entry's body (:func:`upsert_entry`'s
+    ``text.split("\\n")``, no pre-trimming); an EMPTY one stores ZERO
+    preamble lines (unlike an entry body's degenerate one-blank-line case)
+    so "no description" never leaves a stray blank line dangling after the
+    heading — FORMAT.md §3.1's "empty when absent", taken literally.
+
+    Raises :class:`InvalidEntryNameError` for a blank or newline-containing
+    *name*, :class:`NameCollisionError` if *name* already names a category,
+    or :class:`InvalidEntryTextError` if *description* contains an
+    unrepresentable heading-looking line (FORMAT.md §3.4).
+    """
+    name = (name or "").strip()
+    if not name:
+        raise InvalidEntryNameError("category name must not be empty — FORMAT.md §3.2")
+    if "\n" in name:
+        raise InvalidEntryNameError("category name must not contain newlines — FORMAT.md §3.2")
+    if any(block.heading_line is not None and block.name == name for block in parsed.blocks):
+        raise NameCollisionError(f"a category named {name!r} already exists — FORMAT.md §3.4")
+
+    description = description or ""
+    bad_line = find_unrepresentable_heading_line(description)
+    if bad_line is not None:
+        raise InvalidEntryTextError(
+            f"line {bad_line} of the category description starts with '#'/'##', which would "
+            "be read back as a heading; use '###', indentation, or a code fence instead — "
+            "FORMAT.md §3.4"
+        )
+
+    block = CategoryBlock(
+        name=name, heading_line=f"# {name}", preamble=description.split("\n") if description else []
+    )
+    parsed.blocks.append(block)
+    return {"name": name, "description": _trimmed_text(block.preamble)}
+
+
+def set_category_description(parsed: ParsedNotebook, name: str, description: str) -> dict:
+    """Replace the FORMAT.md §3.1 description block under the category
+    *name* — the UPDATE-ONLY primitive behind §3.4's "Set category
+    description" (see :func:`create_category`'s docstring for how the §5
+    route composes the two). A repeated category name targets the LAST
+    block with that name, same convention as :func:`create_category`'s
+    uniqueness check and ``move_entry``'s category placement. Mutates
+    *parsed*; returns ``{"name","description"}``.
+
+    Raises :class:`InvalidEntryTextError` if *description* contains an
+    unrepresentable heading-looking line (FORMAT.md §3.4, checked first —
+    same order :func:`upsert_entry` uses for entry text vs. name lookup), or
+    :class:`CategoryNotFoundError` if no category named *name* exists.
+    """
+    description = description or ""
+    bad_line = find_unrepresentable_heading_line(description)
+    if bad_line is not None:
+        raise InvalidEntryTextError(
+            f"line {bad_line} of the category description starts with '#'/'##', which would "
+            "be read back as a heading; use '###', indentation, or a code fence instead — "
+            "FORMAT.md §3.4"
+        )
+
+    name = (name or "").strip()
+    block = _find_last_block(parsed, name) if name else None
+    if block is None:
+        raise CategoryNotFoundError(f"no such category {name!r} — FORMAT.md §3.2")
+
+    # Same "empty stores zero lines" rule as create_category — see its
+    # docstring.
+    block.preamble = description.split("\n") if description else []
+    return {"name": name, "description": _trimmed_text(block.preamble)}
 
 
 def move_entry(
