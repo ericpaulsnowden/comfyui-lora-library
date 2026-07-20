@@ -253,3 +253,118 @@ def test_fs_root_parent_is_null_for_a_unc_share_root_even_on_windows() -> None:
 
 def test_fs_root_parent_is_null_on_posix() -> None:
     assert lora_routes._fs_root_parent(Path("/"), windows=False) is None
+
+
+# ------------------------------------------------- config: library_dir diagnosis
+#
+# 2026-07-19 fix: a configured library_dir the server machine can't resolve
+# (an unmounted NAS share, or a path shaped for the wrong OS) used to be
+# invisible until a node errored at run time. `_diagnose_library_dir` takes
+# `is_windows` as a parameter (not a bare `os.name` read) specifically so
+# both OS-mismatch directions are exercisable from this (macOS) test
+# machine.
+
+
+def test_diagnose_library_dir_flags_a_posix_path_on_a_windows_server() -> None:
+    note = lora_routes._diagnose_library_dir("/Volumes/NAS/comfy-library", is_windows=True)
+    assert "macOS/Linux" in note
+    assert "Windows" in note
+    assert "set the folder from the machine ComfyUI runs on" in note
+
+
+def test_diagnose_library_dir_flags_a_windows_path_on_a_posix_server() -> None:
+    note = lora_routes._diagnose_library_dir(r"C:\comfy-library", is_windows=False)
+    assert "Windows" in note
+    assert "macOS/Linux" in note
+    assert "set the folder from the machine ComfyUI runs on" in note
+
+
+def test_diagnose_library_dir_flags_a_unc_path_on_a_posix_server() -> None:
+    note = lora_routes._diagnose_library_dir(r"\\nas\share\comfy-library", is_windows=False)
+    assert "Windows" in note
+
+
+def test_diagnose_library_dir_flags_a_mnt_path_on_a_windows_server() -> None:
+    note = lora_routes._diagnose_library_dir("/mnt/nas/comfy-library", is_windows=True)
+    assert "macOS/Linux" in note
+
+
+def test_diagnose_library_dir_is_generic_when_the_shape_matches_but_its_unreachable() -> None:
+    # A perfectly ordinary POSIX path, but on a POSIX server — no OS-shape
+    # mismatch, so this falls through to the generic "can't reach it" note
+    # (the owner's actual 2026-07-19 case: an unmounted NAS mount point).
+    note = lora_routes._diagnose_library_dir("/Users/eric/nas-library", is_windows=False)
+    assert "macOS/Linux" not in note
+    assert "Windows" not in note
+    assert "can't reach this folder" in note
+    assert "NAS mounted" in note
+
+
+def test_check_library_dir_is_fine_when_the_configured_dir_exists(
+    context: LibraryContext, tmp_path: Path
+) -> None:
+    real_dir = tmp_path / "real-library"
+    real_dir.mkdir()
+    context.save_config({"library_dir": str(real_dir)})
+    exists, note = lora_routes._check_library_dir(context)
+    assert exists is True
+    assert note == ""
+
+
+def test_check_library_dir_is_fine_when_unconfigured(context: LibraryContext) -> None:
+    # Nothing configured ⇒ the pack's own default dir — always trivially
+    # fine, nothing to diagnose (FORMAT.md §5).
+    exists, note = lora_routes._check_library_dir(context)
+    assert exists is True
+    assert note == ""
+
+
+def test_check_library_dir_flags_a_bogus_unreachable_path(
+    context: LibraryContext, tmp_path: Path
+) -> None:
+    bogus = tmp_path / "does" / "not" / "exist"
+    context.save_config({"library_dir": str(bogus)})
+    exists, note = lora_routes._check_library_dir(context)
+    assert exists is False
+    assert note != ""
+    assert not bogus.exists()
+
+
+async def test_config_reports_library_dir_exists_true_for_a_real_directory(
+    client, context: LibraryContext, tmp_path: Path
+) -> None:
+    real_dir = tmp_path / "real-library"
+    real_dir.mkdir()
+    context.save_config({"library_dir": str(real_dir)})
+    data = await (await client.get("/lora_library/config")).json()
+    assert data["library_dir_exists"] is True
+    assert data["library_dir_note"] == ""
+
+
+async def test_config_reports_library_dir_exists_false_with_a_note_for_a_bogus_path(
+    client, context: LibraryContext, tmp_path: Path
+) -> None:
+    bogus = tmp_path / "does" / "not" / "exist"
+    context.save_config({"library_dir": str(bogus)})
+    data = await (await client.get("/lora_library/config")).json()
+    assert data["library_dir_exists"] is False
+    assert data["library_dir_note"] != ""
+    assert data["library_dir"] == str(bogus)
+
+
+async def test_config_check_does_not_create_a_bogus_configured_directory(
+    client, context: LibraryContext, tmp_path: Path
+) -> None:
+    bogus = tmp_path / "does" / "not" / "exist"
+    context.save_config({"library_dir": str(bogus)})
+    response = await client.get("/lora_library/config")
+    assert response.status == 200
+    assert not bogus.exists()
+    assert not bogus.parent.exists()
+
+
+async def test_config_unconfigured_library_dir_reports_exists_true(client) -> None:
+    data = await (await client.get("/lora_library/config")).json()
+    assert data["configured"] is False
+    assert data["library_dir_exists"] is True
+    assert data["library_dir_note"] == ""

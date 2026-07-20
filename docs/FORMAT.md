@@ -217,7 +217,7 @@ message>"}` with a 4xx status. `mtime` values are float POSIX seconds.
 | Route | → |
 |---|---|
 | `GET /lora_library/version` | `{"version": "X.Y.Z"}` |
-| `GET /lora_library/config` | `{"library_dir", "default_library_dir", "configured": bool, "is_local": bool}` — `is_local` = §2 loopback verdict for THIS request, so a browser can tell whether it sits on the server machine (drives §7.2's remote read-only gating) |
+| `GET /lora_library/config` | `{"library_dir", "default_library_dir", "configured": bool, "is_local": bool, "library_dir_exists": bool, "library_dir_note": str}` — `is_local` = §2 loopback verdict for THIS request (drives §7.2's remote read-only gating). `library_dir_exists` = whether the SERVER can see the configured folder right now — the owner's 2026-07-19 NAS confusion was a library path the server machine couldn't resolve, invisible until a node errored. `library_dir_note` = "" when fine, else a one-line human diagnosis chosen server-side: unreachable path, or a path whose SHAPE doesn't match the server's OS (e.g. `/Volumes/…` configured while the server is Windows, or `C:\`/UNC while it's POSIX — a strong sign it was set from the wrong machine's perspective) |
 | `GET /lora_library/fs/list?dir=` | **loopback-only** (403 remote): server-filesystem browser for the §7.2 picker. Empty/missing `dir` ⇒ `library_dir`. `dir="ROOTS"` (sentinel) ⇒ the top level: on Windows every existing drive (`C:\`, `D:\`, `U:\`, …) as `dirs` + `parent: null`; on POSIX the filesystem root `/`. → `{"dir": <abs or "ROOTS">, "parent": <abs, "ROOTS", or null>, "dirs": [names], "files": [names]}` — `files` limited to `.md`; entries sorted case-insensitively; a directory at a drive root reports `parent: "ROOTS"` so the picker can climb to the drive list (the 2026-07-19 "stuck at top of C:\, can't reach another drive/NAS" fix); a UNC path (`\\server\share\…`) passed as `dir` lists normally; unreadable/nonexistent dir ⇒ 400 |
 | `POST /lora_library/notebook/open_folder` `{"file"}` | **loopback-only** (403 remote): reveals the resolved notebook file's folder in the OS file manager ON THE SERVER MACHINE (Explorer/Finder). Missing folder ⇒ 404; `{"ok": true}` |
 | `POST /lora_library/config` `{"library_dir"}` | validates (absolute, creatable, writable), persists; `{"ok", "library_dir"}` |
@@ -300,6 +300,16 @@ execution — **the file is the truth; the UI is a view.**
   triggers a re-read. So one controller can keep any number of Apply LoRA
   Set nodes on the same state at once — the owner's "multiple Apply LoRA
   Set nodes all controlled by one controller, kept in sync" use case.
+- **`mirrors loader` tag (owner ask 2026-07-19c: "set different Apply LoRA
+  Set nodes to different Power Lora Loaders as targets").** A FRONTEND-ONLY
+  combo widget (added by `sets.js` on nodeCreated; the server never sees
+  it) listing the graph's PLL nodes plus `"(any)"` (default). It's a
+  GROUPING TAG for §6.3's selective Push — it does not change what the
+  node executes (states still come from the file). Serialized with the
+  node (appended after the server widgets — appended-last consistently so
+  positional restore stays aligned); stores the tagged PLL's node id,
+  displayed by title; tolerates the id disappearing (falls back to
+  "(any)").
 
 ### §6.3 `Lora Loader State Controller` (frontend-only virtual node)
 
@@ -313,14 +323,34 @@ with current rows), `Delete State` (two-click confirm), and `Push State`
 (§8), and states ARE §4 set files — same storage, same routes, same files
 the Apply LoRA Set node reads; only the controller's vocabulary changes.
 
-**Push State** (owner ask 2026-07-19): sets EVERY `LoraLibraryApplySet`
-node in the graph to the controller's currently-selected state (writing
-each one's `set` widget through its real setter + firing its callback), so
-all of them switch together. This is the sync mechanism for the "one
-controller drives several Apply LoRA Set nodes" workflow. It also
-double-serves as an explicit re-apply, which matters because re-selecting
-the already-selected value in a combo does not fire its callback (see the
-strength-persistence fix below).
+**Push State** (owner ask 2026-07-19; SELECTIVE since 2026-07-19c): sets
+`LoraLibraryApplySet` nodes to the controller's currently-selected state
+(writing each one's `set` widget + firing its callback). WHICH Apply nodes
+it touches follows the controller's `target` and each Apply node's §6.2
+`mirrors loader` tag: controller target = a specific PLL ⇒ only Apply
+nodes tagged to that PLL (plus, when none are tagged to it, a toast says
+so instead of silently doing nothing); controller target = `All…` ⇒ every
+Apply node regardless of tag; an Apply tagged `"(any)"` is included in
+every push. The toast reports the count. This is the sync mechanism for
+"different Apply nodes represent different loaders, one controller keeps
+each group in step." It also double-serves as an explicit re-apply.
+
+**State selection must not depend on widget-internals (2026-07-19c
+hardening).** v0.12.0's apply-on-select shadowed the combo's `setValue` —
+correct on the dev rig's frontend but STILL reported broken on the owner's
+ComfyUI 0.28.1 ("strengths are still not saved or updated"), i.e. the
+shadow point is not stable across frontend builds. The durable design: the
+controller OWNS its state dropdown end to end — clicking the state widget
+opens a menu the controller builds itself (`LiteGraph.ContextMenu` or
+equivalent), and every pick runs capture-independent apply logic directly.
+No reliance on `BaseWidget.setValue`/`callback` semantics, so no
+same-value no-op and no version skew. Additionally: `Save State` performs
+a READ-BACK after saving (GET the state and toast the saved rows —
+"Saved 'X': detailer 0.8, grain 1.2") so file truth is visible; and while
+`Show status` is on, the status line names the capture-source loader id +
+row count on every capture/save. Diagnose the 0.28.1 failure by upgrading
+the dev rig's `comfyui-frontend-package` to the version ComfyUI 0.28.1
+pins before concluding anything.
 
 **Strength persistence — 2026-07-19 bug fixes (owner: "Save State doesn't
 work; the loader isn't remembering strengths; re-picking reverts").** Two
@@ -468,12 +498,25 @@ queue. It drives a **genuine, untouched `Power Lora Loader (rgthree)`**:
     its header). §3.5 conflicts surface exactly like Save conflicts.
 - **§7.3 Settings**: an "EPSNodes" settings section shows backend +
   frontend versions (mismatch ⇒ "pulled but not restarted" hint, cpsb
-  pattern) and the `library_dir` (editable → `POST /config`). Remote
-  browsers (§2: a Mac viewing the PC's ComfyUI) DEFER to the host: the
-  field displays the server's value, `POST /config` is only attempted when
-  the user actually edits it to a DIFFERENT value, and a 403 downgrades to
-  a calm "the library folder is controlled by the server machine" notice —
-  never an error toast on page load (owner report 2026-07-18).
+  pattern) and the `library_dir`. Local browser: editable → `POST /config`.
+  **Remote browser (`is_local:false`): the field is genuinely READ-ONLY**
+  (owner report 2026-07-19: the prior revert-on-edit fired an error toast
+  on EVERY keystroke). Implement read-only robustly for a ComfyUI text
+  setting — if the settings API exposes no disabled state, do NOT let
+  `onChange` POST or toast at all when remote; silently restore the
+  server value with zero user-facing noise. A single calm caption ("The
+  library folder is set on the machine ComfyUI runs on.") shown once, not
+  per keystroke.
+  - **Server-can't-see-the-folder surfacing (owner report 2026-07-19, the
+    "NAS .md not found" case).** The settings section reads §5 config's
+    `library_dir_exists`/`library_dir_note`: when the SERVER can't resolve
+    the configured folder, show a persistent WARNING line with the note
+    (e.g. "The server machine can't reach this folder — it looks like a
+    macOS path but ComfyUI is running on Windows" or "…can't reach this
+    folder right now; is the NAS mounted on the server?"). This turns the
+    silent "file not found" at node-run time into an at-a-glance Settings
+    warning. The notebook node's own file-not-found error ALSO names the
+    RESOLVED ABSOLUTE path it tried (§6.1) so the mismatch is obvious.
 - **§7.4 Combo freshness**: after any set CRUD the frontend refreshes every
   `LoraLibraryApplySet` node's `set` combo options in place (no page
   reload). Server-side `VALIDATE_INPUTS` already accepts values the combo

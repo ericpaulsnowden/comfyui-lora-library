@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,105 @@ class TestReadEntry:
             ["edited on the other machine"],
             ["E"],
         )
+
+
+# ------------------------------------------- missing-file error: FORMAT.md §6.1
+#
+# 2026-07-19 owner report: pointing the library folder at a NAS the server
+# machine can't reach made the .md "not found" at node-run time, invisible
+# until then — the node error must name the RESOLVED ABSOLUTE path it tried
+# (so a NAS mismatch is obvious) and, when the library folder itself isn't
+# reachable, add a hint pointing at EPSNodes settings instead of reading
+# like a plain typo.
+
+
+class TestMissingFileErrorNamesResolvedPath:
+    def test_error_names_the_resolved_absolute_path(self, library_dir: Path) -> None:
+        node = nodes_notebook.LoraLibraryNotebook()
+        with pytest.raises(ValueError) as exc_info:
+            node.read_entry(file="loras.md", entry="Anything")
+        resolved = library_dir / "loras.md"
+        assert str(resolved) in str(exc_info.value)
+        assert resolved.is_absolute()
+
+    def test_no_unreachable_hint_when_the_library_dir_itself_is_fine(
+        self, library_dir: Path
+    ) -> None:
+        # The library folder exists (the `library_dir` fixture created it);
+        # only the file itself is missing — that's an ordinary typo/rename,
+        # not a NAS problem, so no hint.
+        node = nodes_notebook.LoraLibraryNotebook()
+        with pytest.raises(ValueError) as exc_info:
+            node.read_entry(file="loras.md", entry="Anything")
+        assert "isn't reachable from the server machine" not in str(exc_info.value)
+
+    def test_unreachable_hint_when_the_configured_library_dir_cannot_be_created(
+        self, context: LibraryContext, tmp_path: Path
+    ) -> None:
+        # A real (not monkeypatched) unreachable-folder scenario: a
+        # read-only parent means `library_dir()`'s `mkdir(parents=True)`
+        # genuinely cannot create the configured folder — unlike a plain
+        # nonexistent path under a writable tmp_path, which `mkdir`
+        # would just create. Root bypasses permission bits entirely, so
+        # this needs a non-root test runner (the usual case).
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            pytest.skip("cannot simulate a permission-denied directory as root")
+        readonly_parent = tmp_path / "readonly"
+        readonly_parent.mkdir()
+        readonly_parent.chmod(0o555)
+        configured = readonly_parent / "library"
+        context.save_config({"library_dir": str(configured)})
+        node = nodes_notebook.LoraLibraryNotebook()
+        try:
+            with pytest.raises(ValueError) as exc_info:
+                node.read_entry(file="loras.md", entry="Anything")
+        finally:
+            readonly_parent.chmod(0o755)
+        message = str(exc_info.value)
+        assert str(configured / "loras.md") in message
+        assert "isn't reachable from the server machine" in message
+        assert "EPSNodes settings" in message
+
+    def test_recovers_when_resolve_notebook_file_raises_oserror(
+        self, context: LibraryContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The real `resolve_notebook_file` resolves a relative `file` via
+        # `library_dir()`, which unconditionally `mkdir`s — an unreachable
+        # configured folder (unmounted NAS, permission-denied mount point)
+        # makes that raise an OSError before a path is ever produced.
+        # read_entry must still surface a clean ValueError naming a path,
+        # never a raw OSError.
+        configured = tmp_path / "nas" / "not-mounted"
+        context.save_config({"library_dir": str(configured)})
+        monkeypatch.setattr(
+            context,
+            "resolve_notebook_file",
+            lambda _file_value: (_ for _ in ()).throw(OSError("no such device")),
+        )
+        node = nodes_notebook.LoraLibraryNotebook()
+        with pytest.raises(ValueError) as exc_info:
+            node.read_entry(file="loras.md", entry="Anything")
+        message = str(exc_info.value)
+        assert str(configured / "loras.md") in message
+        assert "isn't reachable from the server machine" in message
+
+    def test_recovers_with_an_absolute_file_when_resolve_raises(
+        self, context: LibraryContext, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Absolute `file` values pass through resolve_notebook_file
+        # untouched (no library_dir() call at all in the real method) — the
+        # peek fallback must mirror that rather than rebasing under
+        # library_dir.
+        absolute_file = str(tmp_path / "elsewhere" / "loras.md")
+        monkeypatch.setattr(
+            context,
+            "resolve_notebook_file",
+            lambda _file_value: (_ for _ in ()).throw(OSError("boom")),
+        )
+        node = nodes_notebook.LoraLibraryNotebook()
+        with pytest.raises(ValueError) as exc_info:
+            node.read_entry(file=absolute_file, entry="Anything")
+        assert absolute_file in str(exc_info.value)
 
 
 # --------------------------------------------------------------- multi-select

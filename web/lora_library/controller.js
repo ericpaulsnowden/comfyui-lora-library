@@ -36,6 +36,87 @@
  *  (2) Added the `Push State` button — broadcasts the selected state to
  *      every `LoraLibraryApplySet` node in the graph; see `_doPush()`.
  *
+ * 2026-07-19c hardening (owner report AGAIN, this time on ComfyUI 0.28.1 —
+ * "strengths are still not saved or updated"). (1) above shadowed
+ * `BaseWidget.setValue` on the `set` widget INSTANCE. That shadow is correct
+ * on THIS rig's exact frontend build (comfyui-frontend-package 1.45.21,
+ * re-verified below, same file/lines as before) but is not a portable fix:
+ * a different frontend build on the owner's 0.28.1 install can lay out
+ * `ComboWidget`/`BaseWidget` differently enough that the shadow point
+ * silently stops applying, and the regression looks IDENTICAL to the
+ * original bug. Three changes replace it:
+ *  (3) VERSION-PROOF SELECTION — `_hookSetValueForReselect()` is REMOVED.
+ *      `_hookSetWidgetMenu()` / `_openSetMenu()` / `_onSetPicked()` replace
+ *      it: the controller now owns the `set` widget's CLICK, not its VALUE
+ *      SETTER. Re-verified against the same rig bundle cited above
+ *      (static/assets/api-BqIxvqZ8.js):
+ *        - `LGraphCanvas.processWidgetClick(e, node, widget)` (fired from
+ *          widget hit-testing on pointer-down) resolves
+ *          `c = toConcreteWidget(widget, node, false)` and only DEFERS the
+ *          actual click: `pointer.onClick = () => c.onClick({e, node,
+ *          canvas: this})`, invoked later by `CanvasPointer._completeClick`
+ *          on pointer-up-without-drag.
+ *        - `toConcreteWidget(e, node, promote)` starts with
+ *          `if (e instanceof BaseWidget) return e`. `LGraphNode.addWidget()`
+ *          itself already routes the raw `{type,name,value,...}` data
+ *          through `toConcreteWidget` inside `addCustomWidget()` and
+ *          pushes/returns THAT result (a real `ComboWidget` instance), never
+ *          the raw data — so the object `this.addWidget('combo', ...)` hands
+ *          back to us IS ALREADY that instance, and `c === widget` above,
+ *          every time, with no proxy or fresh wrapper in between. Shadowing
+ *          `.onClick` as an own property on that exact instance is therefore
+ *          a stable, version-proof override: unlike `setValue`, there is no
+ *          second internal (a `callback` option, a same-value branch) for a
+ *          future frontend build to reintroduce this same failure through.
+ *        - Stock `ComboWidget.onClick` — the method being replaced — is
+ *          itself nothing more than `new LiteGraph.ContextMenu(values, {
+ *          scale, event, className:'dark', callback: v => this.setValue(v,
+ *          {e,node,canvas}) })`. `_openSetMenu()` below is that exact
+ *          mechanism with the `setValue` detour removed, not a foreign
+ *          technique bolted on. Further precedent for a node pack calling
+ *          `LiteGraph.ContextMenu` directly: rgthree's OWN lora-row
+ *          right-click menu (power_lora_loader.js
+ *          `RgthreePowerLoraLoader.getSlotMenuOptions`, `new
+ *          LiteGraph.ContextMenu(menuItems, {title, event})`).
+ *        - `ContextMenu`'s per-item click (its `inner_onclick`) invokes
+ *          `options.callback.call(itemEl, pickedValue, options, domEvent,
+ *          menuInstance)` — `pickedValue` is exactly the array element we
+ *          passed in, the identical shape the stock widget's own callback
+ *          above receives — so `_openSetMenu()`'s callback getting the
+ *          picked LABEL string as its one argument is guaranteed by the same
+ *          code path the stock widget relies on, not an assumption.
+ *      Net effect: EVERY menu pick — including re-picking the state already
+ *      showing — runs `_onSetPicked()` unconditionally. There is no
+ *      same-value branch anywhere in this path to route around, because
+ *      `BaseWidget.setValue` (the only place that branch lives) is never
+ *      called for a user pick anymore. The `_isRestoring`/`_silentSetWrite`
+ *      guard fields and the `configure()` override that bracketed them are
+ *      REMOVED as a consequence, not merely left unused: they existed only
+ *      to stop a programmatic `.value =` write from being mistaken for a
+ *      real pick THROUGH THE OLD CALLBACK/setValue path. With that path
+ *      gone, a plain assignment structurally cannot reach `_onSetPicked()`
+ *      — see the "Combo callbacks do NOT fire during workflow restore"
+ *      bullet below, updated to match.
+ *  (4) READ-BACK TOAST — `_toastRowsSaved()`. `New State`/`Save State` now
+ *      follow their write with a real `GET /lora_library/set?slug=`
+ *      (FORMAT.md §5) and toast what the FILE holds, not what the button
+ *      THINKS it sent — a wrong `captureRows()` read on a different rgthree
+ *      build, or any backend-side transform, shows up in the toast text
+ *      itself. `captureRows()`'s per-field fallback chain was also widened
+ *      (still read-only, still never writes an alias back). `Show status`
+ *      (still hidden by default) additionally names the capture-source
+ *      loader id + row count on every capture/save — see `_setStatusText()`.
+ *  (5) SELECTIVE PUSH — FORMAT.md §6.2's `mirrors loader` tag, written by
+ *      the sibling `sets.js` on every `LoraLibraryApplySet` node. `_doPush()`
+ *      now reads the controller's OWN `target` combo to decide WHICH Apply
+ *      nodes to touch: a specific Power Lora Loader target restricts the
+ *      push to Apply nodes tagged to that same node (plus any tagged
+ *      "(any)"); `All…` pushes to every Apply node regardless of tag. See
+ *      `selectPushTargets()`/`mirrorsTagMatches()`. Deliberately still
+ *      independent of `probeTargets()` (rgthree health) — a push never
+ *      touches rgthree, so it keeps working with rgthree uninstalled or the
+ *      target unhealthy, exactly as before this amendment.
+ *
  * This file binds to rgthree internals it does not own. Every binding is
  * cited below with the exact file + lines read (rgthree-comfy's COMPILED
  * `web/comfyui/power_lora_loader.js`, since that's what actually runs — not
@@ -179,15 +260,19 @@
  *    `value`, so that assignment resolves to `BaseWidget`'s plain property
  *    setter (widgets/BaseWidget.ts:131-133: `this._state.value = value`) —
  *    NOT `setValue()` (BaseWidget.ts:416-436), the ONLY place `callback` is
- *    invoked (line 432). This is the load-bearing fact behind making the
- *    `set` combo's callback perform Apply (see `_onSetSelected`): a saved
- *    workflow reopening can never silently re-apply a set. We still
- *    bracket our own restore in `_isRestoring` (see `configure()` override
- *    below) and route every *programmatic* `set`-widget write through
- *    `_setSetValueSilently()` — belt-and-suspenders, since this guarantee
- *    otherwise rests entirely on an internal we don't own. Precedent for
- *    overriding `configure()` on a custom node: rgthree's own PLL node
- *    does exactly this (power_lora_loader.js:55-74).
+ *    invoked (line 432). A saved workflow reopening can therefore never
+ *    silently re-apply a set, no matter which mechanism drives the live
+ *    pick. 2026-07-19c: since selection now goes through
+ *    `_hookSetWidgetMenu()`'s `onClick` override (see the top-of-file
+ *    2026-07-19c section) instead of the combo's `callback` option at all,
+ *    this guarantee is now STRUCTURAL rather than belt-and-suspenders —
+ *    restore literally cannot reach `_onSetPicked()`, so the old
+ *    `_isRestoring`/`_silentSetWrite`/`configure()`-override guards (which
+ *    existed only to stop a programmatic write from being mistaken for a
+ *    callback-driven pick) were removed as dead code, not merely unused.
+ *    `_setSetValueSilently()` survives as a plain, unguarded `.value =`
+ *    helper — a display-only write, same as this bullet's finding always
+ *    said it safely could be.
  *  - `widget.hidden` is a first-class, purpose-built hiding mechanism in
  *    this fork — NOT the same thing as the `.disabled` trick noted above
  *    for `status`. `LGraphNode.isWidgetVisible()` (LGraphNode.ts:3935-3939)
@@ -250,6 +335,15 @@ const LORA_ROW_NAME_RE = /^lora_\d+$/
  */
 const APPLY_SET_NODE_CLASS = 'LoraLibraryApplySet'
 const APPLY_SET_WIDGET_NAME = 'set'
+
+/**
+ * FORMAT.md §6.2 `mirrors loader` tag — web/lora_library/sets.js's
+ * frontend-only widget name + its "no PLL selected" default value. Same
+ * "kept in sync by hand" convention as the two constants above (neither
+ * file imports the other — see sets.js's file header).
+ */
+const MIRRORS_WIDGET_NAME = 'mirrors loader'
+const MIRRORS_ANY_VALUE = '(any)'
 
 /** FORMAT.md §6.3: our OWN node property — default false, revealed via right-click Properties. */
 const PROP_SHOW_STATUS = 'Show status'
@@ -317,12 +411,22 @@ function findTargetCandidates() {
   return out
 }
 
+/**
+ * FORMAT.md §6.2/§6.3: the node id embedded in a "<title> #<id>" combo
+ * label — the shape both this file's `target` combo and sets.js's `mirrors
+ * loader` tag use for the same underlying concept (which PLL). `null` for
+ * anything without that suffix ("(any)", "(none found)", "All Power Lora
+ * Loaders (N)").
+ */
+function pllIdFromLabel(label) {
+  const match = /#(-?\d+)\s*$/.exec(String(label || ''))
+  return match ? match[1] : null
+}
+
 /** Resolve a combo label ("<title> #<id>") back to a live node, or null. */
 function resolveTargetNode(label) {
-  if (!label) return null
-  const match = /#(-?\d+)\s*$/.exec(String(label))
-  if (!match) return null
-  const id = match[1]
+  const id = pllIdFromLabel(label)
+  if (id == null) return null
   const nodes = app.graph?._nodes || app.graph?.nodes || []
   return nodes.find((n) => n && String(n.id) === id && n.type === POWER_LORA_LOADER_TYPE) || null
 }
@@ -475,21 +579,63 @@ function probeTargets(nodes) {
  * runs probeTarget() over every node in play), so every row here is already
  * known to have the expected `{on, lora, strength, strengthTwo}`-ish shape.
  * nd-super-nodes' `{enabled, strengthClip}` aliases are read (never written).
+ * 2026-07-19c: widened the fallback chain per field (snake_case spellings +
+ * a couple of other plausible fork property names) — the owner's installed
+ * rgthree may not match this rig's exact shape (confirmed correct on THIS
+ * rig's rgthree via a real pointer drag, see file header), and every
+ * fallback here is read-only/additive, so it can only make capture MORE
+ * forgiving, never change behavior on a normal rgthree row.
+ * `_toastRowsSaved()`'s read-back is the other half of "robust and
+ * observable" (FORMAT.md §6.3): if even this widened chain still reads the
+ * wrong thing on the owner's fork, the save toast shows it plainly.
  */
 function captureRows(node) {
   const { rows } = scanLoraRows(node)
   const out = []
   for (const widget of rows) {
-    const v = widget.value
+    const v = widget.value || {}
     if (v.lora == null || v.lora === 'None') continue
     out.push({
       file: v.lora,
-      on: v.on ?? v.enabled ?? true,
-      strength: v.strength ?? 1,
-      strength_clip: (v.strengthTwo ?? v.strengthClip) ?? null
+      on: v.on ?? v.enabled ?? v.active ?? true,
+      strength: v.strength ?? v.strengthOne ?? v.strength_model ?? 1,
+      strength_clip: v.strengthTwo ?? v.strength_two ?? v.strengthClip ?? v.strength_clip ?? null
     })
   }
   return out
+}
+
+/** Basename minus extension, either separator — same rule FORMAT.md §4 uses for lora resolution. */
+function stemOf(file) {
+  const base = String(file || '')
+    .split(/[\\/]/)
+    .pop()
+  const dot = base.lastIndexOf('.')
+  return dot > 0 ? base.slice(0, dot) : base
+}
+
+/**
+ * FORMAT.md §6.3 read-back toast (2026-07-19c): human-readable row summary
+ * for a saved-state toast, e.g. `detailer 0.8, film_grain 1.2`. Deliberately
+ * NOT the Apply LoRA Set node's `loras_text` format (FORMAT.md §6.2 —
+ * underscore-joined, filename-safe tokens): this is comma-separated prose
+ * for a toast, always shows BOTH strengths when they differ (a
+ * dual-strength state applied against a single-strength target, or vice
+ * versa, is exactly the kind of mismatch this toast exists to surface), and
+ * flags an `off` row explicitly, since a silently-skipped disabled row is
+ * otherwise invisible.
+ */
+function summarizeRowsForToast(rows) {
+  if (!Array.isArray(rows) || !rows.length) return '(no rows)'
+  return rows
+    .map((row) => {
+      const stem = stemOf(row.file)
+      const strength = row.strength ?? 1
+      const clip = row.strength_clip
+      const strengthText = clip != null && clip !== strength ? `${strength}/${clip}` : `${strength}`
+      return row.on === false ? `${stem} ${strengthText} (off)` : `${stem} ${strengthText}`
+    })
+    .join(', ')
 }
 
 /**
@@ -600,10 +746,16 @@ function findApplySetNodes() {
  * Write `slug` to one Apply LoRA Set node's `set` widget through its REAL
  * setter — `BaseWidget.setValue()`, not a plain `.value =` assignment — so
  * its `callback`/`node.onWidgetChanged` fire exactly like a genuine user
- * pick. ApplySet's `set` widget is a stock litegraph ComboWidget (built from
- * the node's Python INPUT_TYPES, never touched by this file otherwise), same
- * class hierarchy as our own `set` combo — see `_hookSetValueForReselect()`
- * for the verified `setValue` mechanics this relies on. Falls back to a
+ * pick — DELIBERATELY still `setValue()`, not the `onClick`-menu replacement
+ * this file's OWN `set` combo now uses (file header 2026-07-19c): pushing a
+ * slug the Apply node doesn't already show is the common case, so the old
+ * same-value no-op essentially never bites here, and going through
+ * `setValue()` is what makes the Apply node's REAL server-widget callback
+ * (which re-reads its file) fire like a genuine pick. ApplySet's `set`
+ * widget is a stock litegraph ComboWidget (built from the node's Python
+ * INPUT_TYPES, never touched by this file otherwise); the verified
+ * `setValue` mechanics this relies on are documented in the file header's
+ * "Key ComfyUI_frontend litegraph bindings" section. Falls back to a
  * manual value+callback+onWidgetChanged sequence if `setValue` isn't there
  * (shape drift on some future core), so Push State degrades gracefully
  * instead of throwing. Always dirties the node's canvas so the combo's
@@ -624,10 +776,45 @@ function pushStateToNode(node, slug) {
   return true
 }
 
-/** Push `slug` to every Apply LoRA Set node in the graph; returns how many were touched. */
-function pushStateToApplySetNodes(slug) {
+/**
+ * FORMAT.md §6.2/§6.3 selective Push (2026-07-19c): does `applyNode`'s own
+ * `mirrors loader` tag (sets.js) match the controller's currently-selected
+ * push scope? `pllId` is `null` when the controller's target isn't a single
+ * specific PLL (no PLL in the graph at all — `selectPushTargets()` already
+ * short-circuits the "All…" case before this function is ever consulted, so
+ * `null` here specifically means "no single PLL is selected," never "push
+ * everything"). An Apply node with NO tag widget at all (sets.js didn't
+ * load, or a workflow saved before this feature existed) degrades to
+ * "(any)" — always included — rather than silently dropping out of every
+ * push just because the tagging feature happens to be unavailable on it.
+ */
+function mirrorsTagMatches(applyNode, pllId) {
+  const widget = (applyNode.widgets || []).find((w) => w && w.name === MIRRORS_WIDGET_NAME)
+  const tagValue = widget ? String(widget.value || '') : MIRRORS_ANY_VALUE
+  if (tagValue === MIRRORS_ANY_VALUE) return true
+  if (pllId == null) return false
+  return pllIdFromLabel(tagValue) === pllId
+}
+
+/**
+ * FORMAT.md §6.2/§6.3 selective Push: which of `findApplySetNodes()`'s
+ * results the controller's raw `target` combo value should touch.
+ * `targetValue` is read straight off `this._w.target.value` by the caller —
+ * deliberately NOT `probeTargets()`/`resolveTargetNodes()` (rgthree
+ * health): a push never touches rgthree and must keep working with rgthree
+ * uninstalled or the target unhealthy, exactly as before this amendment.
+ */
+function selectPushTargets(targetValue) {
+  const label = String(targetValue || '')
+  if (ALL_TARGETS_RE.test(label)) return findApplySetNodes()
+  const pllId = pllIdFromLabel(label)
+  return findApplySetNodes().filter((node) => mirrorsTagMatches(node, pllId))
+}
+
+/** Push `slug` to every node in `nodes`; returns how many were touched. */
+function pushStateToNodes(nodes, slug) {
   let count = 0
-  for (const node of findApplySetNodes()) {
+  for (const node of nodes) {
     if (pushStateToNode(node, slug)) count++
   }
   return count
@@ -677,14 +864,6 @@ export function registerControllerNode() {
         // different dedup-suffixed label for the same underlying entry. See
         // _selectedSetEntry() for the full root-cause writeup.
         this._selectedSlug = null
-        // Guards for the `set` combo's apply-on-select callback (file header:
-        // "Combo callbacks do NOT fire during workflow restore" finding).
-        // `_isRestoring` brackets configure() (workflow load); `_silentSetWrite`
-        // brackets our OWN programmatic `.value` writes (_setSetValueSilently).
-        // Both must be false for a set-combo change to be treated as a real
-        // user selection — see _buildWidgets()'s `set` callback.
-        this._isRestoring = false
-        this._silentSetWrite = false
 
         // FORMAT.md §6.3: "Show status" — boolean, default false, revealed
         // via the node's right-click Properties Panel. Must exist before
@@ -695,23 +874,15 @@ export function registerControllerNode() {
         this._guarded('build widgets', () => this._buildWidgets())
       }
 
-      /**
-       * Brackets workflow restore in `_isRestoring` — belt-and-suspenders
-       * for the `set` combo's apply-on-select callback (file header finding:
-       * widgets_values restore already can't invoke a widget's callback on
-       * this fork, since it assigns `.value` directly rather than calling
-       * `setValue()`). `onPropertyChanged` firing here for "Show status" is
-       * fine and wanted (see that method) — this override only guards the
-       * `set` combo, nothing else.
-       */
-      configure(info) {
-        this._isRestoring = true
-        try {
-          super.configure(info)
-        } finally {
-          this._isRestoring = false
-        }
-      }
+      // 2026-07-19c: the `configure()` override that used to live here is
+      // removed — it existed only to bracket `_isRestoring` around
+      // `super.configure(info)` so a workflow-restore `.value` write on the
+      // `set` combo couldn't be mistaken for a user pick. Selection no
+      // longer goes through that combo's callback at all (see the file
+      // header's 2026-07-19c section and `_hookSetWidgetMenu()`), so restore
+      // structurally cannot reach `_onSetPicked()` regardless — nothing left
+      // to bracket. `onPropertyChanged()` below (a genuinely different,
+      // still-needed code path) is unaffected.
 
       /**
        * FORMAT.md §6.3: "Show status" node property → status widget
@@ -776,26 +947,24 @@ export function registerControllerNode() {
 
         // Choosing a set IS the apply (FORMAT.md §6.3, owner decision
         // 2026-07-18: the separate Apply button "was very confusing and I
-        // thought it was broken") — there is no Apply button anymore. Guard
-        // against both workflow restore and our own programmatic selects
-        // (_selectSetBySlug/_setSetValueSilently); see file header and the
-        // configure() override above for why both guards exist.
-        this._w.set = this.addWidget(
-          'combo',
-          'set',
-          '',
-          () => this._onSetComboCallback(),
-          { values: () => this._setComboValues() }
-        )
+        // thought it was broken") — there is no Apply button anymore.
+        // 2026-07-19c: the combo's own `callback` option below is
+        // deliberately a no-op — `_hookSetWidgetMenu()` replaces the click
+        // path entirely (file header 2026-07-19c section), so this callback
+        // is unreachable in normal operation. It's still passed so
+        // `addWidget('combo', ...)` doesn't console.warn about a
+        // callback-less combo.
+        this._w.set = this.addWidget('combo', 'set', '', () => {}, { values: () => this._setComboValues() })
         // 2026-07-18c rename: display-only. `name` stays 'set' (serialize +
         // our own scanLoraRows-style lookups key off it); see file header's
         // `label` vs `name` citation for the BaseWidget mechanics this relies
         // on. VERIFY(live).
         this._w.set.label = 'state'
-        // 2026-07-19 strength-persistence fix, cause A: force an apply even
-        // when a re-pick doesn't change the combo's value (see
-        // _hookSetValueForReselect for the confirmed root cause).
-        this._hookSetValueForReselect(this._w.set)
+        // 2026-07-19c hardening: the controller owns this widget's click
+        // entirely (see file header + _hookSetWidgetMenu/_openSetMenu below)
+        // instead of shadowing setValue — see _onSetPicked() for why this
+        // makes a same-value re-pick a non-issue by construction.
+        this._hookSetWidgetMenu(this._w.set)
 
         this._w.name = this.addWidget('text', 'name', '', () => {}, {})
 
@@ -894,12 +1063,17 @@ export function registerControllerNode() {
         // "not found" rather than guess.
       }
 
+      /** Single write point for the status line — every caller (probe, capture, update) stays consistent. FORMAT.md §6.3. */
+      _setStatusText(message) {
+        this._lastStatusMessage = message
+        if (this._w.status) this._w.status.value = message
+      }
+
       _probeAndUpdateStatus() {
         const targets = resolveTargetNodes(this._w.target?.value)
         const probe = probeTargets(targets)
         this._lastProbe = probe
-        this._lastStatusMessage = probe.message
-        if (this._w.status) this._w.status.value = probe.message
+        this._setStatusText(probe.message)
         for (const button of this._actionButtons || []) {
           // 2026-07-18c delete-bug fix: never let a heartbeat-driven probe
           // flip disable an ARMED delete button. A disabled widget swallows
@@ -1018,69 +1192,57 @@ export function registerControllerNode() {
       /**
        * The ONLY sanctioned way to write `this._w.set.value` from our own
        * code (Capture/Update select the newly-touched set; Delete falls
-       * back to whatever is now first) — brackets the write in
-       * `_silentSetWrite` so the `set` combo's apply-on-select callback
-       * (_buildWidgets) treats it as programmatic, never a user pick, even
-       * though a plain `.value =` assignment provably can't invoke that
-       * callback on this fork anyway (file header finding). Belt-and-
-       * suspenders, same reasoning as the configure() override.
+       * back to whatever is now first). 2026-07-19c: a plain, UNGUARDED
+       * `.value =` assignment — it no longer needs to "silently" suppress
+       * anything, since selection no longer goes through the combo's
+       * callback/setValue at all (see the file header's 2026-07-19c section
+       * and `_hookSetWidgetMenu()` below). Kept as a named helper purely for
+       * readability at call sites, not for a guard it used to need.
        */
       _setSetValueSilently(label) {
         if (!this._w.set) return
-        this._silentSetWrite = true
-        try {
-          this._w.set.value = label
-        } finally {
-          this._silentSetWrite = false
-        }
+        this._w.set.value = label
       }
 
       /**
-       * FORMAT.md §6.3 strength-persistence fix, cause A (owner report:
-       * "Save State doesn't work; re-picking reverts to original
-       * strengths"). VERIFIED against the exact frontend bundle running on
-       * Eric's rig (comfyui-test, port 8199 — comfyui-frontend-package
-       * 1.45.21, static/assets/api-BqIxvqZ8.js; the hashed filename will
-       * differ on other installs, but the mechanism below is stock
-       * `BaseWidget`, not something rgthree or this pack controls):
-       *
-       *   setValue(v, {node, canvas}) {
-       *     const old = this.value
-       *     if (v === this.value) return          // <- exactly this guard
-       *     this.value = v
-       *     ...
-       *     this.callback?.(this.value, canvas, node, canvas.graph_mouse, event)
-       *     node.onWidgetChanged?.(this.name, v, old, this)
-       *     ...
-       *   }
-       *
-       * and separately, `ComboWidget.onClick`'s dropdown `ContextMenu` item
-       * callback calls `this.setValue(clickedItem, ...)` UNCONDITIONALLY for
-       * whichever item the user clicks — including the already-selected one.
-       * So a real user re-picking the current state hits the `v ===
-       * this.value` branch above and `setValue` returns before invoking
-       * `callback` at all: the `set` combo's apply-on-select callback (see
-       * `_onSetComboCallback`) provably never runs. Confirmed live by
-       * reselecting the current state in the running app and observing zero
-       * effect until this fix — not a hypothesis.
-       *
-       * Fix: shadow `setValue` on this ONE widget INSTANCE — the same
-       * per-instance-shadowing trick `_armDeleteButtonColor()` uses for
-       * `background_color`/`text_color` (file header citation) — so a
-       * same-value pick still forces our apply path, while a genuine value
-       * change still runs the ORIGINAL method completely unmodified
-       * (identical property-sync/callback/onWidgetChanged/version-bump side
-       * effects to before this fix).
+       * FORMAT.md §6.3 2026-07-19c hardening — see the file header's
+       * dated section for the full citation trail (verified against THIS
+       * rig's exact bundle: comfyui-frontend-package 1.45.21,
+       * static/assets/api-BqIxvqZ8.js). Shadows `.onClick` as an own
+       * property on THIS widget INSTANCE — identity-stable per the header's
+       * `toConcreteWidget`/`addCustomWidget` citation, so this is not the
+       * same kind of internal-dependent trick the REMOVED
+       * `_hookSetValueForReselect()` was; it replaces the stock
+       * ComboWidget click -> dropdown -> `setValue()` path with our own
+       * dropdown -> direct-apply path (`_openSetMenu()`/`_onSetPicked()`),
+       * never touching `setValue` at all. `widget.callback` (passed to
+       * `addWidget` in `_buildWidgets`) is deliberately a no-op now — it is
+       * unreachable through any path we exercise, kept only so `addWidget`
+       * doesn't console.warn about a callback-less combo.
        */
-      _hookSetValueForReselect(widget) {
-        const baseSetValue = widget.setValue
-        if (typeof baseSetValue !== 'function') return // shape drift — the normal callback-on-change path still works
-        widget.setValue = (value, opts) => {
-          const unchanged = value === widget.value
-          baseSetValue.call(widget, value, opts)
-          if (!unchanged) return // the call above already ran `callback` -> `_onSetComboCallback()`
-          this._onSetComboCallback()
+      _hookSetWidgetMenu(widget) {
+        widget.onClick = ({ e, canvas }) =>
+          this._guarded('set widget click', () => this._openSetMenu(e, canvas))
+      }
+
+      /**
+       * Builds the controller's OWN dropdown for the `set`/state widget
+       * (file header 2026-07-19c) — the exact `LiteGraph.ContextMenu(items,
+       * {scale, event, className, callback})` shape stock `ComboWidget.onClick`
+       * itself uses (file header citation), minus the `setValue()` detour.
+       */
+      _openSetMenu(event, canvas) {
+        const labels = this._setComboValues()
+        if (!labels.length || labels[0] === PLACEHOLDER_NO_SETS) {
+          this._toast('warn', NODE_TITLE, 'No saved states yet — use New State first.')
+          return
         }
+        new LiteGraph.ContextMenu(labels, {
+          event,
+          scale: Math.max(1, canvas?.ds?.scale || 1),
+          className: 'dark',
+          callback: (label) => this._onSetPicked(label)
+        })
       }
 
       _toast(severity, summary, detail) {
@@ -1108,16 +1270,24 @@ export function registerControllerNode() {
       // -------------------------------------------------------- button actions
 
       /**
-       * The `set` combo's callback (fires on a genuine value CHANGE) and
-       * `_hookSetValueForReselect()`'s forced path (fires on a same-value
-       * RECLICK, which never reaches a real callback on this fork — see that
-       * method's citation) both funnel through here, so a reselect behaves
-       * identically to a real change no matter which of the two triggered it.
+       * FORMAT.md §6.3 2026-07-19c hardening: fired by `_openSetMenu()`'s
+       * `LiteGraph.ContextMenu` callback — i.e. a REAL user pick, always
+       * (see the file header's 2026-07-19c section for why nothing else can
+       * reach this method: workflow restore only ever does a plain
+       * `.value =` assignment, never `.onClick`). `label` is one of
+       * `_setComboValues()`'s own strings, so a `_setsCache` lookup by exact
+       * match always succeeds here. Runs apply UNCONDITIONALLY — there is
+       * no same-value branch anywhere in this path, so re-picking the state
+       * already showing re-applies exactly like picking a different one.
        */
-      _onSetComboCallback() {
-        this._guarded('set changed', () => {
-          if (this._isRestoring || this._silentSetWrite) return
-          // A genuine user reselect means any pending delete-confirm is now
+      _onSetPicked(label) {
+        this._guarded('set picked', () => {
+          const entry = this._setsCache.find((s) => s.label === label)
+          if (!entry) return
+          this._selectedSlug = entry.slug
+          this._setSetValueSilently(label)
+          this.setDirtyCanvas(true, false)
+          // A genuine user pick means any pending delete-confirm is now
           // about a DIFFERENT entry than what's on screen — disarm rather
           // than let a stale confirm click land on the old pick.
           this._disarmDeleteButton()
@@ -1125,7 +1295,13 @@ export function registerControllerNode() {
         })
       }
 
-      /** Fired by the `set` combo's callback (see _buildWidgets) — not a button. */
+      /**
+       * Shared apply trigger, called only from `_onSetPicked()` above. Kept
+       * as its own method purely for the `_runAction` wrapping/naming in
+       * toasts, not because multiple call sites need it (2026-07-19c: there
+       * used to be more, back when the combo's own callback and the
+       * setValue-reselect shim both funneled through here).
+       */
       _onSetSelected() {
         this._runAction('Apply State', () => this._doApply())
       }
@@ -1251,6 +1427,25 @@ export function registerControllerNode() {
       }
 
       /**
+       * FORMAT.md §6.3 2026-07-19c read-back toast: GET the just-written
+       * state back (§5 `GET /lora_library/set?slug=`) and toast what the
+       * FILE holds, not what the caller thinks it sent — see the file
+       * header's item (4) for why. `verb` matches the existing toast
+       * vocabulary ("Saved"/"Updated"); `extraNote` is the existing
+       * multi-target capture-source suffix, unchanged in shape.
+       */
+      async _toastRowsSaved(verb, slug, extraNote) {
+        try {
+          const saved = await api.getJson('/lora_library/set', { slug })
+          const summary = summarizeRowsForToast(saved.loras)
+          this._toast('success', NODE_TITLE, `${verb} "${saved.name}": ${summary}${extraNote || ''}`)
+        } catch (error) {
+          api.warn(`${NODE_TITLE}: read-back after ${verb} failed`, error)
+          this._toast('warn', NODE_TITLE, `${verb}, but reading it back to confirm failed — see console.`)
+        }
+      }
+
+      /**
        * FORMAT.md §6.3 amendment: with "All…" selected, CAPTURE reads from
        * the lowest-node-id PLL — `targets[0]` after `resolveTargetNodes()`'s
        * ascending sort.
@@ -1274,7 +1469,12 @@ export function registerControllerNode() {
         if (this._w.name) this._w.name.value = ''
         const sourceNote =
           targets.length > 1 ? ` from ${source.title || source.type} #${source.id} (lowest id of ${targets.length})` : ''
-        this._toast('success', NODE_TITLE, `Saved "${name}" (${loras.length} rows)${sourceNote}.`)
+        // FORMAT.md §6.3: "Show status" names the capture-source loader id +
+        // row count on every capture/save.
+        this._setStatusText(
+          `Captured ${loras.length} row${loras.length === 1 ? '' : 's'} from ${source.title || source.type} #${source.id}.`
+        )
+        await this._toastRowsSaved('Saved', response.slug, sourceNote)
       }
 
       /** Same lowest-node-id source rule as _doCapture() — Update is a re-capture. */
@@ -1312,20 +1512,28 @@ export function registerControllerNode() {
         this._applySetsResponse(response)
         announceSetsChanged()
         this._selectSetBySlug(entry.slug)
-        // FORMAT.md §6.3 strength-persistence fix, cause A: re-apply the
-        // just-saved rows to every target immediately, unconditionally.
-        // Redundant for the single-target case (we just captured these exact
-        // rows FROM the target), but it's what keeps every OTHER target in
-        // sync in "All Power Lora Loaders" mode, and — the actual point —
-        // it's what makes Save State visibly "take" without depending on the
-        // `set` combo's value ever changing, since the combo's value here
-        // never does (see `_hookSetValueForReselect` for why a later
-        // same-value re-pick alone would otherwise silently no-op).
+        // FORMAT.md §6.3 strength-persistence fix, cause A (unchanged by
+        // 2026-07-19c): re-apply the just-saved rows to every target
+        // immediately, unconditionally. Redundant for the single-target
+        // case (we just captured these exact rows FROM the target), but
+        // it's what keeps every OTHER target in sync in "All Power Lora
+        // Loaders" mode, and it's what makes Save State visibly "take"
+        // without the owner having to reselect anything — selection no
+        // longer depends on the combo's value changing AT ALL now (2026-
+        // 07-19c removed that mechanism outright), but re-applying here on
+        // its own terms is still the right behavior.
         applySetToTargets(targets, { loras })
         this._probeAndUpdateStatus()
         const sourceNote =
           targets.length > 1 ? ` from ${source.title || source.type} #${source.id} (lowest id of ${targets.length})` : ''
-        this._toast('success', NODE_TITLE, `Updated "${name}" (${loras.length} rows)${sourceNote}.`)
+        // FORMAT.md §6.3: "Show status" names the capture-source loader id +
+        // row count on every capture/save — set AFTER _probeAndUpdateStatus()
+        // above so this is the status line's final word for this action,
+        // not immediately overwritten by the generic probe message.
+        this._setStatusText(
+          `Captured ${loras.length} row${loras.length === 1 ? '' : 's'} from ${source.title || source.type} #${source.id}.`
+        )
+        await this._toastRowsSaved('Updated', entry.slug, sourceNote)
       }
 
       async _doDelete() {
@@ -1344,17 +1552,23 @@ export function registerControllerNode() {
       }
 
       /**
-       * FORMAT.md §6.3 Push State: broadcast the currently-selected state to
-       * EVERY `LoraLibraryApplySet` node in the graph — the sync mechanism
-       * for "one controller drives several Apply LoRA Set nodes." Entirely
-       * independent of `probeTargets()`/the rgthree target above: this can
-       * run with zero Power Lora Loaders in the graph, or rgthree not even
-       * installed. Writes the state's SLUG, not its (possibly
-       * dedup-suffixed) combo label — ApplySet's own `set` combo is built
-       * server-side from `["None"] + sorted slugs`
-       * (lora_library/nodes_sets.py `_slug_options()`), and its frontend
-       * cache (sets.js `refreshSetsCache`) mirrors that: slugs only, never
-       * names/labels.
+       * FORMAT.md §6.2/§6.3 SELECTIVE Push State (2026-07-19c amendment,
+       * owner: "set different Apply LoRA Set nodes to different Power Lora
+       * Loaders as targets"): broadcast the currently-selected state, but
+       * only to the Apply nodes this controller's `target` combo selects
+       * for — see `selectPushTargets()`/`mirrorsTagMatches()` (this file)
+       * and sets.js's `mirrors loader` tag they read. `target` = a specific
+       * PLL ⇒ only Apply nodes tagged to that PLL (plus any tagged
+       * "(any)"); `target` = "All…" ⇒ every Apply node regardless of tag.
+       * Still entirely independent of `probeTargets()`/rgthree health — a
+       * push never touches rgthree, so this runs fine with zero Power Lora
+       * Loaders in the graph, or rgthree not installed at all; only the
+       * RAW `target` combo label is read, not its rgthree-resolved node.
+       * Writes the state's SLUG, not its (possibly dedup-suffixed) combo
+       * label — ApplySet's own `set` combo is built server-side from
+       * `["None"] + sorted slugs` (lora_library/nodes_sets.py
+       * `_slug_options()`), and its frontend cache (sets.js
+       * `refreshSetsCache`) mirrors that: slugs only, never names/labels.
        */
       async _doPush() {
         const entry = this._selectedSetEntry()
@@ -1362,15 +1576,20 @@ export function registerControllerNode() {
           this._toast('warn', NODE_TITLE, 'Pick a saved state first.')
           return
         }
-        const count = pushStateToApplySetNodes(entry.slug)
-        if (count === 0) {
-          this._toast('warn', NODE_TITLE, 'No Apply LoRA Set nodes in this graph.')
+        const targetValue = String(this._w.target?.value || '')
+        const pushingAll = ALL_TARGETS_RE.test(targetValue)
+        const applyNodes = selectPushTargets(targetValue)
+        if (applyNodes.length === 0) {
+          const scope = pushingAll ? 'in this graph' : `tagged to "${targetValue}" (or "(any)")`
+          this._toast('warn', NODE_TITLE, `No Apply LoRA Set nodes ${scope}.`)
           return
         }
+        const count = pushStateToNodes(applyNodes, entry.slug)
+        const scopeNote = pushingAll ? '' : ` (target: "${targetValue}")`
         this._toast(
           'success',
           NODE_TITLE,
-          `Pushed "${entry.name}" to ${count} Apply LoRA Set node${count === 1 ? '' : 's'}.`
+          `Pushed "${entry.name}" to ${count} Apply LoRA Set node${count === 1 ? '' : 's'}${scopeNote}.`
         )
       }
     }

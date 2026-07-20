@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from . import markdown_store
-from .context import LibraryContext
+from .context import DEFAULT_NOTEBOOK_FILENAME, LibraryContext
 
 logger = logging.getLogger("lora_library")
 
@@ -56,6 +56,48 @@ def _selected_names(entry: str) -> list[str]:
     selection order; blank/whitespace-only lines are skipped (a single
     name is just the degenerate one-line case)."""
     return [line.strip() for line in entry.split("\n") if line.strip()]
+
+
+def _peek_resolved_path(context: LibraryContext, file_value: str) -> Path:
+    """Best-effort mirror of :meth:`LibraryContext.resolve_notebook_file`
+    that never creates anything.
+
+    Used only to still name a path when the REAL resolution just raised
+    (FORMAT.md §5/§6.1, owner report 2026-07-19): for a relative ``file``,
+    ``resolve_notebook_file`` resolves against ``library_dir()``, which
+    unconditionally ``mkdir``s — an unreachable configured folder (an
+    unmounted NAS, a wrong-OS path) makes that raise an ``OSError`` before
+    a path is ever produced, which would otherwise leak a raw, cryptic
+    stack instead of a node error naming the file. This resolves the same
+    way but reads the configured directory via ``load_config`` (a plain
+    read, no filesystem write) instead of calling ``library_dir()``.
+    Absolute ``file`` values need no such peek — they already pass through
+    untouched, so this is only ever consulted for the relative branch.
+    """
+    value = (file_value or "").strip() or DEFAULT_NOTEBOOK_FILENAME
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    configured = context.load_config().get("library_dir")
+    base = Path(configured) if configured else context.default_library_dir
+    return base / path
+
+
+def _unreachable_library_dir_hint(resolved: Path) -> str:
+    """FORMAT.md §6.1/§7.3 hint suffix for a missing-file error: when
+    *resolved*'s parent (the library folder) isn't there, name the likely
+    cause and point at Settings rather than leaving a bare "does not
+    exist" that reads as a typo instead of a NAS/host-machine problem."""
+    try:
+        parent_reachable = resolved.parent.is_dir()
+    except OSError:
+        parent_reachable = False
+    if parent_reachable:
+        return ""
+    return (
+        " — the library folder isn't reachable from the server machine; "
+        "see EPSNodes settings"
+    )
 
 
 class LoraLibraryNotebook:
@@ -133,11 +175,22 @@ class LoraLibraryNotebook:
         if context is None:
             raise RuntimeError("lora_library: Prompt Notebook has no context configured")
 
-        path = context.resolve_notebook_file(file)
+        try:
+            path = context.resolve_notebook_file(file)
+        except OSError:
+            # FORMAT.md §5/§6.1: a configured library_dir the server
+            # machine can't reach makes the real resolve's `mkdir` raise
+            # before it ever returns a path (owner report 2026-07-19) —
+            # peek the same resolution without creating anything so the
+            # error below can still name it, instead of leaking a raw
+            # OSError.
+            path = _peek_resolved_path(context, file)
+
         parsed, mtime, _line_ending = markdown_store.load_notebook(path)
         if mtime is None:
+            hint = _unreachable_library_dir_hint(path)
             raise ValueError(
-                f"Prompt Notebook: file {file!r} does not exist (resolved: {path})"
+                f"Prompt Notebook: file {file!r} does not exist (resolved: {path}){hint}"
             )
 
         names = _selected_names(entry)

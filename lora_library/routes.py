@@ -61,6 +61,24 @@ _FS_LIST_HOME_LABEL = "Home"
 #: slot.
 _FS_LIST_MAX_ENTRIES = 500
 
+#: FORMAT.md §5 ``library_dir_note`` -- the OS-shape mismatch message
+#: (owner report 2026-07-19: a library folder set from the wrong machine's
+#: perspective, e.g. a macOS `/Volumes/...` path pasted into a Windows
+#: ComfyUI). ``{other}``/``{this}`` are filled with the two OS labels.
+_OS_MISMATCH_NOTE = (
+    "This looks like a {other} path, but ComfyUI is running on {this} — "
+    "set the folder from the machine ComfyUI runs on."
+)
+
+#: Same section -- the generic "can't reach it" message when the configured
+#: path is shaped fine for this OS but just isn't there right now (the
+#: owner's actual 2026-07-19 case: a NAS mount that isn't mounted on the
+#: server machine).
+_UNREACHABLE_NOTE = (
+    "The machine ComfyUI runs on can't reach this folder right now "
+    "(is the NAS mounted there?)."
+)
+
 
 # --------------------------------------------------------------------- guards
 
@@ -263,6 +281,78 @@ def _fs_root_parent(directory: Path, *, windows: bool) -> str | None:
     return None
 
 
+# --------------------------------------------------- library_dir diagnosis
+#
+# 2026-07-19 fix (owner report: a NAS-backed library_dir the server machine
+# can't resolve was invisible until a node errored). `_diagnose_library_dir`
+# is its own function -- not inlined in `get_config` -- specifically so tests
+# can exercise both OS-mismatch directions from a single (macOS) dev/CI
+# machine via the `is_windows` parameter, the same seam `_is_windows()`
+# already provides for the fs/list ROOTS branches above.
+
+
+def _looks_like_windows_path(raw: str) -> bool:
+    """True for a drive-letter (``C:\\``) or UNC (``\\\\server\\share``)
+    shape -- the signal that *raw* was set from a Windows machine's
+    perspective, regardless of what OS is asking."""
+    return bool(re.match(r"^[A-Za-z]:[\\/]", raw)) or raw.startswith("\\\\")
+
+
+def _looks_like_posix_path(raw: str) -> bool:
+    """True for a macOS/Linux mount-style shape (``/Volumes/...``,
+    ``/mnt/...``) -- the signal that *raw* was set from a POSIX machine's
+    perspective, regardless of what OS is asking."""
+    normalized = raw.replace("\\", "/").lower()
+    return normalized.startswith("/volumes/") or normalized.startswith("/mnt/")
+
+
+def _diagnose_library_dir(raw: str, *, is_windows: bool) -> str:
+    """FORMAT.md §5's ``library_dir_note``: a one-line human diagnosis for a
+    configured ``library_dir`` value *raw* that the caller has already
+    confirmed doesn't resolve on this server. *is_windows* is the server's
+    own platform (:func:`_is_windows`, passed in rather than read here so
+    tests can exercise both directions from any host OS).
+
+    An OS-shape mismatch is checked first: it names the likely mistake
+    directly ("set from the wrong machine") and is a stronger, more
+    actionable signal than the generic unreachable-path message, so it wins
+    when *raw* happens to look foreign-shaped. Otherwise the path is shaped
+    fine for this OS but just isn't reachable right now (the owner's actual
+    2026-07-19 case: an unmounted NAS share).
+    """
+    if is_windows and _looks_like_posix_path(raw):
+        return _OS_MISMATCH_NOTE.format(other="macOS/Linux", this="Windows")
+    if not is_windows and _looks_like_windows_path(raw):
+        return _OS_MISMATCH_NOTE.format(other="Windows", this="macOS/Linux")
+    return _UNREACHABLE_NOTE
+
+
+def _check_library_dir(context: LibraryContext) -> tuple[bool, str]:
+    """FORMAT.md §5 ``(library_dir_exists, library_dir_note)`` for THIS
+    request, computed WITHOUT the side effect of creating anything.
+
+    Reads the raw configured value straight from :meth:`LibraryContext.
+    load_config` rather than calling :meth:`LibraryContext.library_dir`,
+    which unconditionally ``mkdir``s -- exactly the wrong thing to do here:
+    that call is *why* a bad NAS path used to surface only as a crash deep
+    in some other route/node instead of a clean diagnosis (owner report
+    2026-07-19). An unconfigured library_dir (the pack's own default,
+    under ComfyUI's own user dir) is always trivially fine -- there is
+    nothing to diagnose, so this only inspects a value the user actually
+    set.
+    """
+    configured = context.load_config().get("library_dir")
+    if not configured:
+        return True, ""
+    try:
+        exists = Path(configured).is_dir()
+    except OSError:
+        exists = False
+    if exists:
+        return True, ""
+    return False, _diagnose_library_dir(configured, is_windows=_is_windows())
+
+
 # ---------------------------------------------------------------- core routes
 
 def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
@@ -274,15 +364,26 @@ def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
 
     @routes.get("/lora_library/config")
     async def get_config(request: web.Request) -> web.Response:
-        configured = bool(context.load_config().get("library_dir"))
+        configured_raw = context.load_config().get("library_dir")
+        configured = bool(configured_raw)
+        library_dir_exists, library_dir_note = _check_library_dir(context)
+        # 2026-07-19: when unreachable (unmounted NAS, wrong-OS shape),
+        # report the raw configured value as-is rather than calling
+        # `context.library_dir()` — its `mkdir` would take this whole route
+        # down; `library_dir_exists`/`library_dir_note` explain why it's
+        # stale (FORMAT.md §5/§7.3). The common (working) case still
+        # resolves through the real method, matching prior behavior.
+        library_dir = str(context.library_dir()) if library_dir_exists else configured_raw
         return web.json_response(
             {
-                "library_dir": str(context.library_dir()),
+                "library_dir": library_dir,
                 "default_library_dir": str(context.default_library_dir),
                 "configured": configured,
                 # §2 verdict for THIS caller — lets the frontend gate the
                 # host-machine-only affordances (§7.2 file panel buttons).
                 "is_local": request_is_loopback(request),
+                "library_dir_exists": library_dir_exists,
+                "library_dir_note": library_dir_note,
             }
         )
 
