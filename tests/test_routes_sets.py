@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from aiohttp import web
 
+from lora_library import sets_store
 from lora_library.context import LibraryContext
 from lora_library.routes import build_routes
 
@@ -149,13 +150,55 @@ async def test_post_set_invalid_set_payload_is_400_with_clear_message(
 async def test_post_set_format_too_new_is_400_and_mentions_update_the_pack(
     context: LibraryContext, aiohttp_client
 ) -> None:
+    # FORMAT.md §4.1 (2026-07-20): CURRENT_FORMAT is now 2 (the composite
+    # schema), so a plain `"format": 2` payload with no `loaders` key is no
+    # longer "too new" — it degrades gracefully to format 1 (see
+    # tests/test_sets_store.py's TestFormatValidation for that contract).
+    # This test now targets a GENUINELY newer format, one past whatever the
+    # pack currently understands, to keep exercising the "reject a real
+    # future format" behavior the route is meant to guard.
+    too_new = sets_store.CURRENT_FORMAT + 1
     client = await aiohttp_client(make_app(context))
     resp = await client.post(
-        "/lora_library/set", json={"set": {"format": 2, "name": "x", "loras": []}}
+        "/lora_library/set", json={"set": {"format": too_new, "name": "x", "loras": []}}
     )
     assert resp.status == 400
     body = await resp.json()
     assert "update the pack" in body["error"]
+
+
+async def test_post_set_format_2_with_loaders_saves_a_composite_state(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    """FORMAT.md §4.1: the route is a thin pass-through onto
+    ``sets_store.save_set``/``normalize_set`` — no route-layer change was
+    needed for composite support, so this locks that in against a
+    regression at the HTTP boundary specifically (unit coverage of
+    ``normalize_set`` itself lives in test_sets_store.py)."""
+    client = await aiohttp_client(make_app(context))
+    resp = await client.post(
+        "/lora_library/set",
+        json={
+            "set": {
+                "format": 2,
+                "name": "WAN hi+lo",
+                "loaders": [
+                    {"loras": [{"file": "high.safetensors"}]},
+                    {"loras": [{"file": "low.safetensors"}]},
+                ],
+            }
+        },
+    )
+    assert resp.status == 200
+    body = await resp.json()
+
+    get_resp = await client.get("/lora_library/set", params={"slug": body["slug"]})
+    saved = await get_resp.json()
+    assert saved["format"] == 2
+    assert len(saved["loaders"]) == 2
+    assert saved["loaders"][0]["loras"][0]["file"] == "high.safetensors"
+    assert saved["loaders"][1]["loras"][0]["file"] == "low.safetensors"
+    assert saved["loras"] == saved["loaders"][0]["loras"]
 
 
 # --------------------------------------------------------------- GET /set

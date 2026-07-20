@@ -110,6 +110,45 @@ def _make_set(context: LibraryContext, **overrides) -> str:
     return slug
 
 
+def _make_composite_set(context: LibraryContext, **overrides) -> str:
+    """FORMAT.md §4.1: a format-2 state with two DISTINCT loader slices —
+    the WAN high/low shape. Loader 0 ("high") carries detailer at 0.8;
+    loader 1 ("low") carries film_grain at 0.3 — chosen to be trivially
+    distinguishable in both the applied stack and ``loras_text``.
+    """
+    payload = {
+        "format": 2,
+        "name": "WAN composite",
+        "loaders": [
+            {
+                "loras": [
+                    {
+                        "file": "detailer.safetensors",
+                        "on": True,
+                        "strength": 0.8,
+                        "strength_clip": None,
+                    },
+                ]
+            },
+            {
+                "loras": [
+                    {
+                        "file": "styles/film_grain.safetensors",
+                        "on": True,
+                        "strength": 0.3,
+                        "strength_clip": None,
+                    },
+                ]
+            },
+        ],
+        "trigger_words": "",
+        "notes": "",
+    }
+    payload.update(overrides)
+    slug, _ = sets_store.save_set(context, payload)
+    return slug
+
+
 def calls_paths(calls: list[tuple]) -> list[str]:
     """The resolved-file element of each recorded ``load_lora_for_models`` call."""
     return [c[0] for c in calls]
@@ -370,6 +409,83 @@ def test_strength_scale_zero_skips_loading_every_row(
     assert loaded_files == []
 
 
+# --------------------------------------------------------------- loader_slot
+
+
+def test_apply_loader_slot_0_on_composite_state_applies_loader_0(
+    context: LibraryContext, fake_comfy
+) -> None:
+    slug = _make_composite_set(context)
+    node = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text = node.apply(set=slug, loader_slot=0, model=FakeModel(), clip=FakeClip())
+    calls, _ = fake_comfy
+    assert calls_paths(calls) == ["detailer.safetensors"]
+    assert loras_text == "detailer_0.8"
+
+
+def test_apply_loader_slot_1_on_composite_state_applies_loader_1_and_differs_from_slot_0(
+    context: LibraryContext, fake_comfy
+) -> None:
+    slug = _make_composite_set(context)
+    node = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text_0 = node.apply(set=slug, loader_slot=0, model=FakeModel(), clip=FakeClip())
+    *_, loras_text_1 = node.apply(set=slug, loader_slot=1, model=FakeModel(), clip=FakeClip())
+    assert loras_text_0 != loras_text_1
+    assert loras_text_1 == "film_grain_0.3"
+
+
+def test_two_apply_nodes_on_same_composite_state_different_slots_get_distinct_loras_text(
+    context: LibraryContext, fake_comfy
+) -> None:
+    """The owner's exact bug report: two Apply LoRA Set nodes on the same
+    composite state showed identical loras_text. loader_slot is the fix —
+    each node below stands in for one of the two Apply nodes on the WAN
+    high/low workflow."""
+    slug = _make_composite_set(context)
+    node_high = nodes_sets.LoraLibraryApplySet()
+    node_low = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text_high = node_high.apply(
+        set=slug, loader_slot=0, model=FakeModel(), clip=FakeClip()
+    )
+    *_, loras_text_low = node_low.apply(
+        set=slug, loader_slot=1, model=FakeModel(), clip=FakeClip()
+    )
+    assert loras_text_high != loras_text_low
+    assert loras_text_high == "detailer_0.8"
+    assert loras_text_low == "film_grain_0.3"
+
+
+def test_apply_loader_slot_out_of_range_clamps_to_last_loader(
+    context: LibraryContext, fake_comfy
+) -> None:
+    slug = _make_composite_set(context)
+    node = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text = node.apply(set=slug, loader_slot=99, model=FakeModel(), clip=FakeClip())
+    assert loras_text == "film_grain_0.3"
+
+
+def test_apply_loader_slot_omitted_defaults_to_0(context: LibraryContext, fake_comfy) -> None:
+    """FORMAT.md §6.2: loader_slot lives in `optional` with a plain default
+    (API-omit-safe), same rationale as strength_scale."""
+    slug = _make_composite_set(context)
+    node = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text_default = node.apply(set=slug, model=FakeModel(), clip=FakeClip())
+    *_, loras_text_explicit_0 = node.apply(
+        set=slug, loader_slot=0, model=FakeModel(), clip=FakeClip()
+    )
+    assert loras_text_default == loras_text_explicit_0 == "detailer_0.8"
+
+
+def test_format_1_state_ignores_loader_slot(context: LibraryContext, fake_comfy) -> None:
+    """FORMAT.md §4.1: a format-1 state has no `loaders` to slice, so any
+    loader_slot value applies the exact same single `loras` list."""
+    slug = _make_set(context)  # plain format-1 set (existing helper)
+    node = nodes_sets.LoraLibraryApplySet()
+    *_, loras_text_slot_0 = node.apply(set=slug, loader_slot=0, model=FakeModel(), clip=FakeClip())
+    *_, loras_text_slot_5 = node.apply(set=slug, loader_slot=5, model=FakeModel(), clip=FakeClip())
+    assert loras_text_slot_0 == loras_text_slot_5
+
+
 # ---------------------------------------------------------------------- IS_CHANGED
 
 
@@ -410,6 +526,24 @@ def test_is_changed_handles_none_without_raising(context: LibraryContext) -> Non
     assert isinstance(token, str)
 
 
+def test_is_changed_includes_loader_slot(context: LibraryContext) -> None:
+    """FORMAT.md §4.1/§6.2: switching slots on the SAME composite state
+    (same file, same mtime/size) must still re-execute — the file token
+    alone can't see that."""
+    slug = _make_composite_set(context)
+    token_slot_0 = nodes_sets.LoraLibraryApplySet.IS_CHANGED(set=slug, loader_slot=0)
+    token_slot_1 = nodes_sets.LoraLibraryApplySet.IS_CHANGED(set=slug, loader_slot=1)
+    assert token_slot_0 != token_slot_1
+
+
+def test_is_changed_omitting_loader_slot_defaults_to_0(context: LibraryContext) -> None:
+    """Same default-kwarg contract as strength_scale above, for loader_slot."""
+    slug = _make_composite_set(context)
+    token_omitted = nodes_sets.LoraLibraryApplySet.IS_CHANGED(set=slug)
+    token_explicit = nodes_sets.LoraLibraryApplySet.IS_CHANGED(set=slug, loader_slot=0)
+    assert token_omitted == token_explicit
+
+
 # ------------------------------------------------------- VALIDATE_INPUTS / INPUT_TYPES
 
 
@@ -440,6 +574,17 @@ def test_input_types_strength_scale_widget_matches_format_md(context: LibraryCon
     widget_type, spec = input_types["optional"]["strength_scale"]
     assert widget_type == "FLOAT"
     assert spec == {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}
+
+
+def test_input_types_loader_slot_widget_matches_format_md(context: LibraryContext) -> None:
+    """FORMAT.md §6.2/§4.1: loader_slot is INT, optional (not required,
+    API-omit-safe), default 0, min 0."""
+    input_types = nodes_sets.LoraLibraryApplySet.INPUT_TYPES()
+    assert "loader_slot" not in input_types["required"]
+    widget_type, spec = input_types["optional"]["loader_slot"]
+    assert widget_type == "INT"
+    assert spec["default"] == 0
+    assert spec["min"] == 0
 
 
 def test_input_types_model_and_clip_are_optional(context: LibraryContext) -> None:

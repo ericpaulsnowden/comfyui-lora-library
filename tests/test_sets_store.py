@@ -97,13 +97,21 @@ class TestFormatValidation:
         result = sets_store.normalize_set({"format": 1, "name": "x", "loras": []})
         assert result["format"] == 1
 
-    def test_missing_format_defaults_to_current(self) -> None:
+    def test_missing_format_on_a_single_loader_payload_defaults_to_format_1(self) -> None:
+        """FORMAT.md §4.1: the OUTPUT format is derived from whether
+        `loaders` is present — never copied from (or defaulted to) whatever
+        `format` int the payload declares or omits. A plain single-loader
+        payload always normalizes to format 1, even now that
+        ``CURRENT_FORMAT`` (the highest format this reader UNDERSTANDS) is
+        2 — that ceiling is not the same thing as "the default format for a
+        payload that doesn't look composite"."""
         result = sets_store.normalize_set({"name": "x", "loras": []})
-        assert result["format"] == sets_store.CURRENT_FORMAT
+        assert result["format"] == 1
 
     def test_format_greater_than_current_is_rejected_with_update_the_pack_message(self) -> None:
+        too_new = sets_store.CURRENT_FORMAT + 1
         with pytest.raises(sets_store.SetValidationError, match="update the pack"):
-            sets_store.normalize_set({"format": 2, "name": "x", "loras": []})
+            sets_store.normalize_set({"format": too_new, "name": "x", "loras": []})
 
     def test_non_int_format_is_rejected(self) -> None:
         with pytest.raises(sets_store.SetValidationError, match="format"):
@@ -113,14 +121,214 @@ class TestFormatValidation:
         with pytest.raises(sets_store.SetValidationError, match="format"):
             sets_store.normalize_set({"format": True, "name": "x", "loras": []})
 
-    def test_load_set_with_format_2_on_disk_raises_on_load(
+    def test_load_set_with_a_too_new_format_on_disk_raises_on_load(
         self, context: LibraryContext, library_dir: Path
     ) -> None:
+        too_new = sets_store.CURRENT_FORMAT + 1
         path = library_dir / "sets" / "future.json"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"format": 2, "name": "x", "loras": []}), encoding="utf-8")
+        path.write_text(json.dumps({"format": too_new, "name": "x", "loras": []}), encoding="utf-8")
         with pytest.raises(sets_store.SetValidationError, match="update the pack"):
             sets_store.load_set(context, "future")
+
+    def test_format_2_labeled_file_with_no_loaders_key_degrades_to_format_1(self) -> None:
+        """FORMAT.md §4.1: "no loaders key" is format 1 regardless of the
+        declared `format` int — this is the NEW behavior that supersedes
+        the pre-§4.1 contract (where any `format` greater than 1 was
+        rejected outright): a hand-edited file, or a `format: 2` file that
+        just never got a composite capture, degrades gracefully instead of
+        being refused."""
+        result = sets_store.normalize_set(
+            {"format": 2, "name": "x", "loras": [{"file": "a.safetensors"}]}
+        )
+        assert result["format"] == 1
+        assert "loaders" not in result
+        assert result["loras"] == [
+            {"file": "a.safetensors", "on": True, "strength": 1.0, "strength_clip": None}
+        ]
+
+
+# --------------------------------------------------------- format 2 composite
+
+
+class TestFormat2Composite:
+    """FORMAT.md §4.1 — the composite multi-loader state schema."""
+
+    @staticmethod
+    def _composite_payload(**overrides: object) -> dict:
+        payload = {
+            "format": 2,
+            "name": "WAN hi+lo",
+            "loaders": [
+                {"loras": [{"file": "detailer.safetensors", "strength": 0.8}]},
+                {"loras": [{"file": "styles/film_grain.safetensors", "strength": 0.3}]},
+            ],
+            "trigger_words": "",
+            "notes": "",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_format_2_with_loaders_normalizes_to_format_2(self) -> None:
+        result = sets_store.normalize_set(self._composite_payload())
+        assert result["format"] == 2
+        assert len(result["loaders"]) == 2
+
+    def test_top_level_loras_mirrors_loaders_0(self) -> None:
+        result = sets_store.normalize_set(self._composite_payload())
+        assert result["loras"] == result["loaders"][0]["loras"]
+        assert result["loras"][0]["file"] == "detailer.safetensors"
+
+    def test_top_level_loras_is_recomputed_even_if_raw_payload_disagreed(self) -> None:
+        # A stale/hand-edited top-level `loras` must never win over
+        # loaders[0] — FORMAT.md §4.1: "ALWAYS keep top-level loras ==
+        # loaders[0].loras in sync."
+        payload = self._composite_payload(loras=[{"file": "totally-different.safetensors"}])
+        result = sets_store.normalize_set(payload)
+        assert result["loras"] == result["loaders"][0]["loras"]
+        assert result["loras"][0]["file"] == "detailer.safetensors"
+
+    def test_each_loader_keeps_its_own_distinct_rows(self) -> None:
+        result = sets_store.normalize_set(self._composite_payload())
+        assert result["loaders"][0]["loras"][0]["file"] == "detailer.safetensors"
+        assert result["loaders"][0]["loras"][0]["strength"] == 0.8
+        assert result["loaders"][1]["loras"][0]["file"] == "styles/film_grain.safetensors"
+        assert result["loaders"][1]["loras"][0]["strength"] == 0.3
+
+    def test_loader_entry_that_is_not_an_object_is_rejected(self) -> None:
+        payload = self._composite_payload(loaders=["nope", {"loras": []}])
+        with pytest.raises(sets_store.SetValidationError, match=r"loaders\[0\]"):
+            sets_store.normalize_set(payload)
+
+    def test_bad_row_inside_a_loader_is_rejected_with_a_loader_scoped_message(self) -> None:
+        payload = self._composite_payload(
+            loaders=[{"loras": [{"on": True}]}, {"loras": []}]  # row 0 is missing 'file'
+        )
+        with pytest.raises(sets_store.SetValidationError, match=r"loaders\[0\]\.loras\[0\]"):
+            sets_store.normalize_set(payload)
+
+    def test_empty_loaders_list_degrades_to_format_1_and_logs_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        payload = self._composite_payload(loaders=[], loras=[{"file": "detailer.safetensors"}])
+        with caplog.at_level(logging.WARNING, logger="lora_library"):
+            result = sets_store.normalize_set(payload)
+        assert result["format"] == 1
+        assert "loaders" not in result
+        assert result["loras"][0]["file"] == "detailer.safetensors"
+        assert any("loaders" in r.message for r in caplog.records)
+
+    def test_non_list_loaders_degrades_to_format_1_and_logs_a_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        payload = self._composite_payload(loaders="nope", loras=[{"file": "detailer.safetensors"}])
+        with caplog.at_level(logging.WARNING, logger="lora_library"):
+            result = sets_store.normalize_set(payload)
+        assert result["format"] == 1
+        assert result["loras"][0]["file"] == "detailer.safetensors"
+
+    def test_save_then_load_round_trips_a_composite_state(self, context: LibraryContext) -> None:
+        slug, saved = sets_store.save_set(context, self._composite_payload())
+        loaded = sets_store.load_set(context, slug)
+        assert loaded == saved
+        assert loaded["format"] == 2
+        assert len(loaded["loaders"]) == 2
+        assert loaded["loaders"][0]["loras"][0]["file"] == "detailer.safetensors"
+        assert loaded["loaders"][1]["loras"][0]["file"] == "styles/film_grain.safetensors"
+        assert loaded["loras"] == loaded["loaders"][0]["loras"]
+
+    def test_saved_composite_file_on_disk_has_format_2_and_a_loaders_array(
+        self, context: LibraryContext, library_dir: Path
+    ) -> None:
+        slug, _ = sets_store.save_set(context, self._composite_payload())
+        path = library_dir / "sets" / f"{slug}.json"
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["format"] == 2
+        assert len(on_disk["loaders"]) == 2
+        assert on_disk["loras"] == on_disk["loaders"][0]["loras"]
+
+    def test_plain_format_1_save_is_unaffected_by_the_format_2_addition(
+        self, context: LibraryContext
+    ) -> None:
+        slug, saved = sets_store.save_set(context, {"name": "Plain", "loras": []})
+        assert saved["format"] == 1
+        assert "loaders" not in saved
+        loaded = sets_store.load_set(context, slug)
+        assert loaded["format"] == 1
+        assert "loaders" not in loaded
+
+    def test_list_sets_count_reflects_loaders_0_row_count_for_a_composite_state(
+        self, context: LibraryContext
+    ) -> None:
+        sets_store.save_set(context, self._composite_payload())
+        listed = sets_store.list_sets(context)
+        assert listed[0]["count"] == 1  # loaders[0] has exactly one row
+
+
+# --------------------------------------------------------------- loras_for_slot
+
+
+class TestLorasForSlot:
+    """FORMAT.md §4.1: the per-slot slice helper `nodes_sets.py`'s Apply
+    `loader_slot` (and controller.js's hand-kept-in-sync JS mirror,
+    `lorasForLoaderIndex()`) both rely on. Never raises."""
+
+    def test_format_1_state_returns_loras_regardless_of_slot(self) -> None:
+        state = {"format": 1, "loras": [{"file": "a.safetensors"}]}
+        assert sets_store.loras_for_slot(state, 0) == state["loras"]
+        assert sets_store.loras_for_slot(state, 5) == state["loras"]
+
+    @staticmethod
+    def _composite_state() -> dict:
+        return sets_store.normalize_set(
+            {
+                "format": 2,
+                "loaders": [
+                    {"loras": [{"file": "high.safetensors"}]},
+                    {"loras": [{"file": "low.safetensors"}]},
+                ],
+            }
+        )
+
+    def test_format_2_slot_0_returns_loaders_0(self) -> None:
+        state = self._composite_state()
+        assert sets_store.loras_for_slot(state, 0)[0]["file"] == "high.safetensors"
+
+    def test_format_2_slot_1_returns_loaders_1_and_differs_from_slot_0(self) -> None:
+        state = self._composite_state()
+        slot0 = sets_store.loras_for_slot(state, 0)
+        slot1 = sets_store.loras_for_slot(state, 1)
+        assert slot0 != slot1
+        assert slot1[0]["file"] == "low.safetensors"
+
+    def test_out_of_range_slot_clamps_to_the_last_loader(self) -> None:
+        state = self._composite_state()
+        assert sets_store.loras_for_slot(state, 99)[0]["file"] == "low.safetensors"
+
+    def test_negative_slot_clamps_to_zero(self) -> None:
+        state = self._composite_state()
+        assert sets_store.loras_for_slot(state, -3)[0]["file"] == "high.safetensors"
+
+    def test_non_dict_state_returns_empty_list_without_raising(self) -> None:
+        assert sets_store.loras_for_slot(None, 0) == []  # type: ignore[arg-type]
+        assert sets_store.loras_for_slot("nope", 0) == []  # type: ignore[arg-type]
+
+    def test_empty_state_returns_empty_list(self) -> None:
+        assert sets_store.loras_for_slot({}, 0) == []
+
+    def test_malformed_loaders_falls_back_to_top_level_loras(self) -> None:
+        # Defensive against hand-built dicts that bypassed normalize_set —
+        # loras_for_slot never trusts `loaders` being well-shaped.
+        state = {"loaders": "nope", "loras": [{"file": "a.safetensors"}]}
+        assert sets_store.loras_for_slot(state, 0) == state["loras"]
+
+    def test_empty_loaders_list_falls_back_to_top_level_loras(self) -> None:
+        state = {"loaders": [], "loras": [{"file": "a.safetensors"}]}
+        assert sets_store.loras_for_slot(state, 0) == state["loras"]
+
+    def test_non_int_slot_falls_back_to_zero_without_raising(self) -> None:
+        state = self._composite_state()
+        assert sets_store.loras_for_slot(state, "not-a-number")[0]["file"] == "high.safetensors"
 
 
 # --------------------------------------------------------- shape validation

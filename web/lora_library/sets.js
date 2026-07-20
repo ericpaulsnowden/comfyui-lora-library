@@ -91,6 +91,16 @@
  *    properties-merge loop runs immediately after and calls the wrapped
  *    `onPropertyChanged` for whatever the saved file actually has, so the
  *    saved value always wins last regardless of call order.
+ *
+ * 2026-07-20 (§4.1 composite fix) addition: FORMAT.md §6.2/§4.1's
+ * `loader_slot` hide-by-default — `applyLoaderSlotVisibility()`. Exactly
+ * mirrors `strength_scale`/`applyStrengthScaleVisibility()` immediately
+ * above: same `.hidden` mechanism, same attach-time wiring (property +
+ * shared wrapped `onPropertyChanged` + one explicit initial apply call), a
+ * separate property (`Show loader slot`) so the two widgets can be revealed
+ * independently. A fresh Apply node therefore shows NEITHER `strength_scale`
+ * NOR `loader_slot`; revealing `Show loader slot` in the node's right-click
+ * Properties shows only that one widget.
  */
 
 import { app } from '../../../scripts/app.js'
@@ -113,6 +123,15 @@ const MIRRORS_ANY_VALUE = '(any)'
  * resolution.js's per-instance attach()/onPropertyChanged idiom. */
 const STRENGTH_SCALE_WIDGET_NAME = 'strength_scale'
 const PROP_SHOW_STRENGTH_SCALE = 'Show strength scale'
+
+/** FORMAT.md §6.2/§4.1 (2026-07-20 composite fix): the `loader_slot` widget
+ * name (a real, Python-declared widget — lora_library/nodes_sets.py's
+ * INPUT_TYPES) + the node property that reveals it, default false. Exact
+ * mirror of the `strength_scale`/`Show strength scale` pair above — same
+ * hide mechanism (`applyLoaderSlotVisibility()` below), same attach-time
+ * wiring, own property so the two widgets reveal independently. */
+const LOADER_SLOT_WIDGET_NAME = 'loader_slot'
+const PROP_SHOW_LOADER_SLOT = 'Show loader slot'
 
 /** §7.4 freshness beats thrift here, but don't hammer on every redraw. */
 const REFRESH_THROTTLE_MS = 2000
@@ -199,6 +218,24 @@ function applyStrengthScaleVisibility(node) {
 }
 
 /**
+ * FORMAT.md §6.2/§4.1 (2026-07-20 composite fix): hide/show `loader_slot`
+ * per the node's `Show loader slot` property. Exact mirror of
+ * `applyStrengthScaleVisibility()` immediately above — same `.hidden`
+ * primitive, same idempotent-safe-to-call-redundantly design, same silent
+ * no-op if the widget isn't found (e.g. a future backend rename). The
+ * widget's VALUE is untouched either way — hiding is purely cosmetic, so a
+ * hidden `loader_slot` still serializes and still feeds `apply()`/
+ * `IS_CHANGED()` at whatever it's set to (default 0).
+ * @param {object} node
+ */
+function applyLoaderSlotVisibility(node) {
+  const widget = (node.widgets ?? []).find((w) => w.name === LOADER_SLOT_WIDGET_NAME)
+  if (!widget) return
+  widget.hidden = node.properties?.[PROP_SHOW_LOADER_SLOT] !== true
+  node.setDirtyCanvas(true, true)
+}
+
+/**
  * Per-instance hook (called from lora_library.js `nodeCreated`); no-op for
  * every node type except LoraLibraryApplySet.
  * @param {object} node
@@ -233,15 +270,22 @@ export function attachApplySetBehavior(node) {
   // explicit applyStrengthScaleVisibility() call right after wiring is what
   // actually hides it on a fresh node.
   node.addProperty(PROP_SHOW_STRENGTH_SCALE, false, 'boolean')
+  // FORMAT.md §6.2/§4.1 (2026-07-20 composite fix): `Show loader slot` —
+  // exact mirror of `Show strength scale` just above, added in this same
+  // attach pass so both properties already exist before the shared
+  // onPropertyChanged wrapper below needs to branch on either name.
+  node.addProperty(PROP_SHOW_LOADER_SLOT, false, 'boolean')
 
   const originalOnPropertyChanged = node.onPropertyChanged
   node.onPropertyChanged = function (name, value, prevValue) {
     const result = originalOnPropertyChanged?.call(this, name, value, prevValue)
     if (name === PROP_SHOW_STRENGTH_SCALE) applyStrengthScaleVisibility(this)
+    if (name === PROP_SHOW_LOADER_SLOT) applyLoaderSlotVisibility(this)
     return result
   }
 
   applyStrengthScaleVisibility(node)
+  applyLoaderSlotVisibility(node)
 }
 
 /** One-time wiring at extension setup: seed the cache so the first dropdown

@@ -201,6 +201,48 @@
  *    whether something else is happening (e.g. the wrong node/row being
  *    read) — either way narrowing the next round instead of re-guessing.
  *
+ * 2026-07-20 (§4.1 composite fix, owner: "All Power Lora Loaders currently
+ * reads only the lowest-id loader and writes that ONE config to ALL
+ * loaders; I want each loader to keep its OWN distinct set, captured/
+ * restored together" — same root cause as "two Apply LoRA Set nodes on
+ * different loaders show identical loras_text", fixed on the ApplySet side
+ * by nodes_sets.py's new `loader_slot`). FORMAT.md §4.1 adds a `loaders[]`
+ * array to the §4 set-file schema for exactly this case; this file's half:
+ *  - CAPTURE (`_doCapture()`/`_doUpdate()`, now delegating to
+ *    `_captureComposite()`/`_updateComposite()` for target "All Power Lora
+ *    Loaders (N)", N>=2): every PLL's rows, in ascending-node-id order
+ *    (`resolveTargetNodes()` already sorts "All…" that way), become one
+ *    `loaders[i]` each — via the SAME `captureRows()` this file has used
+ *    since v0.14.1, called once per loader, completely unmodified. The
+ *    single-target path (every OTHER target value) is a pure ADDITION
+ *    guarded by `targets.length > 1` — the owner-validated capture/strength
+ *    read for one loader runs through zero new code.
+ *  - APPLY (`_doApply()`, via the now composite-aware
+ *    `applySetToTargets()`): a format-2 state's `loaders[i]` goes to the
+ *    i-th PLL by ascending id for an "All…" target (fewer loaders than
+ *    PLLs -> extras left untouched + a toast names the mismatch, never
+ *    guessed); for a SINGLE specific-PLL target, the slice is that PLL's
+ *    ascending-id RANK AMONG EVERY PLL IN THE GRAPH (`pllAscendingIndex()`)
+ *    — not its (always-0) position within a 1-element `targets` array. A
+ *    format-1 state (no `loaders`) takes the exact pre-existing path either
+ *    way — `isComposite` short-circuits every new branch.
+ *  - PUSH STATE (`_doPush()`): unchanged in scope — still broadcasts the
+ *    selected slug to every selected Apply node exactly as before. As a
+ *    strictly best-effort ADDITION (`_syncLoaderSlotsForPush()`, wrapped in
+ *    the new `_guardedAsync()`), a composite push also sets each pushed
+ *    Apply node's `loader_slot` from its `mirrors loader` tag's
+ *    ascending-id index, so a WAN pair of tagged Apply nodes needs no
+ *    manual "reveal loader_slot and set it to 1" step. This runs AFTER the
+ *    push count is already computed and can never affect it, is skipped
+ *    outright for a format-1 push, and any failure inside it is caught and
+ *    logged rather than surfaced — chosen deliberately over baking this
+ *    into `pushStateToNode()` itself, to keep the validated core broadcast
+ *    (`pushStateToNodes()`) exactly as it was.
+ *  - `lorasForLoaderIndex()` is this file's hand-kept-in-sync mirror of
+ *    `sets_store.py`'s `loras_for_slot()` — same "no cross-language import"
+ *    convention as every other duplicated constant here (e.g.
+ *    `APPLY_SET_WIDGET_NAME`).
+ *
  * This file binds to rgthree internals it does not own. Every binding is
  * cited below with the exact file + lines read (rgthree-comfy's COMPILED
  * `web/comfyui/power_lora_loader.js`, since that's what actually runs — not
@@ -419,6 +461,15 @@ const LORA_ROW_NAME_RE = /^lora_\d+$/
  */
 const APPLY_SET_NODE_CLASS = 'LoraLibraryApplySet'
 const APPLY_SET_WIDGET_NAME = 'set'
+/**
+ * FORMAT.md §6.2/§4.1 (2026-07-20 composite fix): the Apply LoRA Set node's
+ * `loader_slot` widget name — a real, Python-declared widget
+ * (lora_library/nodes_sets.py INPUT_TYPES), hidden by default by the
+ * sibling `sets.js` behind its own `Show loader slot` property. Same
+ * "kept in sync by hand, no cross-module import" convention as
+ * `APPLY_SET_WIDGET_NAME` above.
+ */
+const APPLY_SET_LOADER_SLOT_WIDGET_NAME = 'loader_slot'
 
 /**
  * FORMAT.md §6.2 `mirrors loader` tag — web/lora_library/sets.js's
@@ -549,6 +600,61 @@ function resolveTargetNodes(label) {
   }
   const single = resolveTargetNode(label)
   return single ? [single] : []
+}
+
+/**
+ * FORMAT.md §4.1: the lora rows a state stores for loader index `index`.
+ * Frontend mirror of `sets_store.py`'s `loras_for_slot()` — same
+ * "kept in sync by hand, no cross-language import" convention as every
+ * other duplicated-on-purpose constant/helper in this file (see file
+ * header). Format-2 `setData` (`loaders` present, non-empty) returns
+ * `loaders[clamp(index)].loras`; anything else (format-1, or a
+ * malformed/missing `loaders`) returns the top-level `loras` array. Never
+ * throws; clamps into range; empty-safe.
+ */
+function lorasForLoaderIndex(setData, index) {
+  const loaders = setData?.loaders
+  if (Array.isArray(loaders) && loaders.length) {
+    const i = Math.max(0, Math.min(Number(index) || 0, loaders.length - 1))
+    const loras = loaders[i]?.loras
+    return Array.isArray(loras) ? loras : []
+  }
+  return Array.isArray(setData?.loras) ? setData.loras : []
+}
+
+/**
+ * FORMAT.md §6.3 (2026-07-20 §4.1 composite extension): `node`'s rank
+ * (0-based) among EVERY live PLL in the graph, sorted ascending by id —
+ * "the slice for THAT loader's ascending-id index among the graph's PLLs"
+ * that a single-PLL-target APPLY of a composite state uses (see
+ * `_doApply()`). Deliberately scans the WHOLE graph
+ * (`findTargetCandidates()`), not just whatever `resolveTargetNodes()`
+ * returned for the current target — a single target's rank among ALL PLLs
+ * is a different number than its rank within a 1-element array (always 0).
+ * Falls back to 0 (never -1) if `node` isn't found among the candidates for
+ * any reason (e.g. removed between resolve and apply) — degrades to
+ * loader 0 rather than throwing.
+ */
+function pllAscendingIndex(node) {
+  const candidates = findTargetCandidates().sort((a, b) => a.id - b.id)
+  const index = candidates.findIndex((c) => c.node === node)
+  return index === -1 ? 0 : index
+}
+
+/**
+ * Like `pllAscendingIndex()` above but starting from a PLL's node id
+ * (string or number) rather than a live node reference — used where only
+ * the id is at hand, e.g. a `mirrors loader` tag's embedded id (FORMAT.md
+ * §6.2), see `pushLoaderSlotForTag()`. `null` when `id` is
+ * `null`/`undefined` or doesn't match any live PLL (never guesses 0 here,
+ * unlike `pllAscendingIndex()` — the caller needs to tell "no specific PLL"
+ * apart from "the first PLL").
+ */
+function pllAscendingIndexById(id) {
+  if (id == null) return null
+  const candidates = findTargetCandidates().sort((a, b) => a.id - b.id)
+  const index = candidates.findIndex((c) => String(c.id) === String(id))
+  return index === -1 ? null : index
 }
 
 /**
@@ -910,13 +1016,41 @@ function applySetToTarget(node, setData) {
 }
 
 /**
- * Multi-target APPLY (FORMAT.md §6.3 amendment): "APPLY ... applies the set
- * to EVERY PLL." `applySetToTarget()` only READS `setData` (builds a fresh
- * `.value` object per row; never mutates the set or any row in place), so
- * reusing the same `setData` across every target here is safe — no cloning
- * needed.
+ * Multi-target APPLY (FORMAT.md §6.3 amendment, extended 2026-07-20 for
+ * §4.1 composites): `applySetToTarget()` only READS `setData` per node
+ * (builds a fresh `.value` object per row; never mutates the set or any row
+ * in place), so reusing/reslicing the same `setData` across multiple
+ * targets here is always safe — no cloning needed.
+ *
+ * - `setData` format-1 (no usable `loaders`): the exact pre-existing
+ *   behavior — the same `loras` applied to every node in `nodes`.
+ * - `setData` format-2 (`loaders` present, non-empty) AND `nodes.length > 1`
+ *   ("All…" target, §6.3): `loaders[i]` -> `nodes[i]`, by ascending id
+ *   (guaranteed by `resolveTargetNodes()`'s sort before `nodes` gets here).
+ *   Fewer loaders than nodes -> the extra trailing nodes are left untouched
+ *   (FORMAT.md §6.3: "never guess"); the caller toasts the mismatch (see
+ *   `_doApply()`).
+ * - `setData` format-2 AND `nodes.length === 1` with `loaderIndexForSingle`
+ *   given (a single-PLL target, §6.3): applies ONLY
+ *   `loaders[clamp(loaderIndexForSingle)]` to that one node — `_doApply()`
+ *   computes the index as the target's ascending-id RANK AMONG EVERY PLL IN
+ *   THE GRAPH (via `pllAscendingIndex()`), per FORMAT.md §6.3's "uses the
+ *   slice for THAT loader's ascending-id index among the graph's PLLs."
  */
-function applySetToTargets(nodes, setData) {
+function applySetToTargets(nodes, setData, { loaderIndexForSingle } = {}) {
+  const loaders = setData?.loaders
+  const isComposite = Array.isArray(loaders) && loaders.length > 0
+  if (isComposite && nodes.length === 1 && loaderIndexForSingle != null) {
+    applySetToTarget(nodes[0], { loras: lorasForLoaderIndex(setData, loaderIndexForSingle) })
+    return
+  }
+  if (isComposite && nodes.length > 1) {
+    for (let i = 0; i < nodes.length; i++) {
+      if (i >= loaders.length) continue // fewer loaders than PLLs -> leave untouched (§6.3)
+      applySetToTarget(nodes[i], { loras: lorasForLoaderIndex(setData, i) })
+    }
+    return
+  }
   for (const node of nodes) applySetToTarget(node, setData)
 }
 
@@ -1007,6 +1141,40 @@ function pushStateToNodes(nodes, slug) {
     if (pushStateToNode(node, slug)) count++
   }
   return count
+}
+
+/**
+ * FORMAT.md §6.2/§6.3 (2026-07-20, §4.1 nice-to-have): when `node`'s
+ * `mirrors loader` tag names a SPECIFIC PLL (not "(any)"), also set that
+ * Apply node's `loader_slot` widget to the tagged PLL's ascending-id rank
+ * among the graph's PLLs — so pushing a composite state to a WAN-style pair
+ * of tagged Apply nodes lands each one on its own slice with zero manual
+ * "reveal loader_slot and type 1" step. Best-effort and silent: a tag of
+ * "(any)" (no natural single slot), a missing/never-tagged widget, a
+ * `loader_slot` widget that isn't there (older workflow, or `sets.js`
+ * failed to load), or a tag whose PLL id no longer resolves are all left
+ * COMPLETELY ALONE — this never touches the `set` widget Push State's core
+ * broadcast depends on, so it can never affect that broadcast even when
+ * every early-return below fires. A plain `.value =` assignment (not
+ * `setValue()`) is deliberate: `loader_slot` has no live-preview reason to
+ * fire a callback (its only consumer is server-side `apply()` at the next
+ * queue), and a plain assignment is the same restore-safe pattern this
+ * file's own header cites for workflow-load (`configure()`'s
+ * `widget.value = ...`) — see `pushStateToNode()`'s own fallback branch for
+ * the same idiom applied to a widget WITH a meaningful callback.
+ */
+function pushLoaderSlotForTag(node) {
+  const tagWidget = (node.widgets || []).find((w) => w && w.name === MIRRORS_WIDGET_NAME)
+  const tagValue = tagWidget ? String(tagWidget.value || '') : MIRRORS_ANY_VALUE
+  if (tagValue === MIRRORS_ANY_VALUE) return
+  const index = pllAscendingIndexById(pllIdFromLabel(tagValue))
+  if (index == null) return
+  const slotWidget = (node.widgets || []).find(
+    (w) => w && w.name === APPLY_SET_LOADER_SLOT_WIDGET_NAME
+  )
+  if (!slotWidget || slotWidget.value === index) return
+  slotWidget.value = index
+  node.setDirtyCanvas(true, true)
 }
 
 // ------------------------------------------------------------ node registration
@@ -1119,6 +1287,20 @@ export function registerControllerNode() {
       _guarded(label, fn) {
         try {
           fn()
+        } catch (error) {
+          api.warn(`${NODE_TITLE}: ${label} failed`, error)
+        }
+      }
+
+      /**
+       * Async sibling of `_guarded()` above — a plain try/catch cannot catch
+       * a rejected Promise, so an `await`-ing caller (e.g. `_doPush()`'s
+       * best-effort loader_slot sync, FORMAT.md §6.2/§4.1) needs this
+       * instead. Same contract: never throws back to the caller.
+       */
+      async _guardedAsync(label, fn) {
+        try {
+          await fn()
         } catch (error) {
           api.warn(`${NODE_TITLE}: ${label} failed`, error)
         }
@@ -1592,6 +1774,18 @@ export function registerControllerNode() {
        * FORMAT.md §6.3 amendment: with "All…" selected, APPLY writes the set
        * to every PLL — `targets` may hold 1 or N nodes, `probeTargets`/
        * `applySetToTargets` already handle both uniformly.
+       *
+       * 2026-07-20 §4.1 composite extension: a format-2 `full` (has
+       * `loaders`) is sliced per FORMAT.md §6.3's two composite-apply rules
+       * — see `applySetToTargets()`'s doc comment for the exact mechanics;
+       * this method only computes the one extra piece it can't derive by
+       * itself (`loaderIndexForSingle`, meaningful only for a single,
+       * non-"All" target — `pllAscendingIndex()`) and builds the toast,
+       * including the §6.3 "fewer loaders than targets" mismatch note. A
+       * format-1 `full` (no `loaders`) takes EXACTLY the same path as
+       * before this addition — `isComposite` is false, so every branch
+       * below that's gated on it is skipped, and the final toast is
+       * byte-for-byte the old message.
        */
       async _doApply() {
         const targets = resolveTargetNodes(this._w.target?.value)
@@ -1606,17 +1800,41 @@ export function registerControllerNode() {
           return
         }
         const full = await api.getJson('/lora_library/set', { slug: entry.slug })
-        applySetToTargets(targets, full)
-        this._probeAndUpdateStatus()
-        const rows = (full.loras || []).length
+        const isComposite = Array.isArray(full?.loaders) && full.loaders.length > 0
         const targetDesc =
           targets.length > 1
             ? `${targets.length} Power Lora Loaders`
             : `${targets[0].title || targets[0].type} #${targets[0].id}`
+
+        if (isComposite && targets.length > 1) {
+          applySetToTargets(targets, full)
+          this._probeAndUpdateStatus()
+          // Targets beyond `full.loaders.length` were left UNTOUCHED by
+          // applySetToTargets() above (§6.3: "never guess") — say so
+          // explicitly rather than describing them via `lorasForLoaderIndex()`'s
+          // clamp, which would misleadingly report the LAST loader's row
+          // count for a target that didn't actually receive it.
+          const rowsDesc = targets
+            .map((_node, i) => (i < full.loaders.length ? `L${i} ${lorasForLoaderIndex(full, i).length}` : `L${i} untouched`))
+            .join(', ')
+          const shortBy = targets.length - full.loaders.length
+          const mismatch =
+            shortBy > 0
+              ? ` (state has ${full.loaders.length} loader${full.loaders.length === 1 ? '' : 's'} — ` +
+                `${shortBy} target${shortBy === 1 ? '' : 's'} left untouched)`
+              : ''
+          this._toast('success', NODE_TITLE, `Applied "${full.name}" -> ${targetDesc} (${rowsDesc})${mismatch}.`)
+          return
+        }
+
+        const loaderIndexForSingle = isComposite ? pllAscendingIndex(targets[0]) : null
+        applySetToTargets(targets, full, { loaderIndexForSingle })
+        this._probeAndUpdateStatus()
+        const rows = isComposite ? lorasForLoaderIndex(full, loaderIndexForSingle).length : (full.loras || []).length
         this._toast(
           'success',
           NODE_TITLE,
-          `Applied "${full.name}" -> ${targetDesc} (${rows} row${rows === 1 ? '' : 's'} each).`
+          `Applied "${full.name}" -> ${targetDesc} (${rows} row${rows === 1 ? '' : 's'}${targets.length > 1 ? ' each' : ''}).`
         )
       }
 
@@ -1640,9 +1858,41 @@ export function registerControllerNode() {
       }
 
       /**
+       * FORMAT.md §4.1/§6.3 composite read-back toast (2026-07-20): same
+       * read-the-file-back philosophy as `_toastRowsSaved()` above, but
+       * formats a PER-LOADER summary — the spec's own example, "Saved
+       * 'WAN': L0 detailer 0.8 / L1 detailer 0.3" — by running
+       * `summarizeRowsForToast()` (unchanged, reused as-is) over each
+       * loader's rows and slash-joining the per-loader segments.
+       */
+      async _toastCompositeRowsSaved(verb, slug) {
+        try {
+          const saved = await api.getJson('/lora_library/set', { slug })
+          const loaders = Array.isArray(saved.loaders) ? saved.loaders : []
+          const summary = loaders.map((loader, i) => `L${i} ${summarizeRowsForToast(loader.loras)}`).join(' / ')
+          this._toast('success', NODE_TITLE, `${verb} "${saved.name}": ${summary}`)
+        } catch (error) {
+          api.warn(`${NODE_TITLE}: read-back after ${verb} failed`, error)
+          this._toast('warn', NODE_TITLE, `${verb}, but reading it back to confirm failed — see console.`)
+        }
+      }
+
+      /**
        * FORMAT.md §6.3 amendment: with "All…" selected, CAPTURE reads from
        * the lowest-node-id PLL — `targets[0]` after `resolveTargetNodes()`'s
        * ascending sort.
+       *
+       * 2026-07-20 §4.1 composite extension: `targets.length > 1` can ONLY
+       * happen here when "All Power Lora Loaders (N)" is selected with
+       * N>=2 — every other `target` value resolves to 0 or 1 node via
+       * `resolveTargetNode()` singular (see `resolveTargetNodes()`). That
+       * case now captures EVERY target into its own composite slice
+       * (`_captureComposite()`) instead of the lowest-id-only capture below
+       * — FORMAT.md §4.1/§6.3: "each loader keeps its OWN config," replacing
+       * the prior All-target capture behavior for real. The single-target
+       * path below the guard is UNCHANGED from before this addition (the
+       * owner-validated path) — this is a pure ADDITION gated on
+       * `targets.length > 1`, so that path never runs through new code.
        */
       async _doCapture() {
         const targets = resolveTargetNodes(this._w.target?.value)
@@ -1651,9 +1901,15 @@ export function registerControllerNode() {
           this._toast('warn', NODE_TITLE, probe.message)
           return
         }
+        const name = (this._w.name?.value || '').trim() || `State ${this._setsCache.length + 1}`
+
+        if (targets.length > 1) {
+          await this._captureComposite(targets, name)
+          return
+        }
+
         const source = targets[0]
         const loras = await captureRows(source, { debugCapture: !!this.properties[PROP_DEBUG_CAPTURE] })
-        const name = (this._w.name?.value || '').trim() || `State ${this._setsCache.length + 1}`
         const response = await api.postJson('/lora_library/set', {
           set: { format: 1, name, loras, trigger_words: '', notes: '' }
         })
@@ -1661,17 +1917,61 @@ export function registerControllerNode() {
         announceSetsChanged()
         this._selectSetBySlug(response.slug)
         if (this._w.name) this._w.name.value = ''
-        const sourceNote =
-          targets.length > 1 ? ` from ${source.title || source.type} #${source.id} (lowest id of ${targets.length})` : ''
         // FORMAT.md §6.3: "Show status" names the capture-source loader id +
         // row count on every capture/save.
         this._setStatusText(
           `Captured ${loras.length} row${loras.length === 1 ? '' : 's'} from ${source.title || source.type} #${source.id}.`
         )
-        await this._toastRowsSaved('Saved', response.slug, sourceNote)
+        await this._toastRowsSaved('Saved', response.slug, '')
       }
 
-      /** Same lowest-node-id source rule as _doCapture() — Update is a re-capture. */
+      /**
+       * FORMAT.md §4.1/§6.3 composite New State: target = "All Power Lora
+       * Loaders (N)", N>=2. Captures EVERY target's rows via the EXISTING
+       * `captureRows()` (the v0.14.1 serialize-based capture — reused per
+       * loader completely unchanged, not rewritten), in ascending-node-id
+       * order (already guaranteed before `targets` reaches here, by
+       * `resolveTargetNodes()`'s own sort), into one format-2 state:
+       * `loaders[i]` = the i-th PLL's rows, top-level `loras` mirrors
+       * `loaders[0]` (both per FORMAT.md §4.1 — the backend's own
+       * `normalize_set()` also enforces the mirror on save/load, so this is
+       * belt-and-suspenders, not the only place it happens).
+       */
+      async _captureComposite(targets, name) {
+        const debugCapture = !!this.properties[PROP_DEBUG_CAPTURE]
+        const loadersRows = []
+        for (const node of targets) {
+          loadersRows.push(await captureRows(node, { debugCapture }))
+        }
+        const set = {
+          format: 2,
+          name,
+          loaders: loadersRows.map((rows) => ({ loras: rows })),
+          loras: loadersRows[0] || [],
+          trigger_words: '',
+          notes: ''
+        }
+        const response = await api.postJson('/lora_library/set', { set })
+        this._applySetsResponse(response)
+        announceSetsChanged()
+        this._selectSetBySlug(response.slug)
+        if (this._w.name) this._w.name.value = ''
+        this._setStatusText(
+          `Captured ${targets.length} loaders: ` +
+            targets.map((_node, i) => `L${i} ${loadersRows[i].length} row${loadersRows[i].length === 1 ? '' : 's'}`).join(', ') +
+            '.'
+        )
+        await this._toastCompositeRowsSaved('Saved', response.slug)
+      }
+
+      /**
+       * Same lowest-node-id source rule as _doCapture() — Update is a
+       * re-capture. 2026-07-20 §4.1 composite extension: same
+       * `targets.length > 1` guard/split as `_doCapture()` — see that
+       * method's doc comment for why that can only mean "All Power Lora
+       * Loaders (N)", N>=2, and why the single-target path below is
+       * otherwise untouched by this addition.
+       */
       async _doUpdate() {
         const targets = resolveTargetNodes(this._w.target?.value)
         const probe = probeTargets(targets)
@@ -1684,6 +1984,12 @@ export function registerControllerNode() {
           this._toast('warn', NODE_TITLE, 'Pick a saved state first.')
           return
         }
+
+        if (targets.length > 1) {
+          await this._updateComposite(targets, entry)
+          return
+        }
+
         const source = targets[0]
         const loras = await captureRows(source, { debugCapture: !!this.properties[PROP_DEBUG_CAPTURE] })
         // Preserve the existing name/trigger_words/notes; only the rows
@@ -1718,8 +2024,6 @@ export function registerControllerNode() {
         // its own terms is still the right behavior.
         applySetToTargets(targets, { loras })
         this._probeAndUpdateStatus()
-        const sourceNote =
-          targets.length > 1 ? ` from ${source.title || source.type} #${source.id} (lowest id of ${targets.length})` : ''
         // FORMAT.md §6.3: "Show status" names the capture-source loader id +
         // row count on every capture/save — set AFTER _probeAndUpdateStatus()
         // above so this is the status line's final word for this action,
@@ -1727,7 +2031,60 @@ export function registerControllerNode() {
         this._setStatusText(
           `Captured ${loras.length} row${loras.length === 1 ? '' : 's'} from ${source.title || source.type} #${source.id}.`
         )
-        await this._toastRowsSaved('Updated', entry.slug, sourceNote)
+        await this._toastRowsSaved('Updated', entry.slug, '')
+      }
+
+      /**
+       * FORMAT.md §4.1/§6.3 composite Save State: target = "All Power Lora
+       * Loaders (N)", N>=2 — re-captures EVERY target into the SAME
+       * selected slug (a format-2 overwrite), same "Update is a re-capture"
+       * rule the single-target half of `_doUpdate()` already follows;
+       * preserves the existing name/trigger_words/notes exactly like that
+       * single-target path (best-effort GET, falls back to rows-only).
+       */
+      async _updateComposite(targets, entry) {
+        const debugCapture = !!this.properties[PROP_DEBUG_CAPTURE]
+        const loadersRows = []
+        for (const node of targets) {
+          loadersRows.push(await captureRows(node, { debugCapture }))
+        }
+        let name = entry.name
+        let trigger_words = ''
+        let notes = ''
+        try {
+          const existing = await api.getJson('/lora_library/set', { slug: entry.slug })
+          name = existing.name ?? name
+          trigger_words = existing.trigger_words ?? ''
+          notes = existing.notes ?? ''
+        } catch (error) {
+          api.warn(`${NODE_TITLE}: could not read existing set before update; overwriting rows only`, error)
+        }
+        const set = {
+          format: 2,
+          name,
+          loaders: loadersRows.map((rows) => ({ loras: rows })),
+          loras: loadersRows[0] || [],
+          trigger_words,
+          notes
+        }
+        const response = await api.postJson('/lora_library/set', { slug: entry.slug, set })
+        this._applySetsResponse(response)
+        announceSetsChanged()
+        this._selectSetBySlug(entry.slug)
+        // Re-apply immediately — same rationale the single-target half
+        // documents above (keeps every OTHER target in sync, makes Save
+        // State visibly "take"); composite-aware apply (loaders[i] ->
+        // targets[i] by ascending id, same rule `_doApply()` uses) via the
+        // just-built `set` payload, echoing back exactly what was just
+        // captured.
+        applySetToTargets(targets, set)
+        this._probeAndUpdateStatus()
+        this._setStatusText(
+          `Captured ${targets.length} loaders: ` +
+            targets.map((_node, i) => `L${i} ${loadersRows[i].length} row${loadersRows[i].length === 1 ? '' : 's'}`).join(', ') +
+            '.'
+        )
+        await this._toastCompositeRowsSaved('Updated', entry.slug)
       }
 
       async _doDelete() {
@@ -1779,12 +2136,41 @@ export function registerControllerNode() {
           return
         }
         const count = pushStateToNodes(applyNodes, entry.slug)
+        // FORMAT.md §6.2/§6.3 (2026-07-20, §4.1 nice-to-have): best-effort
+        // loader_slot sync for composite states — see
+        // `_syncLoaderSlotsForPush()`/`pushLoaderSlotForTag()`. Wrapped in
+        // `_guardedAsync` so a failure here (a slow/failed GET, an
+        // unexpected response shape) can NEVER affect the push above, which
+        // has already completed by this line — this is strictly additive,
+        // never a precondition for the toast below or the broadcast itself.
+        await this._guardedAsync('push loader_slot sync', () => this._syncLoaderSlotsForPush(applyNodes, entry.slug))
         const scopeNote = pushingAll ? '' : ` (target: "${targetValue}")`
         this._toast(
           'success',
           NODE_TITLE,
           `Pushed "${entry.name}" to ${count} Apply LoRA Set node${count === 1 ? '' : 's'}${scopeNote}.`
         )
+      }
+
+      /**
+       * Best-effort loader_slot sync (FORMAT.md §6.2/§6.3, 2026-07-20
+       * nice-to-have for the WAN flow): when the just-pushed state is a
+       * §4.1 composite (format 2), also set each pushed Apply node's
+       * `loader_slot` to its `mirrors loader` tag's ascending-id index
+       * among the graph's PLLs (`pushLoaderSlotForTag()`) — so a WAN pair
+       * of tagged Apply nodes lands on its own slice with no manual "reveal
+       * loader_slot and type 1" step. Deliberately skipped ENTIRELY for a
+       * format-1 state: nothing to slice, and `loader_slot` is spec'd to be
+       * ignored there anyway, so there's no reason to touch a hidden widget
+       * the user never revealed for the common single-loader case — the
+       * validated Push State path for a format-1 state runs through zero
+       * new code beyond this one extra GET (see caller: any failure here is
+       * caught by `_guardedAsync` and never reaches the push itself).
+       */
+      async _syncLoaderSlotsForPush(applyNodes, slug) {
+        const full = await api.getJson('/lora_library/set', { slug })
+        if (!Array.isArray(full?.loaders) || !full.loaders.length) return // format-1: nothing to sync
+        for (const node of applyNodes) pushLoaderSlotForTag(node)
       }
     }
 

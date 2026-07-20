@@ -99,6 +99,15 @@ class LoraLibraryApplySet:
     empty stack and empty trigger words — a set that briefly doesn't resolve
     must not fail the whole prompt (same posture as an individual missing
     lora, FORMAT.md §4).
+
+    A §4.1 COMPOSITE (format-2) set holds one row-list per loader
+    (``loaders[i].loras``); ``loader_slot`` (default 0) picks which one this
+    node applies, via :func:`sets_store.loras_for_slot`. A plain format-1 set
+    ignores ``loader_slot`` and always applies its single ``loras`` — so two
+    ``Apply LoRA Set`` nodes pointed at the SAME composite state but
+    different ``loader_slot`` values apply different loras and report
+    different ``loras_text`` (the fix for the owner's "both Apply nodes show
+    the same loras_text" report).
     """
 
     CATEGORY = "EPSNodes"
@@ -124,6 +133,19 @@ class LoraLibraryApplySet:
                     "FLOAT",
                     {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05},
                 ),
+                # FORMAT.md §6.2/§4.1 (2026-07-20 composite fix): which
+                # loader's slice of a §4.1 COMPOSITE (format-2) state to
+                # apply — 0 = the first loader (and the whole config for a
+                # plain format-1 state, where this is ignored). Same
+                # optional/default-kwarg rationale as strength_scale above:
+                # HIDDEN by default behind a `Show loader slot` node
+                # property (sets.js), so most single-loader users never see
+                # it, and a hand-built /prompt that omits it must still
+                # queue and get slot 0 rather than a rejection.
+                "loader_slot": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 63, "step": 1},
+                ),
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
             },
@@ -141,15 +163,20 @@ class LoraLibraryApplySet:
         cls,
         set: str,
         strength_scale: float = 1.0,
+        loader_slot: int = 0,
         model: Any = None,
         clip: Any = None,
     ) -> str:
-        return f"{set}:{_set_file_token(_context, set)}:{strength_scale}"
+        # loader_slot is included so switching slots on the SAME composite
+        # state (same file, same mtime/size) still re-executes — the file
+        # token alone can't see that (FORMAT.md §6.2/§4.1).
+        return f"{set}:{_set_file_token(_context, set)}:{strength_scale}:{loader_slot}"
 
     def apply(
         self,
         set: str,
         strength_scale: float = 1.0,
+        loader_slot: int = 0,
         model: Any = None,
         clip: Any = None,
     ) -> tuple[Any, Any, list[tuple[str, float, float]], str, str]:
@@ -170,8 +197,15 @@ class LoraLibraryApplySet:
             logger.warning("lora_library: set %r has no file on disk; passthrough", set)
             return model, clip, [], "", ""
 
+        # FORMAT.md §4.1/§6.2: picks the loader_slot-th loader's rows for a
+        # composite (format-2) state; a plain format-1 state ignores
+        # loader_slot entirely and returns its single `loras` unchanged —
+        # this is the exact fix for "two Apply LoRA Set nodes on the same
+        # composite state show identical loras_text" (they now select
+        # different slices below, so the loras_text built from them differs
+        # too).
         stack: list[tuple[str, float, float]] = []
-        for row in set_data["loras"]:
+        for row in sets_store.loras_for_slot(set_data, loader_slot):
             if not row["on"]:
                 continue
             resolved = sets_store.resolve_lora(context, row["file"])

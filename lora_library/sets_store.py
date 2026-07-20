@@ -1,11 +1,11 @@
-"""On-disk storage for LoRA sets (FORMAT.md §4).
+"""On-disk storage for LoRA sets (FORMAT.md §4/§4.1).
 
 One JSON file per set under ``context.sets_dir()``. This module owns the
 whole §4 file lifecycle (slug derivation, validation/defaults, atomic
-save/load/list/delete) and the §4 lora-resolution rule; ``routes_sets.py``
-and ``nodes_sets.py`` both build on it and never touch the filesystem
-directly. No ComfyUI imports here — same importable-without-ComfyUI seam as
-``context.py`` (see its module docstring).
+save/load/list/delete), the §4.1 composite multi-loader schema, and the §4
+lora-resolution rule; ``routes_sets.py`` and ``nodes_sets.py`` both build on
+it and never touch the filesystem directly. No ComfyUI imports here — same
+importable-without-ComfyUI seam as ``context.py`` (see its module docstring).
 """
 
 from __future__ import annotations
@@ -19,8 +19,13 @@ from .context import LibraryContext, _atomic_write_text
 
 logger = logging.getLogger("lora_library")
 
-#: FORMAT.md §4 — the only ``format`` value this reader understands.
-CURRENT_FORMAT = 1
+#: FORMAT.md §4/§4.1 — the highest ``format`` value this reader understands.
+#: Bumped 1 -> 2 for the §4.1 composite multi-loader schema (owner ask
+#: 2026-07-20). Note that this ceiling only ever rejects a GENUINELY newer
+#: format: a file *labeled* ``"format": 2`` (or higher) but missing a usable
+#: ``loaders`` key still degrades gracefully to format 1 — see
+#: :func:`normalize_set`.
+CURRENT_FORMAT = 2
 
 #: Characters kept by :func:`slugify`; everything else is dropped outright
 #: (v1 deliberately does not transliterate unicode/emoji — FORMAT.md §4).
@@ -93,37 +98,76 @@ def _coerce_float(value: object, field_name: str) -> float:
     return float(value)
 
 
-def _normalize_row(index: int, row: object) -> dict:
+def _normalize_row(index: int, row: object, label: str = "loras") -> dict:
+    """One ``loras[]`` entry, validated. *label* is the name used in error
+    messages (default ``"loras"`` for the top-level list — every existing
+    §4 message is byte-identical to before this parameter existed; §4.1
+    composite entries pass ``"loaders[i].loras"`` so a bad row inside a
+    specific loader names that loader).
+    """
     if not isinstance(row, dict):
-        raise SetValidationError(f"loras[{index}] must be an object — FORMAT.md §4")
+        raise SetValidationError(f"{label}[{index}] must be an object — FORMAT.md §4")
     file = row.get("file")
     if not isinstance(file, str) or not file:
-        raise SetValidationError(f"loras[{index}] is missing a 'file' — FORMAT.md §4")
+        raise SetValidationError(f"{label}[{index}] is missing a 'file' — FORMAT.md §4")
     strength_clip_raw = row.get("strength_clip")
     strength_clip = (
         None
         if strength_clip_raw is None
-        else _coerce_float(strength_clip_raw, f"loras[{index}].strength_clip")
+        else _coerce_float(strength_clip_raw, f"{label}[{index}].strength_clip")
     )
     return {
         "file": file,
         "on": bool(row.get("on", True)),
-        "strength": _coerce_float(row.get("strength", 1.0), f"loras[{index}].strength"),
+        "strength": _coerce_float(row.get("strength", 1.0), f"{label}[{index}].strength"),
         "strength_clip": strength_clip,
     }
 
 
+def _normalize_loras_list(loras_raw: object, label: str = "loras") -> list[dict]:
+    """A whole ``loras[]`` array, validated row by row. *label* — see
+    :func:`_normalize_row`; also used in the "must be a list" message so it
+    reads e.g. ``set 'loaders[0].loras' must be a list``.
+    """
+    if not isinstance(loras_raw, list):
+        raise SetValidationError(f"set '{label}' must be a list — FORMAT.md §4")
+    return [_normalize_row(i, row, label) for i, row in enumerate(loras_raw)]
+
+
 def normalize_set(raw: object) -> dict:
     """Validate *raw* (parsed JSON or a request body's ``set``) into a
-    canonical FORMAT.md §4 dict, applying every documented default.
+    canonical FORMAT.md §4/§4.1 dict, applying every documented default.
+
+    The OUTPUT format is derived STRUCTURALLY from whether *raw* has a
+    usable ``loaders`` key — never copied from (or defaulted to) whatever
+    ``format`` int *raw* declares or omits:
+
+    - A ``loaders`` key that is a non-empty list normalizes to the §4.1
+      composite shape: ``{"format": 2, ..., "loaders": [...], "loras":
+      <copy of loaders[0].loras>}``. The top-level ``loras`` mirror is
+      ALWAYS recomputed from ``loaders[0]`` here, regardless of whatever
+      *raw*'s own top-level ``loras`` said, so the two can never drift.
+    - Anything else — no ``loaders`` key at all, or one that is present but
+      malformed (not a list, or an empty list) — normalizes to the plain
+      format-1 shape (no ``loaders`` key in the result), using the
+      top-level ``loras``. A malformed-but-present ``loaders`` is logged
+      and degraded rather than rejected ("never crash on malformed"); this
+      is also FORMAT.md §4.1's documented graceful-degrade rule for a
+      hand-edited file: "no loaders key" (functionally) is format 1
+      regardless of the declared ``format`` int.
 
     Raises :class:`SetValidationError` — never a bare ``KeyError``/``TypeError``
     — so callers (routes, the loader below) can surface one clear message.
+    This still only covers the same classes of malformed input it always
+    did (non-dict payload/row, bad field types, a ``format`` newer than this
+    pack understands); §4.1's ``loaders[i]`` entries follow the identical
+    posture (a non-object entry, or a bad row inside one, raises exactly
+    like a bad top-level row always has).
     """
     if not isinstance(raw, dict):
         raise SetValidationError("a set must be a JSON object — FORMAT.md §4")
 
-    fmt = raw.get("format", CURRENT_FORMAT)
+    fmt = raw.get("format", 1)
     if not isinstance(fmt, int) or isinstance(fmt, bool):
         raise SetValidationError("set 'format' must be an integer — FORMAT.md §4")
     if fmt > CURRENT_FORMAT:
@@ -136,11 +180,6 @@ def normalize_set(raw: object) -> dict:
     if not isinstance(name, str):
         raise SetValidationError("set 'name' must be a string — FORMAT.md §4")
 
-    loras_raw = raw.get("loras", [])
-    if not isinstance(loras_raw, list):
-        raise SetValidationError("set 'loras' must be a list — FORMAT.md §4")
-    loras = [_normalize_row(i, row) for i, row in enumerate(loras_raw)]
-
     trigger_words = raw.get("trigger_words", "")
     if not isinstance(trigger_words, str):
         raise SetValidationError("set 'trigger_words' must be a string — FORMAT.md §4")
@@ -149,13 +188,79 @@ def normalize_set(raw: object) -> dict:
     if not isinstance(notes, str):
         raise SetValidationError("set 'notes' must be a string — FORMAT.md §4")
 
+    loaders_raw = raw.get("loaders")
+    if isinstance(loaders_raw, list) and loaders_raw:
+        loaders = []
+        for i, loader_raw in enumerate(loaders_raw):
+            if not isinstance(loader_raw, dict):
+                raise SetValidationError(f"loaders[{i}] must be an object — FORMAT.md §4.1")
+            loras = _normalize_loras_list(loader_raw.get("loras", []), f"loaders[{i}].loras")
+            loaders.append({"loras": loras})
+        return {
+            "format": 2,
+            "name": name,
+            "loaders": loaders,
+            # §4.1: ALWAYS kept in sync with loaders[0] — never trust *raw*'s
+            # own top-level `loras`, so the mirror can never drift.
+            "loras": [dict(row) for row in loaders[0]["loras"]],
+            "trigger_words": trigger_words,
+            "notes": notes,
+        }
+
+    if loaders_raw is not None:
+        # Present but malformed (wrong type, or a genuinely empty list) —
+        # FORMAT.md §4.1 "never crash on malformed": log and degrade to a
+        # single-loader (format 1) set from the top-level `loras`, rather
+        # than rejecting the whole set outright.
+        logger.warning(
+            "lora_library: set %r has a malformed/empty 'loaders' (%r); "
+            "degrading to a single-loader (format 1) set — FORMAT.md §4.1",
+            name,
+            loaders_raw,
+        )
+
+    loras = _normalize_loras_list(raw.get("loras", []))
     return {
-        "format": CURRENT_FORMAT,
+        "format": 1,
         "name": name,
         "loras": loras,
         "trigger_words": trigger_words,
         "notes": notes,
     }
+
+
+def loras_for_slot(state: object, slot: int) -> list[dict]:
+    """The lora rows *state* stores for loader index *slot* (FORMAT.md §4.1).
+
+    Format-2 *state* (a ``loaders`` key holding a non-empty list) returns
+    ``state["loaders"][clamp(slot, 0, len(loaders) - 1)]["loras"]`` — *slot*
+    clamps into range instead of raising, per §4.1's "index out of range
+    clamps to the last available loader (never errors)". Anything else
+    (format-1, or a *state* whose ``loaders`` is missing/malformed/empty)
+    returns ``state["loras"]``.
+
+    NEVER RAISES: *state* not being a dict, ``loaders``/``loras`` not being
+    lists, a loader entry not being a dict, or *slot* not being coercible to
+    ``int`` all degrade to the safest available fallback (ultimately ``[]``)
+    rather than throwing — this is meant to be safe to call from
+    ``nodes_sets.py``'s ``apply()`` against a state that came from
+    :func:`normalize_set` (already well-shaped) just as readily as from a
+    hand-built/legacy dict that never went through it.
+    """
+    if not isinstance(state, dict):
+        return []
+    loaders = state.get("loaders")
+    if isinstance(loaders, list) and loaders:
+        try:
+            index = int(slot)
+        except (TypeError, ValueError):
+            index = 0
+        index = max(0, min(index, len(loaders) - 1))
+        loader = loaders[index]
+        loras = loader.get("loras") if isinstance(loader, dict) else None
+        return loras if isinstance(loras, list) else []
+    loras = state.get("loras")
+    return loras if isinstance(loras, list) else []
 
 
 # -------------------------------------------------------------- persistence

@@ -188,8 +188,44 @@ One JSON file per set: `<library_dir>/sets/<slug>.json`, UTF-8, format:
 }
 ```
 
-- `format`: integer, currently `1`. Readers reject greater values with a
-  clear "update the pack" error and tolerate missing optional fields.
+- `format`: integer, `1` or `2` (see §4.1). Readers reject GREATER values
+  with a clear "update the pack" error and tolerate missing optional fields.
+
+### §4.1 Format 2 — composite multi-loader state (owner ask 2026-07-20)
+
+For the WAN high/low workflow (two+ Power Lora Loaders, each with its OWN
+distinct set), a state may store per-loader configs. Format 2 ADDS a
+`loaders` array; it is fully backward/forward-compatible:
+
+```json
+{
+  "format": 2,
+  "name": "WAN hi+lo",
+  "loaders": [
+    {"loras": [ {"file": "...", "on": true, "strength": 0.8, "strength_clip": null} ]},
+    {"loras": [ {"file": "...", "on": true, "strength": 0.3, "strength_clip": null} ]}
+  ],
+  "loras": [ {"file": "...", "on": true, "strength": 0.8, "strength_clip": null} ],
+  "trigger_words": "",
+  "notes": ""
+}
+```
+
+- `loaders[i].loras` = the i-th loader's rows, ordered by ascending node id at
+  capture time (loader 0 = the lowest-id Power Lora Loader). Each `loras` list
+  obeys every §4 rule (order = apply order, separator-insensitive resolve,
+  `on:false` kept-not-applied, `strength_clip:null`).
+- `loras` (top level) is MIRRORED = `loaders[0].loras`, so a format-1-only
+  reader (old pack, or any consumer that only knows `loras`) still gets a
+  sane single-loader config instead of nothing. Writers MUST keep it in sync
+  with `loaders[0]`.
+- A **format-1** state (no `loaders`) is a single-loader config: applying it
+  to N loaders applies the same `loras` to all (the pre-2026-07-20 behavior,
+  unchanged). Readers treat "no `loaders` key" as format 1 regardless of the
+  `format` integer, so a hand-edited file degrades gracefully.
+- Consumers pick their slice by INDEX (see §6.2 Apply `loader_slot`, §6.3
+  controller capture/apply). Index out of range clamps to the last available
+  loader (never errors).
 - `loras[]` order **is** application order (reordering is a first-class
   feature). `file` holds the lora exactly as ComfyUI lists it
   (`folder_paths.get_filename_list("loras")`) — NOTE that ComfyUI uses the
@@ -295,9 +331,21 @@ execution — **the file is the truth; the UI is a view.**
   `detailer_0.8_0.4`) — `stem` = basename without extension, strengths
   post-`strength_scale` formatted `%g`, tokens space-joined; `""` when
   nothing applied.
-- Behavior: loads the §4 file; applies enabled rows IN ORDER via the same
-  core machinery ComfyUI's own LoraLoader uses, when `model`/`clip` are
-  wired; always emits `LORA_STACK` = `[(file, strength_model,
+- **`loader_slot` (INT, optional, default 0, owner ask 2026-07-20, §4.1):**
+  which loader's slice of a COMPOSITE (format-2) state to apply. `0` = the
+  first loader (and the whole config for a plain format-1 state, where the
+  slot is ignored). For the WAN workflow: an Apply node representing the high
+  loader uses slot 0, the low loader uses slot 1 — so two Apply nodes on the
+  SAME composite state produce DISTINCT `loras_text` (this is the fix for the
+  owner's "both Apply nodes show the same loras_text" report — same root
+  cause as the controller's shared-config bug). Out-of-range clamps to the
+  last loader. HIDDEN by default behind a `Show loader slot` node property
+  (same declutter pattern as `strength_scale`); most single-loader users
+  never see it. In `optional` (API-omit-safe), default 0.
+- Behavior: loads the §4 file; selects the slice per `loader_slot` when the
+  file is format 2 (else the single `loras`); applies enabled rows IN ORDER
+  via the same core machinery ComfyUI's own LoraLoader uses, when
+  `model`/`clip` are wired; always emits `LORA_STACK` = `[(file, strength_model,
   strength_clip), …]` for enabled rows (efficiency-nodes-compatible) and
   `trigger_words`. With no model/clip wired the node is a pure
   stack/trigger source. `"None"` (or a missing/unresolvable set) with
@@ -345,6 +393,27 @@ Apply node regardless of tag; an Apply tagged `"(any)"` is included in
 every push. The toast reports the count. This is the sync mechanism for
 "different Apply nodes represent different loaders, one controller keeps
 each group in step." It also double-serves as an explicit re-apply.
+
+**Composite multi-loader capture/apply (owner ask 2026-07-20, §4.1
+format 2): with target = `All Power Lora Loaders (N)`, each loader keeps its
+OWN config.** The prior behavior — capture read only the lowest-id PLL and
+apply wrote that one config to ALL — is replaced FOR THE `All` TARGET ONLY:
+- **New State / Save State with target `All`:** capture EVERY PLL's rows, in
+  ascending-node-id order, into a §4.1 format-2 state (`loaders[i]` = the
+  i-th PLL). Also mirror `loras` = `loaders[0]` (§4.1). The read-back toast
+  summarizes per loader ("Saved 'WAN': L0 detailer 0.8 / L1 detailer 0.3").
+- **Selecting/applying a format-2 state with target `All`:** apply
+  `loaders[i]` to the i-th PLL by ascending id; if the state has FEWER
+  loaders than the graph, extra PLLs are left untouched (never guess) and a
+  toast notes the mismatch; extra state loaders beyond the PLLs are ignored.
+- **Single-PLL target** (target = one specific loader): capture writes a
+  plain format-1 state (that one loader's rows). Applying a format-2 state to
+  a single target uses the slice for THAT loader's ascending-id index among
+  the graph's PLLs (clamped), so single-targeting the low loader restores the
+  low slice; a format-1 state applies its single `loras` as before.
+- **Backward compatible:** a format-1 state through target `All` still
+  applies its one config to every PLL (unchanged). Nothing about the
+  single-loader common case changes.
 
 **State selection must not depend on widget-internals (2026-07-19c
 hardening).** v0.12.0's apply-on-select shadowed the combo's `setValue` —
@@ -587,6 +656,56 @@ is the functional core WITHOUT the grid.
 - **Deferred (M3–M4):** NAS presets (reuse `lora_library`
   context/sets_store/settings), multi-image list fan-out. Do NOT build them
   yet.
+
+## §6.6 `EPSImageGrid` (display: "EPS Image Grid") — accumulate + fan out
+
+Roadmap/research: `research/roadmap-eps-image-grid.md`, `research-eps-image-grid.md`.
+NON-lora node in `eps_image/`, category "EPSNodes". Class id `EPSImageGrid`
+frozen once shipped (§8). Owner decisions locked 2026-07-20 (see roadmap):
+Collect/Emit toggle; copy/paste = OS clipboard + ComfyUI clipspace + Ctrl+V
+add; single batch-aware IMAGE input; disk-backed, survive-restart, NO cap.
+
+- **Inputs:** `image` (IMAGE, optional — a Run with it wired-and-present in
+  Collect mode appends; batch-aware: a `[B,H,W,C]` input adds all B frames).
+- **Widgets:** `mode` (COMBO `Collect`/`Emit`, default `Collect`);
+  `grid_uuid` (STRING, HIDDEN — the per-node identity mirrored from
+  `node.properties.uuid`, the `EPSSwitcher.toggles` serialized-hidden-widget
+  trick, so the backend can key the buffer; frontend generates + dedupes it).
+- **Outputs (fan-out):** `image`, `width` (INT), `height` (INT);
+  `RETURN_NAMES=("image","width","height")`, `OUTPUT_IS_LIST=(True,True,True)`
+  — N buffered images make the workflow run N times, each with its paired
+  width/height. Each emitted image is a `[1,H,W,C]` batch-of-one in a plain
+  Python list (NEVER stacked — buffered images may differ in size).
+- **Execution model:** `OUTPUT_NODE = True` (so it runs even with nothing
+  wired downstream — collect phase) + `IS_CHANGED` returns an
+  always-different token (`float("nan")`) so caching never skips it → exactly
+  one execution (= at most one append of the batch) per queued prompt. In
+  `Collect` mode `execute()` appends the present input (if any) to the buffer
+  then emits the whole buffer; in `Emit` mode it appends nothing, only emits.
+  Returns the `{"ui":{"images":[…whole buffer…]}}` shape so ComfyUI core
+  renders the navigable thumbnail grid + pager FOR FREE (no custom widget).
+- **Buffer store (disk, survives restart):** under ComfyUI's OUTPUT dir so
+  core's `/view` serves the thumbnails AND it survives restart —
+  `<comfy output>/eps_image_grid/<grid_uuid>/NNNN.png` + a `manifest.json`
+  (order/metadata), atomic writes (`_atomic_write_text` pattern). NOT temp
+  (`cleanup_temp()` wipes it). No cap (owner decision); Clear wipes the dir.
+  PNG-on-disk; decode to tensors lazily at emit.
+- **Identity/dedup:** `grid_uuid` generated (`crypto.randomUUID()`) into
+  `node.properties.uuid` + the hidden widget on first create; on copy/paste
+  and cross-workflow load a collision check (`loadedGraphNode` + deferred
+  `nodeCreated`) against live siblings mints a fresh uuid (litegraph only
+  self-heals its numeric `id`). Regex-validate the uuid before any fs use.
+- **Clear:** a frontend Clear button → `POST /eps_image_grid/clear {uuid}`
+  (on `PromptServer.instance.routes`, never raw `app.add_routes`).
+- **Copy/paste (M2):** copy a selected grid cell to the OS clipboard
+  (`canvas→toBlob('image/png')→ClipboardItem`, the shipped `copyImage`
+  pattern) AND to ComfyUI clipspace (populate `node.images`/`imgs`); Ctrl+V
+  on the selected node uploads the pasted image (`POST /upload/image`) and
+  appends it (`POST /eps_image_grid/add`).
+- **Milestones:** M1 = collect/emit + buffer + fan-out + free grid + Clear +
+  identity/dedup; M2 = copy/paste (both targets) + Ctrl+V add; M3 = buffer
+  management (per-image remove, count, reorder, batch-count guard). No cap in
+  v1. No module-scope torch/ComfyUI import (lazy inside functions).
 
 ## §7 Frontend surfaces
 

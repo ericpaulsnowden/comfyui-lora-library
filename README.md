@@ -85,8 +85,14 @@ whole configurations ("states") in and out of it:
   the armed button turns red).
 - **Multi-loader targeting:** with two or more Power Lora Loaders in the
   graph (WAN high/low noise, for example) the target dropdown offers
-  `All Power Lora Loaders (N)` — one state pick updates every loader;
-  capture reads from the lowest-numbered one.
+  `All Power Lora Loaders (N)`. With `All` selected, a state stores **each
+  loader's OWN config** (a "composite" state): New/Save State captures every
+  loader distinctly, and picking that state restores each loader to its own
+  rows — so one state file holds your whole WAN high+low setup. To feed those
+  distinct configs into the standalone `Apply LoRA Set` loaders, give each
+  Apply node a `loader_slot` (0 = first loader, 1 = second, …; revealed via
+  right-click → Properties → `Show loader slot`). Single-loader states are
+  unchanged and fully backward-compatible.
 - A debug `status` line is hidden by default — right-click the node →
   Properties → `Show status` to reveal it.
 - **If a saved state ever disagrees with what you set on the loader**, the
