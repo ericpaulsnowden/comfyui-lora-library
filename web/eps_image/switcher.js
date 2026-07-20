@@ -25,6 +25,43 @@
  *    for exactly the duration of THIS node's own `configure()` call, and a
  *    single converge pass runs in `finally` once `this.inputs` is stable.
  *
+ *    **Round-10 dead-rewire fix**: the LIVE `onConnectionsChange` path (a
+ *    real user drag, not `configure()`) now SCHEDULES `convergeImageInputs`
+ *    via `setTimeout(fn, 0)` instead of calling it synchronously, guarded so
+ *    a burst of events coalesces into one deferred run (`wireImageInputGrowth`
+ *    below). Root cause investigated per owner report ("rewiring a socket
+ *    that was disconnected while toggled off goes dead"): `LGraphNode.ts`'s
+ *    `removeInput(slot)` (~1726) calls `this.disconnectInput(slot, true)`
+ *    FIRST, and `disconnectInput` (~3240) itself dispatches
+ *    `this.onConnectionsChange?.(...)` (~3321) BEFORE it returns -- so the
+ *    trailing-collapse case (disconnecting the HIGHEST connected `image_N`,
+ *    where 2+ trailing empties must collapse to 1) previously called
+ *    `node.removeInput()` on that SAME slot SYNCHRONOUSLY from inside
+ *    litegraph's own `disconnectInput` call for that slot, splicing
+ *    `this.inputs` while litegraph (and whatever mouse-gesture code called
+ *    `disconnectInput`) was still mid-call on it. Live-verified with real
+ *    drags against the dev rig's frontend (ComfyUI 0.28.0 /
+ *    comfyui-frontend-package 1.45.21): this specific reentrant splice did
+ *    NOT corrupt `this.inputs` there (nothing after the `onConnectionsChange`
+ *    dispatch inside `disconnectInput` re-touches the slot by index; verified
+ *    by reading to the end of the function) -- both the middle-gap and
+ *    trailing-collapse disconnect/rewire sequences below (see `attach`'s
+ *    call sites) worked via real mouse drags every time, and a queued fan-out
+ *    run afterward produced the correct output count. The bug therefore
+ *    could NOT be reproduced on 1.45.21. It is exactly the kind of
+ *    internal-timing assumption that can differ on another frontend build
+ *    (the owner's ComfyUI 0.28.1, never re-verified here -- see the file-level
+ *    0.28.1 caveat), so deferring the restructuring past the entire
+ *    synchronous mouse-event chain is shipped anyway, defensively: by the
+ *    time the `setTimeout` fires, no litegraph-internal call frame is still
+ *    holding a slot index or input reference into `this.inputs`, so the
+ *    restructuring can never race a caller that assumes indices stay put.
+ *    `configure()`'s own post-restore converge above is UNCHANGED (still
+ *    synchronous, in `finally`, once per `configure()` call) -- that path is
+ *    never nested inside a live litegraph mutation, so deferring it would
+ *    only add risk (e.g. a paste/undo immediately followed by another
+ *    `configure()` before the deferred call fires) for no benefit.
+ *
  * 2. **Per-row on/off toggle** -- rgthree Power Lora Loader's per-row dot
  *    (`web/comfyui/power_lora_loader.js` `PowerLoraLoaderWidget.onToggleDown`)
  *    is UX borrowed, not code: PLL's rows are pure WIDGETS (a lora's
@@ -92,6 +129,38 @@
  *    the last image_N socket" rather than literally above the title. This
  *    is a deliberate M1 trade-off, not an oversight.
  *
+ * 4. **Renamable rows** (round-10, FORMAT.md §6.4 "Renamable rows") --
+ *    double-clicking an `image_N` row opens `LGraphCanvas.prompt` (confirmed
+ *    present on this fork; falls back to `window.prompt` otherwise) and
+ *    sets `input.label`, display-only: `input.name` and every `toggles` key
+ *    stay the frozen `image_N` (backend contract untouched -- confirmed live
+ *    by inspecting the actual `/prompt` payload a queued run sends: it
+ *    carries only names, never a label). Two hooks cover the whole row
+ *    because litegraph dispatches double-clicks differently depending on
+ *    WHERE they land: `onInputDblClick(index, e)` fires for a click within
+ *    litegraph's OWN input hit-region (the socket dot and its name/label
+ *    text -- `LGraphCanvas.ts`'s inputs loop registers this and `return`s
+ *    before reaching anything else); `onDblClick(e, pos, canvas)` fires for
+ *    a click anywhere ELSE in the node body -- our toggle checkbox (point 2
+ *    above; deliberately outside that same input hit-region) or blank row
+ *    space. Both were live-verified (real double-clicks, both a connected
+ *    row and the trailing spare). The header widget's own clicks are
+ *    dispatched through a third, earlier branch (`getWidgetOnPos` /
+ *    `processWidgetClick`), so `onDblClick` never fires for it; the title
+ *    bar is excluded explicitly (`pos[1] < 0`, litegraph's own signal for
+ *    "this was the title"). `drawRowToggles` (point 2) measures `label ||
+ *    name` (not just `name`) for its width math, matching
+ *    `measureSlots.ts`'s own precedence, so a long label can't collide with
+ *    the toggle box. **Persistence**: FORMAT.md §6.4 asks to verify
+ *    `input.label` survives save/reload before trusting it, with a
+ *    node-property fallback if the fork drops it. Confirmed unnecessary
+ *    here on two levels: `node/slotUtils.ts`'s `inputAsSerialisable`
+ *    (called from `LGraphNode.serialize()`) explicitly destructures `label`
+ *    into the serialized POJO, and a live round trip (rename a connected
+ *    row AND the spare, reload the page, re-read `node.inputs[i].label`)
+ *    came back unchanged both times. Plain `input.label` is therefore the
+ *    only mechanism used -- no node-property map.
+ *
  * **`toggles` is the enabled-set bridge to the backend** (module docstring,
  * `eps_image/nodes_switcher.py`): a hidden (`.hidden = true`, same trick
  * FORMAT.md §7.2 uses for the Prompt Notebook's `file` widget) STRING
@@ -114,6 +183,8 @@
  * error, on purpose.
  */
 
+import { app } from '../../../scripts/app.js'
+
 const CLASS_ID = 'EPSSwitcher'
 const PREFIX = '[eps_image:switcher]'
 const IMAGE_INPUT_RE = /^image_(\d+)$/
@@ -127,6 +198,11 @@ const ROW_BOX = 12
 //: LEFT-anchored rather than measured from the node's right edge.
 const ROW_LABEL_PAD = 12
 const ROW_MIN_X = 92
+//: Half-height of the Y band (around a row's getConnectionPos) that counts
+//: as "this row" for double-click rename hit-testing (file header point 4).
+//: Rows are ~20px apart (litegraph's default slot height); 9 leaves a small
+//: deadzone between adjacent rows rather than an ambiguous overlap.
+const ROW_HIT_HALF_HEIGHT = 9
 const HEADER_BOX = 12
 const HEADER_ROW_HEIGHT = 20
 const MIN_NODE_WIDTH = 200
@@ -327,7 +403,40 @@ function convergeImageInputs(node) {
  * @param {object} node
  */
 function wireImageInputGrowth(node) {
-  const state = { restoring: false }
+  const state = { restoring: false, convergeScheduled: false }
+
+  /**
+   * Runs the actual convergeImageInputs() pass for a DEFERRED (live,
+   * post-setTimeout) call. Guarded against a `configure()` having started
+   * in the meantime (that path runs its own synchronous converge in
+   * `finally` once restore completes, so a deferred call left over from
+   * before the configure() would be redundant at best) and against the
+   * node having been removed from the graph while the timeout was pending.
+   * @param {object} target
+   */
+  function runDeferredConverge(target) {
+    state.convergeScheduled = false
+    if (state.restoring || !target.graph) return
+    try {
+      convergeImageInputs(target)
+    } catch (error) {
+      console.warn(PREFIX, 'convergeImageInputs (deferred) failed', error)
+    }
+  }
+
+  /**
+   * Schedules ONE convergeImageInputs() pass on the next macrotask --
+   * see the file header's "Round-10 dead-rewire fix" for why this is
+   * deferred rather than synchronous. `convergeScheduled` coalesces a burst
+   * of connect/disconnect events (e.g. a fast drag) into a single pass, so
+   * this is safe to call from every qualifying onConnectionsChange.
+   * @param {object} target
+   */
+  function scheduleConverge(target) {
+    if (state.convergeScheduled) return
+    state.convergeScheduled = true
+    setTimeout(() => runDeferredConverge(target), 0)
+  }
 
   const originalConfigure = node.configure
   node.configure = function (...args) {
@@ -351,11 +460,7 @@ function wireImageInputGrowth(node) {
       result = originalOnConnectionsChange.apply(this, arguments)
     }
     if (!state.restoring && IMAGE_INPUT_RE.test(inputOrOutput?.name || '')) {
-      try {
-        convergeImageInputs(this)
-      } catch (error) {
-        console.warn(PREFIX, 'convergeImageInputs (onConnectionsChange) failed', error)
-      }
+      scheduleConverge(this)
     }
     return result
   }
@@ -455,9 +560,13 @@ function drawRowToggles(node, ctx) {
       continue
     }
     const localY = pos[1] - node.pos[1]
-    // getNodeInputOnPos's reserved width for THIS row's own name, so a
-    // longer name (image_12, image_137, ...) still clears its own hit-zone.
-    const inputHitWidth = 20 + entry.name.length * 7
+    // getNodeInputOnPos's reserved width for THIS row's own DISPLAYED text
+    // (FORMAT.md §6.4 "Renamable rows"): litegraph draws `label || name` and
+    // measureSlots.ts's getNodeInputOnPos sizes ITS OWN hit-region off the
+    // same `label ?? localized_name ?? name` precedence, so a renamed row
+    // with a long label needs the same width bump here, or the toggle box
+    // would start drawing on top of litegraph's now-wider input hit-zone.
+    const inputHitWidth = 20 + displayText(entry.input).length * 7
     const boxX = Math.max(inputHitWidth + ROW_LABEL_PAD, ROW_MIN_X)
     const boxY = localY - ROW_BOX / 2
     drawToggleBox(ctx, boxX, boxY, ROW_BOX, isRowEnabled(node, entry.name), false)
@@ -571,6 +680,154 @@ function addHeaderWidget(node) {
 }
 
 // ---------------------------------------------------------------------------
+// Double-click rename (FORMAT.md §6.4 "Renamable rows"; see file header
+// point 4)
+// ---------------------------------------------------------------------------
+
+/**
+ * The text litegraph actually draws for *input* -- `label || name`, per
+ * FORMAT.md §6.4 and measureSlots.ts's own precedence
+ * (`input.label?.length ?? input.localized_name?.length ?? input.name?.length`).
+ * @param {object} input
+ * @returns {string}
+ */
+function displayText(input) {
+  return (input && (input.label || input.name)) || ''
+}
+
+/**
+ * Sets or clears *input*'s display label. `input.name` (the backend
+ * kwargs/serialization contract) and the `toggles` map's keys (also names)
+ * are untouched -- purely a display-layer change (FORMAT.md §6.4). An
+ * empty/whitespace *label* resets to the socket name: the property is
+ * DELETED rather than set to `""`, so `displayText`/litegraph's own
+ * `label || name` fallback shows `name` again immediately.
+ * @param {object} node
+ * @param {object} input
+ * @param {string} label
+ */
+function setInputLabel(node, input, label) {
+  const trimmed = (label ?? '').trim()
+  if (trimmed) input.label = trimmed
+  else delete input.label
+  node.graph?.setDirtyCanvas(true, true)
+}
+
+/**
+ * Opens the rename editor for *input*: `LGraphCanvas.prompt` when this fork
+ * has it (confirmed present on the dev rig's 1.45.21 -- `LGraphCanvas.ts`
+ * `prompt(title, value, callback, event, multiline)`, the small styled
+ * dialog rgthree's own widgets use), else a plain `window.prompt` fallback
+ * so renaming still works on a fork that dropped the custom dialog.
+ * `window.prompt` returns `null` on Cancel but `""` on an intentional
+ * OK-with-empty-field -- `commit` only skips the `null` case, so clearing
+ * the field still resets the label per FORMAT.md §6.4.
+ * @param {object} node
+ * @param {object} input
+ * @param {object|null} canvas
+ * @param {Event} event
+ */
+function promptForLabel(node, input, canvas, event) {
+  const commit = (value) => {
+    if (value == null) return
+    setInputLabel(node, input, value)
+  }
+  if (canvas && typeof canvas.prompt === 'function') {
+    canvas.prompt('Label', displayText(input), commit, event)
+  } else {
+    commit(window.prompt('Label', displayText(input)))
+  }
+}
+
+/**
+ * Best-effort active LGraphCanvas for callbacks that don't receive one
+ * directly (`onInputDblClick` below) -- same `app.canvas` access pattern
+ * already used by lora_library/controller.js.
+ * @returns {object|null}
+ */
+function activeCanvas() {
+  return app?.canvas ?? null
+}
+
+/**
+ * @param {object} node
+ * @param {number} localY node-local Y (graph Y minus node.pos[1])
+ * @returns {{idx: number, n: number, name: string, input: object}|null} the
+ *   image_N row at *localY* -- connected or the trailing spare -- or null
+ *   if no row is close enough.
+ */
+function rowAtLocalY(node, localY) {
+  if (typeof node.getConnectionPos !== 'function') return null
+  for (const entry of imageInputEntries(node)) {
+    let pos
+    try {
+      pos = node.getConnectionPos(true, entry.idx)
+    } catch (error) {
+      continue
+    }
+    if (Math.abs(localY - (pos[1] - node.pos[1])) <= ROW_HIT_HALF_HEIGHT) return entry
+  }
+  return null
+}
+
+/**
+ * Wraps `onInputDblClick` and `onDblClick` so double-clicking an `image_N`
+ * row -- connected or the trailing spare -- opens the rename prompt.
+ * `onInputDblClick(index, e)` fires when the double-click lands within
+ * litegraph's OWN input hit-region (the socket dot and its name/label text,
+ * per `measureSlots.ts` `getNodeInputOnPos` -- `LGraphCanvas.ts`'s inputs
+ * loop registers this and `return`s BEFORE reaching the widget-or-background
+ * branch, so it and `onDblClick` are mutually exclusive per click).
+ * `onDblClick(e, pos, canvas)` fires for a double-click anywhere ELSE inside
+ * the node body -- e.g. our toggle checkbox area (deliberately drawn outside
+ * litegraph's input hit-region, see file header point 2) or blank space in
+ * the row. The header widget's clicks are dispatched via
+ * `getWidgetOnPos`/`processWidgetClick` -- a THIRD, earlier branch in that
+ * same function -- so a double-click on the header never reaches
+ * `onDblClick` at all, and the title bar is excluded explicitly below via
+ * `pos[1] < 0` (litegraph's own "this was the title" signal, per
+ * `LGraphCanvas.ts`'s dblclick dispatch). Together the two hooks cover the
+ * whole visual row (FORMAT.md §6.4's "double-clicking an image_N row")
+ * without reproducing litegraph's own hit-region math twice.
+ * @param {object} node
+ */
+function wireRowRename(node) {
+  const originalOnInputDblClick = node.onInputDblClick
+  node.onInputDblClick = function (index, e) {
+    let result
+    if (typeof originalOnInputDblClick === 'function') {
+      result = originalOnInputDblClick.apply(this, arguments)
+    }
+    try {
+      const input = this.inputs?.[index]
+      if (input && IMAGE_INPUT_RE.test(input.name || '')) {
+        promptForLabel(this, input, activeCanvas(), e)
+      }
+    } catch (error) {
+      console.warn(PREFIX, 'onInputDblClick rename failed', error)
+    }
+    return result
+  }
+
+  const originalOnDblClick = node.onDblClick
+  node.onDblClick = function (e, pos, canvas) {
+    let result
+    if (typeof originalOnDblClick === 'function') {
+      result = originalOnDblClick.apply(this, arguments)
+    }
+    try {
+      if (Array.isArray(pos) && pos[1] >= 0) {
+        const entry = rowAtLocalY(this, pos[1])
+        if (entry) promptForLabel(this, entry.input, canvas || activeCanvas(), e)
+      }
+    } catch (error) {
+      console.warn(PREFIX, 'onDblClick rename failed', error)
+    }
+    return result
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Node width floor (keeps the per-row toggle box clear of both the input
 // label hit-region and the single `images` output's hit-region -- see file
 // header point 2)
@@ -615,6 +872,7 @@ export function attach(node) {
     wireRowToggleDrawing(node)
     wireRowToggleClicks(node)
     addHeaderWidget(node)
+    wireRowRename(node)
   } catch (error) {
     console.warn(PREFIX, 'attach failed', error)
   }

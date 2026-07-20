@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import sys
+import types
 
 import pytest
 
@@ -20,6 +22,39 @@ from eps_image.nodes_switcher import EPSSwitcher, _FlexibleOptionalImageInputs
 def _toggles(**overrides: bool) -> str:
     """A `toggles` JSON string, e.g. `_toggles(image_2=False)`."""
     return json.dumps(overrides)
+
+
+@pytest.fixture
+def fake_execution_blocker(monkeypatch: pytest.MonkeyPatch):
+    """Installs a fake ``comfy_execution.graph`` module exposing
+    ``ExecutionBlocker`` into ``sys.modules`` -- mirrors the ``fake_comfy``
+    convention in ``tests/test_resolution.py``/``test_nodes_sets.py`` (this
+    pack's tests never require a real ComfyUI install on the path).
+    ``EPSSwitcher.execute``'s all-off path imports ``ExecutionBlocker``
+    lazily from exactly this module path (FORMAT.md §6.4), so installing the
+    fake here is the whole story -- nothing in ``nodes_switcher`` itself
+    needs patching. Returns the fake class so tests can ``isinstance()``
+    the returned blocker.
+    """
+
+    class FakeExecutionBlocker:
+        """Mirrors the real ``comfy_execution.graph_utils.ExecutionBlocker``
+        (``__init__(self, message)`` storing ``self.message``) exactly
+        enough for these tests -- an identity/attribute check, since
+        nodes_switcher.py never does anything else with the instance.
+        """
+
+        def __init__(self, message: object) -> None:
+            self.message = message
+
+    fake_graph = types.ModuleType("comfy_execution.graph")
+    fake_graph.ExecutionBlocker = FakeExecutionBlocker
+    fake_pkg = types.ModuleType("comfy_execution")
+    fake_pkg.graph = fake_graph
+
+    monkeypatch.setitem(sys.modules, "comfy_execution", fake_pkg)
+    monkeypatch.setitem(sys.modules, "comfy_execution.graph", fake_graph)
+    return FakeExecutionBlocker
 
 
 # --------------------------------------------------------- flexible inputs
@@ -163,31 +198,101 @@ class TestExecuteCollectsEnabledInAscendingOrder:
         assert result == (["img1"],)
 
 
-class TestEnforceAtLeastOneEnabled:
-    def test_nothing_connected_raises_naming_no_connections(self) -> None:
-        node = EPSSwitcher()
-        with pytest.raises(ValueError, match="no image inputs are connected"):
-            node.execute(toggles=_toggles())
+class TestAllOffOrNoneConnectedReturnsAnExecutionBlocker:
+    """FORMAT.md §6.4 "All-off / none-connected is a VALID state" (owner
+    decision 2026-07-20, superseding the v0.14.0 behavior these tests used
+    to cover -- a queue-time ``ValueError``): queueing with nothing
+    connected, or everything toggled off, must SUCCEED. ``execute`` returns
+    a one-element list holding a silent (``message=None``)
+    ``ExecutionBlocker`` instead of raising.
+    """
 
-    def test_all_connected_but_toggled_off_raises_naming_the_count(self) -> None:
+    def test_nothing_connected_returns_a_one_element_blocker_list(
+        self, fake_execution_blocker: type
+    ) -> None:
         node = EPSSwitcher()
-        with pytest.raises(ValueError, match="3 image input"):
+        result = node.execute(toggles=_toggles())
+        assert isinstance(result, tuple)
+        assert len(result) == 1
+        assert isinstance(result[0], list)
+        assert len(result[0]) == 1
+        blocker = result[0][0]
+        assert isinstance(blocker, fake_execution_blocker)
+        # `message=None` matters: execution.py's own `execution_block_cb`
+        # only broadcasts an `execution_error` websocket event when
+        # `.message is not None` -- a message here would turn our graceful
+        # skip back into a reported error.
+        assert blocker.message is None
+
+    def test_nothing_connected_logs_at_info_not_warning_or_error(
+        self, fake_execution_blocker: type, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = EPSSwitcher()
+        with caplog.at_level(logging.INFO, logger="eps_image"):
+            node.execute(toggles=_toggles())
+        assert any(
+            "no image inputs are connected" in record.message for record in caplog.records
+        )
+        assert all(record.levelno <= logging.INFO for record in caplog.records)
+
+    def test_all_connected_but_toggled_off_returns_a_one_element_blocker_list(
+        self, fake_execution_blocker: type
+    ) -> None:
+        node = EPSSwitcher()
+        result = node.execute(
+            toggles=_toggles(image_1=False, image_2=False, image_3=False),
+            image_1="img1",
+            image_2="img2",
+            image_3="img3",
+        )
+        assert len(result[0]) == 1
+        assert isinstance(result[0][0], fake_execution_blocker)
+        assert result[0][0].message is None
+
+    def test_all_toggled_off_log_names_the_count_and_toggled_off(
+        self, fake_execution_blocker: type, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        node = EPSSwitcher()
+        with caplog.at_level(logging.INFO, logger="eps_image"):
             node.execute(
                 toggles=_toggles(image_1=False, image_2=False, image_3=False),
                 image_1="img1",
                 image_2="img2",
                 image_3="img3",
             )
+        messages = [record.message for record in caplog.records]
+        assert any("3 image input" in message for message in messages)
+        assert any("toggled off" in message for message in messages)
 
-    def test_all_toggled_off_error_mentions_toggled_off(self) -> None:
+    def test_only_none_valued_slots_returns_the_nothing_connected_blocker(
+        self, fake_execution_blocker: type
+    ) -> None:
         node = EPSSwitcher()
-        with pytest.raises(ValueError, match="toggled off"):
-            node.execute(toggles=_toggles(image_1=False), image_1="img1")
+        result = node.execute(toggles=_toggles(), image_1=None, image_2=None)
+        assert len(result[0]) == 1
+        assert isinstance(result[0][0], fake_execution_blocker)
 
-    def test_only_none_valued_slots_raises_the_nothing_connected_message(self) -> None:
+    def test_all_off_does_not_raise(self, fake_execution_blocker: type) -> None:
+        # The headline behavior change, asserted directly rather than only
+        # via return-value shape: this must not raise ANYTHING.
         node = EPSSwitcher()
-        with pytest.raises(ValueError, match="no image inputs are connected"):
-            node.execute(toggles=_toggles(), image_1=None, image_2=None)
+        node.execute(toggles=_toggles(image_1=False), image_1="img1")
+
+    def test_missing_fake_execution_blocker_module_surfaces_as_import_error(self) -> None:
+        # Sanity check on the test fixture's own premise (no
+        # `fake_execution_blocker` requested here): without a real or faked
+        # `comfy_execution.graph` on the path, the lazy import inside the
+        # all-off branch fails loudly rather than silently -- confirms the
+        # other tests above are genuinely exercising that import, not
+        # accidentally passing because ExecutionBlocker was already
+        # importable some other way.
+        import sys as _sys
+
+        if "comfy_execution" in _sys.modules or "comfy_execution.graph" in _sys.modules:
+            pytest.skip("comfy_execution is already importable in this environment")
+        node = EPSSwitcher()
+        with pytest.raises(ModuleNotFoundError):
+            node.execute(toggles=_toggles())
 
 
 # --------------------------------------------------------- class shape / spec

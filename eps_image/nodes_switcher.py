@@ -30,6 +30,14 @@ plain API caller who has never heard of this widget) defaults to enabled,
 which is the least-surprising behavior for the "ComfyUI-only must work"
 floor (bridge design ethos): wiring three images with no ``toggles`` value
 at all should pass all three through, not silently drop them.
+
+**All-off / none-connected is a valid state** (FORMAT.md §6.4, owner
+decision 2026-07-20 -- "there will be times when a user might want to turn
+them all off"). When zero images end up enabled, ``execute`` returns a
+one-element list holding a ``comfy_execution.graph.ExecutionBlocker``
+instead of raising -- a deliberate downgrade from the v0.14.0 behavior (a
+queue-time ``ValueError`` naming the reason). See ``execute``'s own comment
+for why an ``ExecutionBlocker`` beats a bare empty list here.
 """
 
 from __future__ import annotations
@@ -147,6 +155,12 @@ class EPSSwitcher:
     (lazy evaluation) is tracked as M3 (``research/roadmap-eps-switcher.md``),
     not built here.
 
+    Zero enabled images -- everything toggled off, or nothing connected at
+    all -- is a VALID queue, not an error (FORMAT.md §6.4 "All-off /
+    none-connected is a VALID state"): ``execute`` returns an
+    ``ExecutionBlocker`` instead of raising, so the queue succeeds and the
+    downstream image branch simply doesn't run for it.
+
     Re-derives the enabled set from ``toggles`` + the connected ``image_N``
     kwargs on every execution -- there is no other state to go stale, so
     unlike the Prompt Notebook this node needs no ``IS_CHANGED`` override:
@@ -162,9 +176,11 @@ class EPSSwitcher:
     DESCRIPTION = (
         "Toggle any number of image inputs on/off; the enabled ones fan out in "
         "slot order (N enabled -> the rest of the workflow runs N times). "
-        "Caveat: a scalar value (e.g. a seed) wired downstream repeats "
-        "identically across all N runs -- use an explicit per-image list for "
-        "per-image variation."
+        "Turning every input off (or wiring none at all) is a valid state -- "
+        "the queue still succeeds, the downstream image branch just doesn't "
+        "run for it. Caveat: a scalar value (e.g. a seed) wired downstream "
+        "repeats identically across all N runs -- use an explicit per-image "
+        "list for per-image variation."
     )
 
     @classmethod
@@ -211,18 +227,43 @@ class EPSSwitcher:
         ]
 
         if not enabled_images:
-            # FORMAT.md §6.4 "Enforce ≥1 enabled": an empty list can crash a
-            # downstream node whose only input is this list
-            # (`max_len_input == 0` → called with zero kwargs) -- a loud,
-            # clear queue-time error beats that silent crash.
+            # FORMAT.md §6.4 "All-off / none-connected is a VALID state"
+            # (owner decision 2026-07-20, supersedes the v0.14.0 queue-time
+            # ValueError this used to raise here -- "there will be times when
+            # a user might want to turn them all off"). Returning a list
+            # holding a single ExecutionBlocker(None) makes ComfyUI's own
+            # list-fanout machinery (execution.py `merge_result_data`) treat
+            # THIS WHOLE LIST as "blocked": every downstream node whose input
+            # traces back to it is silently skipped -- no `execution_error`
+            # event (that only fires when `.message` is not None, per
+            # execution.py's `execution_block_cb`), no exception, a normal
+            # SUCCESS queue. A bare `[]` was tried and rejected: with no
+            # co-input it still hits the `max_len_input == 0` path and calls
+            # the downstream function with ZERO kwargs (a crash for any node
+            # whose signature requires the list), and mixed with a second,
+            # non-empty list input on the same downstream node it
+            # IndexErrors inside `slice_dict`'s `v[-1]` on an empty list.
+            # Verified live with a real /prompt + /history round trip -- see
+            # tests/test_switcher.py and the round-10 report.
             if not present:
-                raise ValueError(
-                    "EPS Switcher: no image inputs are connected -- wire at "
-                    "least one image_N input"
+                logger.info(
+                    "EPS Switcher: no image inputs are connected -- "
+                    "returning an execution blocker so the queue succeeds "
+                    "and downstream nodes are silently skipped"
                 )
-            raise ValueError(
-                f"EPS Switcher: {len(present)} image input(s) connected but all "
-                "are toggled off -- enable at least one (or remove this node)"
-            )
+            else:
+                logger.info(
+                    "EPS Switcher: %d image input(s) connected but all are "
+                    "toggled off -- returning an execution blocker so the "
+                    "queue succeeds and downstream nodes are silently "
+                    "skipped",
+                    len(present),
+                )
+            # Lazy import: keeps this module importable with no ComfyUI on
+            # the path (module docstring's "no torch/ComfyUI import" promise;
+            # see tests/test_switcher.py's test_module_never_imports_comfy_or_torch).
+            from comfy_execution.graph import ExecutionBlocker
+
+            return ([ExecutionBlocker(None)],)
 
         return (enabled_images,)

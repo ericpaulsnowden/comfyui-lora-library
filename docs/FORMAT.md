@@ -456,9 +456,17 @@ per-input toggle + toggle-all header + N-enabled→N-runs fan-out.
   empty list only propagates safely while every downstream list input comes
   from this node (a node mixing our list with a non-empty co-input hits
   repeat-last on an empty list → IndexError), while an ExecutionBlocker makes
-  core skip dependent nodes silently (rgthree / Impact precedent). Verify the
-  blocker path live under OUTPUT_IS_LIST before shipping; if it misbehaves,
-  fall back to the empty list and record the mixed-input caveat here.
+  core skip dependent nodes silently (rgthree / Impact precedent). VERIFIED
+  LIVE 2026-07-20 (shipped v0.16.0): all-off and none-connected queues
+  succeed (`status_str: success`, no `execution_error`) with zero downstream
+  executions — including when the blocked list feeds a node that mixes it
+  with a non-empty co-input (ImageBlend test). The bare-empty-list
+  alternative was traced in core execution.py and REJECTED: sole-input
+  empty list calls the downstream function with zero kwargs
+  (`max_len_input == 0`), and mixed with a non-empty co-input it
+  IndexErrors in `slice_dict`'s `v[-1]`. `ExecutionBlocker(None)`'s null
+  message is what keeps the skip silent (`execution_block_cb` only errors
+  on a non-None message).
 - **Backend:** a real (non-virtual) node; `INPUT_TYPES` uses the flexible
   optional dict, which also carries the `toggles` STRING bridge (in `optional`,
   NOT `required` — a required input absent from a hand-built `/prompt` is

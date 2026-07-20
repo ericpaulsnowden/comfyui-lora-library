@@ -145,8 +145,13 @@ off means three runs.
   chosen input, EPS Switcher forwards *all* the enabled ones and lets
   ComfyUI iterate. (A scalar wired downstream — e.g. a seed — repeats
   identically across the runs; use a per-image list for per-image
-  variation.) Toggle everything off and it stops with a clear message rather
-  than a confusing downstream crash.
+  variation.)
+- **All off is allowed:** toggle everything off (or wire nothing) and the
+  queue still succeeds — the image branch simply doesn't run that time. No
+  error, no downstream crash.
+- **Double-click a row to rename it:** the label is display-only (wires,
+  toggles, and the backend still see `image_N`), persists with the
+  workflow, and an empty name resets it.
 - Toggle states save with the workflow and survive reload.
 
 ## EPS Resolution (shipped)
