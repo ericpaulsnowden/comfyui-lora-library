@@ -50,6 +50,47 @@
  * validity check: if the tagged PLL id no longer resolves to a live node,
  * it resets the widget to "(any)" right there — no separate heartbeat or
  * `onDrawForeground` hook needed.
+ *
+ * 2026-07-20 addition: FORMAT.md §6.2's `strength_scale` hide-by-default
+ * (owner: "this should be turned off by default ... by default the
+ * strength should pass through what is set in the loader ... it's an edge
+ * case") — `applyStrengthScaleVisibility()`. Two mechanisms combine, each
+ * borrowed from an existing file rather than invented fresh:
+ *  - The HIDE ITSELF mirrors controller.js's `Show status` handling
+ *    exactly: `widget.hidden = true` is a real litegraph layout primitive
+ *    for widget INPUT slots (not a value-blanking trick) — controller.js's
+ *    file header cites `LGraphNode.isWidgetVisible()`/`getLayoutWidgets()`
+ *    branching on `.hidden`, and `computeSize()`/`_arrangeWidgets()`
+ *    building exclusively off that filtered list, so a hidden widget is
+ *    removed from drawing AND layout AND size — later widgets shift up, the
+ *    node visibly shrinks. `drawNode()` calls `node.arrange()`
+ *    unconditionally every frame, so `setDirtyCanvas(true, true)` is the
+ *    only extra step needed, exactly as controller.js's own
+ *    `onPropertyChanged` for `Show status` does it (no manual
+ *    computeSize/setSize bookkeeping). The widget's VALUE is untouched
+ *    either way — hiding is purely cosmetic, so a hidden `strength_scale`
+ *    still serializes and still feeds `apply()` at whatever it's set to
+ *    (default 1.0, i.e. pass-through).
+ *  - The ATTACH-TIME WIRING (property + wrapped `onPropertyChanged` + one
+ *    explicit initial apply call) mirrors `eps_image/resolution.js`'s
+ *    `attach()` instead of controller.js: controller.js owns its ENTIRE
+ *    node class and can define `onPropertyChanged` as a genuine class
+ *    method, but this file — like resolution.js — only gets a per-instance
+ *    `nodeCreated` hook on a node class it does NOT own (the real,
+ *    Python-declared `LoraLibraryApplySet`), so it must wrap whatever
+ *    `node.onPropertyChanged` already is (there is none today, but wrapping
+ *    is still the defensive, no-cross-module-assumption move) rather than
+ *    assign a class method. Same reasoning resolution.js's file header
+ *    documents in detail ("Defaults flipped to OFF"): `addProperty()` is a
+ *    silent `this.properties[name] = default_value` — it never fires
+ *    `onPropertyChanged` and never touches the widget — so a fresh node
+ *    needs one explicit `applyStrengthScaleVisibility()` call right after
+ *    wiring. A RELOADED node gets that same explicit call too (harmless —
+ *    idempotent), because `nodeCreated` always runs BEFORE
+ *    `LGraphNode.configure()` for a saved workflow; `configure()`'s own
+ *    properties-merge loop runs immediately after and calls the wrapped
+ *    `onPropertyChanged` for whatever the saved file actually has, so the
+ *    saved value always wins last regardless of call order.
  */
 
 import { app } from '../../../scripts/app.js'
@@ -64,6 +105,14 @@ const POWER_LORA_LOADER_TYPE = 'Power Lora Loader (rgthree)'
 /** FORMAT.md §6.2 `mirrors loader` tag — widget name + its "no PLL selected" default value. controller.js's `MIRRORS_WIDGET_NAME`/`MIRRORS_ANY_VALUE` mirror these by hand (same convention as NODE_CLASS/WIDGET_NAME above). */
 const MIRRORS_WIDGET_NAME = 'mirrors loader'
 const MIRRORS_ANY_VALUE = '(any)'
+
+/** FORMAT.md §6.2 (2026-07-20): the `strength_scale` widget name (a real,
+ * Python-declared widget — lora_library/nodes_sets.py's INPUT_TYPES) + the
+ * node property that reveals it, default false. See file header for why
+ * this hides via controller.js's `.hidden` pattern but wires up via
+ * resolution.js's per-instance attach()/onPropertyChanged idiom. */
+const STRENGTH_SCALE_WIDGET_NAME = 'strength_scale'
+const PROP_SHOW_STRENGTH_SCALE = 'Show strength scale'
 
 /** §7.4 freshness beats thrift here, but don't hammer on every redraw. */
 const REFRESH_THROTTLE_MS = 2000
@@ -130,6 +179,26 @@ function attachMirrorsWidget(node) {
 }
 
 /**
+ * FORMAT.md §6.2 (2026-07-20): hide/show `strength_scale` per the node's
+ * `Show strength scale` property. Safe to call redundantly (idempotent —
+ * just re-derives `.hidden` from the current property value each time), so
+ * both the one-time attach call and every live `onPropertyChanged` fire can
+ * share this one function. No-ops quietly if the widget isn't found (e.g. a
+ * future backend rename) rather than throwing.
+ * @param {object} node
+ */
+function applyStrengthScaleVisibility(node) {
+  const widget = (node.widgets ?? []).find((w) => w.name === STRENGTH_SCALE_WIDGET_NAME)
+  if (!widget) return
+  // See file header: `.hidden` is a real litegraph layout primitive here
+  // (controller.js's `Show status` uses the identical mechanism) — it drops
+  // the row from drawing/layout/size, it does not just blank the value, and
+  // the value itself keeps flowing to apply()/IS_CHANGED() while hidden.
+  widget.hidden = node.properties?.[PROP_SHOW_STRENGTH_SCALE] !== true
+  node.setDirtyCanvas(true, true)
+}
+
+/**
  * Per-instance hook (called from lora_library.js `nodeCreated`); no-op for
  * every node type except LoraLibraryApplySet.
  * @param {object} node
@@ -154,6 +223,25 @@ export function attachApplySetBehavior(node) {
   // ComfyUI's own Python-declared widgets already exist, which is always
   // true by the time `nodeCreated` fires.
   attachMirrorsWidget(node)
+
+  // FORMAT.md §6.2 (2026-07-20): `Show strength scale` node property, default
+  // false — right-click Properties reveals the widget. addProperty() alone
+  // only seeds `node.properties`; it never fires onPropertyChanged and never
+  // touches the widget (see file header's "2026-07-20 addition" section for
+  // why this file wraps onPropertyChanged, resolution.js-style, rather than
+  // defining it as a class method the way controller.js does), so an
+  // explicit applyStrengthScaleVisibility() call right after wiring is what
+  // actually hides it on a fresh node.
+  node.addProperty(PROP_SHOW_STRENGTH_SCALE, false, 'boolean')
+
+  const originalOnPropertyChanged = node.onPropertyChanged
+  node.onPropertyChanged = function (name, value, prevValue) {
+    const result = originalOnPropertyChanged?.call(this, name, value, prevValue)
+    if (name === PROP_SHOW_STRENGTH_SCALE) applyStrengthScaleVisibility(this)
+    return result
+  }
+
+  applyStrengthScaleVisibility(node)
 }
 
 /** One-time wiring at extension setup: seed the cache so the first dropdown

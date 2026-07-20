@@ -111,12 +111,19 @@ class LoraLibraryApplySet:
         return {
             "required": {
                 "set": (_slug_options(), {"default": "None"}),
+            },
+            "optional": {
+                # FORMAT.md §6.2 (2026-07-20 amendment): optional, not
+                # required — owner ask: strength_scale is an edge-case
+                # override the frontend hides by default (sets.js), and a
+                # hand-built /prompt that omits it must get the apply()/
+                # IS_CHANGED() default (1.0 = clean pass-through of the
+                # set's own stored strengths) instead of a "required input
+                # missing" rejection.
                 "strength_scale": (
                     "FLOAT",
                     {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05},
                 ),
-            },
-            "optional": {
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
             },
@@ -133,7 +140,7 @@ class LoraLibraryApplySet:
     def IS_CHANGED(
         cls,
         set: str,
-        strength_scale: float,
+        strength_scale: float = 1.0,
         model: Any = None,
         clip: Any = None,
     ) -> str:
@@ -142,7 +149,7 @@ class LoraLibraryApplySet:
     def apply(
         self,
         set: str,
-        strength_scale: float,
+        strength_scale: float = 1.0,
         model: Any = None,
         clip: Any = None,
     ) -> tuple[Any, Any, list[tuple[str, float, float]], str, str]:

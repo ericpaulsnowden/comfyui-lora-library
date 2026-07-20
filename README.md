@@ -120,7 +120,10 @@ LOW branch, each with its own state.) Outputs:
   `detailer_0.8_0.4`; values reflect `strength_scale`). Wire it into
   captions, filenames, or notes.
 
-`strength_scale` multiplies every applied strength (quick global A/B).
+`strength_scale` multiplies every applied strength (quick global A/B) — an
+edge-case override that's **hidden by default** so the node passes the set's
+own strengths straight through; reveal it with right-click → Properties →
+`Show strength scale`.
 States are JSON files in `<library folder>/sets/` — captured from a Power
 Lora Loader by the State Controller, created via the API, or hand-edited. Loras
 referenced by a set resolve **separator-insensitively** with a unique-

@@ -214,6 +214,40 @@ def test_strength_scale_multiplies_both_model_and_clip_strengths(
     assert calls[0][4] == pytest.approx(0.3)  # 0.2 * 1.5
 
 
+def test_apply_omitting_strength_scale_defaults_to_pass_through(
+    context: LibraryContext, fake_comfy
+) -> None:
+    """FORMAT.md §6.2 (2026-07-20 amendment): strength_scale now lives in
+    `optional`, so a hand-built /prompt that omits it entirely must still
+    queue and apply — Python's own default (1.0) takes over, which is a
+    clean pass-through of each row's stored strengths, unscaled."""
+    slug = _make_set(
+        context,
+        loras=[
+            {"file": "detailer.safetensors", "on": True, "strength": 0.8, "strength_clip": 0.4}
+        ],
+    )
+    node = nodes_sets.LoraLibraryApplySet()
+    model_out, clip_out, stack, trigger_words, _loras_text_out = node.apply(
+        set=slug, model=FakeModel(), clip=FakeClip()
+    )  # strength_scale intentionally omitted
+    calls, _ = fake_comfy
+    assert calls[0][3] == pytest.approx(0.8)  # unscaled model strength
+    assert calls[0][4] == pytest.approx(0.4)  # unscaled clip strength
+    assert stack == [("detailer.safetensors", pytest.approx(0.8), pytest.approx(0.4))]
+    assert trigger_words == "cinematic, detailed"
+    assert model_out is not None
+    assert clip_out is not None
+
+
+def test_is_changed_omitting_strength_scale_defaults_to_one(context: LibraryContext) -> None:
+    """Same default-kwarg contract as apply() above, for IS_CHANGED()."""
+    slug = _make_set(context)
+    token_omitted = nodes_sets.LoraLibraryApplySet.IS_CHANGED(set=slug)
+    token_explicit = nodes_sets.LoraLibraryApplySet.IS_CHANGED(set=slug, strength_scale=1.0)
+    assert token_omitted == token_explicit
+
+
 def test_no_model_or_clip_wired_is_a_pure_stack_and_trigger_source(
     context: LibraryContext, fake_comfy
 ) -> None:
@@ -397,8 +431,13 @@ def test_input_types_default_is_none(context: LibraryContext) -> None:
 
 
 def test_input_types_strength_scale_widget_matches_format_md(context: LibraryContext) -> None:
+    """FORMAT.md §6.2 (2026-07-20 amendment): strength_scale moved from
+    required to optional (default/min/max/step unchanged) so a hand-built
+    /prompt that omits it gets the apply()/IS_CHANGED() pass-through default
+    instead of a "required input missing" rejection."""
     input_types = nodes_sets.LoraLibraryApplySet.INPUT_TYPES()
-    widget_type, spec = input_types["required"]["strength_scale"]
+    assert "strength_scale" not in input_types["required"]
+    widget_type, spec = input_types["optional"]["strength_scale"]
     assert widget_type == "FLOAT"
     assert spec == {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05}
 
