@@ -27,9 +27,39 @@ logger = logging.getLogger("lora_library")
 #: FORMAT.md §4 — set slugs; also the only characters accepted in URLs.
 SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-_]*$")
 
-#: FORMAT.md §5 — the fs/list sentinel meaning "the top level": every drive
-#: on Windows, the single filesystem root on POSIX.
+#: ../../STANDARD-fs-browse.md's `dir` sentinel meaning "the virtual top
+#: level": this pack's own default library directory (labeled), "Home", and
+#: every drive on Windows / every `/Volumes` mount on macOS.
 ROOTS = "ROOTS"
+
+#: STANDARD-fs-browse.md's locality policy for THIS pack, as an explicit,
+#: documented, build-time flag (not a request-time param -- flipping this via
+#: a query string would let any caller downgrade their own security posture).
+#: `True` here is epsnodes' pre-existing posture (FORMAT.md §5: file browsing
+#: is host-machine-only) -- porting to the shared contract must never
+#: silently flip a pack's posture. Contrast cpsb's own (deliberately `False`)
+#: flag for the same route shape.
+FS_LIST_LOCAL_ONLY: bool = True
+
+#: STANDARD-fs-browse.md's `ext` query param default/allowlist for this
+#: pack's picker -- Prompt Notebook files are always `.md` (FORMAT.md §2).
+DEFAULT_EXTENSIONS = (".md",)
+
+#: STANDARD-fs-browse.md ROOTS listing label for this pack's own default
+#: fs/list directory (`context.library_dir()` -- this pack's OWN folder, user
+#: -configurable, unlike cprb's ComfyUI-owned `output_dir`; FORMAT.md §5).
+_FS_LIST_DEFAULT_DIR_LABEL = "Library Folder"
+
+#: Same for the user's home directory (always present, regardless of platform).
+_FS_LIST_HOME_LABEL = "Home"
+
+#: Cap on combined `dirs` + `files` entries returned by one
+#: `/lora_library/fs/list` listing (root or directory) -- so a directory with
+#: an enormous number of children can't turn one request into a
+#: multi-megabyte response. Counts only entries actually emitted -- a huge
+#: pile of hidden dotfiles or extension-filtered-out files never consumes a
+#: slot.
+_FS_LIST_MAX_ENTRIES = 500
 
 
 # --------------------------------------------------------------------- guards
@@ -101,13 +131,108 @@ def _is_windows() -> bool:
 def _list_windows_drives() -> list[str]:
     """Every existing drive's root, e.g. ``["C:\\\\", "D:\\\\"]``.
 
-    Backs the ``dir="ROOTS"`` sentinel on Windows. Probes A-Z with
-    ``Path.exists()`` — factored out to its own function so tests replace
-    it wholesale instead of needing real drives to exist.
+    Backs the ``dir="ROOTS"`` sentinel's platform tail on Windows
+    (:func:`_platform_root_entries`). Probes A-Z with ``Path.exists()`` —
+    factored out to its own function so tests replace it wholesale instead of
+    needing real drives to exist.
     """
     return [
         f"{letter}:\\" for letter in string.ascii_uppercase if Path(f"{letter}:\\").exists()
     ]
+
+
+def _list_macos_volumes() -> list[str]:
+    """Every mounted volume under ``/Volumes`` on a macOS (or other POSIX) host.
+
+    Backs the ``dir="ROOTS"`` sentinel's platform tail on POSIX
+    (:func:`_platform_root_entries`) -- ``/Volumes`` always contains at least
+    a symlink back to the boot volume (e.g. ``Macintosh HD``) plus one entry
+    per externally-mounted disk/network share, exactly the set a user reaches
+    for when they mean "browse by volume" the way Finder's own sidebar does.
+    Hidden entries are skipped (same convention the directory-listing branch
+    of ``get_fs_list`` uses) and a stat failure on any one entry is skipped
+    rather than aborting the whole root listing. Factored out to its own
+    function, like :func:`_list_windows_drives`, so tests replace it wholesale.
+    """
+    volumes_dir = Path("/Volumes")
+    if not volumes_dir.is_dir():
+        return []
+    try:
+        entries = sorted(volumes_dir.iterdir(), key=lambda p: p.name.casefold())
+    except OSError:
+        return []
+    volumes = []
+    for entry in entries:
+        if entry.name.startswith("."):
+            continue
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            continue
+        if is_dir:
+            volumes.append(str(entry))
+    return volumes
+
+
+def _fs_entry(name: str, path: Path) -> dict[str, str]:
+    """A labeled, directly-navigable ROOTS entry: ``{"name", "path"}``.
+
+    STANDARD-fs-browse.md's general contract is names-only (the client joins
+    ``dir``+``sep``+``name`` for a REAL directory listing), but a ROOTS entry
+    (this pack's default library dir, "Home", a `/Volumes` mount, a Windows
+    drive) has no single parent directory to join against -- each one is
+    independently rooted, so the server hands back its actual absolute path
+    directly. A deliberate, documented, additive extension of the base
+    schema: any consumer that only reads ``name`` still gets a sensible label.
+    """
+    return {"name": name, "path": str(path)}
+
+
+def _platform_root_entries(windows: bool) -> list[dict[str, str]]:
+    """STANDARD-fs-browse.md ROOTS listing's platform-specific tail.
+
+    Every existing drive letter on Windows (:func:`_list_windows_drives`,
+    labeled by its short drive-letter form, e.g. ``"C:"``), or every mounted
+    ``/Volumes`` entry on macOS/other POSIX (:func:`_list_macos_volumes`,
+    labeled by its bare volume name, e.g. ``"Macintosh HD"``).
+    """
+    if windows:
+        return [_fs_entry(raw.rstrip("\\"), Path(raw)) for raw in _list_windows_drives()]
+    return [_fs_entry(Path(raw).name, Path(raw)) for raw in _list_macos_volumes()]
+
+
+def _fs_list_roots(context: LibraryContext, *, windows: bool) -> list[dict[str, str]]:
+    """The top-level entries for ``dir="ROOTS"`` (STANDARD-fs-browse.md).
+
+    Always: this pack's own default fs/list directory (labeled
+    :data:`_FS_LIST_DEFAULT_DIR_LABEL`) and the user's home directory, then
+    :func:`_platform_root_entries`'s platform-specific tail -- the standard's
+    exact ROOTS ordering ("the pack's default dir first (labeled) ... 'Home',
+    then platform roots"). 2026-07-19: previously POSIX's ``ROOTS`` resolved
+    straight to a real listing of ``/``; this labeled-roots shape (already
+    used on Windows) now applies uniformly on every platform.
+    """
+    roots = [
+        _fs_entry(_FS_LIST_DEFAULT_DIR_LABEL, context.library_dir().resolve()),
+        _fs_entry(_FS_LIST_HOME_LABEL, Path.home().resolve()),
+    ]
+    roots.extend(_platform_root_entries(windows))
+    return roots
+
+
+def _parse_extensions(raw: str) -> tuple[str, ...]:
+    """STANDARD-fs-browse.md's `ext` query param: a comma-separated,
+    case-insensitive extension filter.
+
+    Entries may be given with or without the leading dot. An empty/blank
+    value means "the default allowlist" (:data:`DEFAULT_EXTENSIONS`, just
+    ``.md`` -- this is a Prompt Notebook file picker, not a general file
+    browser) -- mirrors cprb's identical ``_parse_extensions`` helper (same
+    contract, independently implemented per pack per STANDARD-fs-browse.md).
+    """
+    parts = [part.strip().lower() for part in (raw or "").split(",")]
+    cleaned = tuple(f".{p.lstrip('.')}" for p in parts if p.strip(". "))
+    return cleaned or DEFAULT_EXTENSIONS
 
 
 def _is_unc_share_root(directory: Path) -> bool:
@@ -163,41 +288,97 @@ def register_core(context: LibraryContext, routes: web.RouteTableDef) -> None:
 
     @routes.get("/lora_library/fs/list")
     async def get_fs_list(request: web.Request) -> web.Response:
-        # FORMAT.md §5: the §7.2 picker's directory listing. Loopback-only —
-        # a remote browser defers to the host for file selection (§7.2), so
-        # it never needs to walk the server's filesystem. The loopback
-        # check runs before ROOTS/absolute-path handling below: ROOTS is an
-        # exception to the absolute-path requirement, never to this one.
-        if not request_is_loopback(request):
+        """STANDARD-fs-browse.md's shared cross-plugin contract. Gated by
+        :data:`FS_LIST_LOCAL_ONLY` (``True`` for epsnodes -- FORMAT.md §5: a
+        remote browser defers to the host for file selection, so it never
+        needs to walk the server's filesystem). The loopback check runs
+        before ROOTS/absolute-path handling below: ROOTS is an exception to
+        the absolute-path requirement, never to this one.
+
+        Query params:
+            dir: Optional. Empty/omitted resolves to this pack's own default
+                directory (``context.library_dir()``); the literal ``"ROOTS"``
+                (:data:`ROOTS`) returns the virtual top-level listing
+                (:func:`_fs_list_roots`). Any other value MUST be an absolute
+                path naming an existing, listable directory.
+            ext: Optional, comma-separated, case-insensitive
+                (:func:`_parse_extensions`) -- defaults to
+                :data:`DEFAULT_EXTENSIONS` (``.md``).
+
+        Returns 200 with ``{"dir", "parent", "sep", "dirs", "files",
+        "truncated"}`` (STANDARD-fs-browse.md) -- names-only ``dirs``/
+        ``files`` entries for a real directory listing (the client joins
+        with ``dir``+``sep``); ROOTS entries additionally carry ``path``
+        (:func:`_fs_entry`). 403 when :data:`FS_LIST_LOCAL_ONLY` and the
+        caller isn't loopback; 400 for a relative/non-existent/non-directory
+        ``dir``.
+        """
+        if FS_LIST_LOCAL_ONLY and not request_is_loopback(request):
             return error_response(403, "file browsing is host-machine-only — FORMAT.md §5")
         raw = (request.query.get("dir") or "").strip()
         windows = _is_windows()
         if raw == ROOTS:
-            # The one non-absolute accepted value: the virtual "top" of the
-            # filesystem. Windows has no single root — this is a synthetic
-            # drive list. POSIX has exactly one, so ROOTS just resolves to it.
-            if windows:
-                return web.json_response(
-                    {"dir": ROOTS, "parent": None, "dirs": _list_windows_drives(), "files": []}
-                )
-            raw = "/"
+            return web.json_response(
+                {
+                    "dir": ROOTS,
+                    "parent": None,
+                    "sep": os.sep,
+                    "dirs": _fs_list_roots(context, windows=windows),
+                    "files": [],
+                    "truncated": False,
+                }
+            )
         directory = Path(raw) if raw else context.library_dir()
         if not directory.is_absolute():
             return error_response(400, f"dir must be an absolute path (got {raw!r})")
+        extensions = _parse_extensions(request.query.get("ext", ""))
         try:
             entries = sorted(directory.iterdir(), key=lambda p: p.name.casefold())
         except OSError as exc:
             return error_response(400, f"could not list {directory}: {exc}")
+
+        dirs: list[dict[str, str]] = []
+        files: list[dict[str, object]] = []
+        count = 0
+        truncated = False
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                continue
+            if is_dir:
+                if count >= _FS_LIST_MAX_ENTRIES:
+                    truncated = True
+                    break
+                dirs.append({"name": entry.name})
+                count += 1
+                continue
+            if entry.suffix.lower() not in extensions:
+                continue
+            try:
+                stat_result = entry.stat()
+            except OSError:
+                continue
+            if count >= _FS_LIST_MAX_ENTRIES:
+                truncated = True
+                break
+            files.append(
+                {"name": entry.name, "size": stat_result.st_size, "mtime": stat_result.st_mtime}
+            )
+            count += 1
+
         at_root = directory.parent == directory
         parent = _fs_root_parent(directory, windows=windows) if at_root else str(directory.parent)
         return web.json_response(
             {
                 "dir": str(directory),
                 "parent": parent,
-                "dirs": [p.name for p in entries if p.is_dir()],
-                "files": [
-                    p.name for p in entries if p.is_file() and p.suffix.lower() == ".md"
-                ],
+                "sep": os.sep,
+                "dirs": dirs,
+                "files": files,
+                "truncated": truncated,
             }
         )
 

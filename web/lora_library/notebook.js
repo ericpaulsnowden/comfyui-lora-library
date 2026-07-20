@@ -1,4 +1,6 @@
 /**
+ * fs-browse dialog v1 — synced from STANDARD-fs-browse.md
+ *
  * @file Prompt Notebook two-pane DOM widget (FORMAT.md §7.2) — attaches to
  * `LoraLibraryNotebook` nodes. Left pane: a scrollable, category-grouped,
  * multi-selectable, drag-to-reorder (including a multiselect dragged as one
@@ -200,6 +202,20 @@
  * same inline slot for the same reason, unifying what used to be a
  * separate whole-dialog error view.
  *
+ * STANDARDIZED 2026-07-19 (../../STANDARD-fs-browse.md, the cross-plugin
+ * "server filesystem Browse" contract shared with cpsb's/cprb's own
+ * pickers): `GET /lora_library/fs/list` reshaped its response to NAMES-ONLY
+ * `dirs`/`files` entries (`{"name"}` / `{"name","size","mtime"}`) plus a
+ * `sep` field — this picker now joins `dir` + `sep` + `name` itself
+ * (`joinServerPath()`, now preferring the server-reported `sep` over its old
+ * heuristic) instead of receiving bare path strings. The `ROOTS` sentinel's
+ * listing keeps its drive-list role but now ALSO includes this pack's own
+ * default library dir and "Home" (labeled, `{"name","path"}` entries —
+ * STANDARD-fs-browse.md's documented ROOTS extension) ahead of the platform
+ * drives/volumes, and (2026-07-19) is synthesized on macOS/POSIX too, not
+ * just Windows. Locality: epsnodes' `FS_LIST_LOCAL_ONLY` build-time flag
+ * stays `True` (unchanged loopback-only posture, FORMAT.md §5).
+ *
  * Categories (FORMAT.md §7.2 amendment, owner ask 2026-07-19): typing a name
  * STARTING WITH `#` into the ＋ New row creates a CATEGORY instead of an
  * entry (POST `/notebook/category`; the `#`s + surrounding whitespace are
@@ -305,8 +321,9 @@ const FILE_CHANGE_DEBOUNCE_MS = 250
  */
 const DRAG_THRESHOLD_PX = 4
 
-/** FORMAT.md §5's `fs/list` sentinel for "the top level" (drive list on
- * Windows, filesystem root on POSIX) — mirrors routes.py's own `ROOTS`. */
+/** STANDARD-fs-browse.md's `fs/list` sentinel for "the top level" — this
+ * pack's own default library dir (labeled) + Home, then every Windows drive
+ * or every macOS `/Volumes` mount — mirrors routes.py's own `ROOTS`. */
 const FS_ROOTS = 'ROOTS'
 
 const STYLE_TAG_ID = 'lora-library-notebook-styles'
@@ -1319,13 +1336,21 @@ async function onOpenFolderClick(state) {
   }
 }
 
-/** Best-effort join of a `GET /fs/list` `dir` + child name using the SAME
- * separator style the server's `dir` string already uses — the server may
- * run on Windows (backslash paths, incl. UNC `\\server\share`) or POSIX
- * (forward slash), and the picker has no other way to know which. */
-function joinServerPath(dir, name) {
-  const sep = dir.includes('\\') && !dir.includes('/') ? '\\' : '/'
-  return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`
+/**
+ * Join of a `GET /fs/list` `dir` + a names-only child entry's `name`.
+ * @param {string} dir
+ * @param {string} name
+ * @param {string} [sep] - STANDARD-fs-browse.md's server-reported `sep`
+ * (`GET /lora_library/fs/list`'s response field) — preferred when given,
+ * since it's authoritative for the machine actually being browsed. Falls
+ * back to the old heuristic (present-backslash-without-forward-slash) only
+ * for call sites with no response to read a `sep` from (e.g.
+ * `dirnameOfServerPath` below, seeding the picker from the resolved file's
+ * own path).
+ */
+function joinServerPath(dir, name, sep) {
+  const separator = sep || (dir.includes('\\') && !dir.includes('/') ? '\\' : '/')
+  return dir.endsWith(separator) ? `${dir}${name}` : `${dir}${separator}${name}`
 }
 
 /** Best-effort parent-folder guess for seeding the picker at the resolved
@@ -1443,10 +1468,13 @@ async function loadPickerDir(state, dialog, contentEl, pathErrorEl, dir) {
 }
 
 function renderPickerDialog(state, dialog, contentEl, pathErrorEl, data) {
-  // FS_ROOTS ("ROOTS", FORMAT.md §5's fs/list sentinel): the synthetic
-  // drive-list level on Windows — "Drives" reads better than the raw
-  // sentinel string as a header.
-  const headerText = data.dir === FS_ROOTS ? 'Drives' : data.dir
+  // FS_ROOTS ("ROOTS", STANDARD-fs-browse.md's fs/list sentinel): the
+  // synthetic top-level listing (default library dir + Home + platform
+  // drives/volumes) — "Top Level" reads better than the raw sentinel string
+  // as a header (2026-07-19: no longer just a drive list, so "Drives" alone
+  // stopped being accurate).
+  const isRootsList = data.dir === FS_ROOTS
+  const headerText = isRootsList ? 'Top Level' : data.dir
   const header = el('div', { className: 'llnb-picker-header', text: headerText, attrs: { title: data.dir } })
   const list = el('div', { className: 'llnb-picker-list' })
 
@@ -1455,21 +1483,24 @@ function renderPickerDialog(state, dialog, contentEl, pathErrorEl, data) {
     upRow.addEventListener('click', () => loadPickerDir(state, dialog, contentEl, pathErrorEl, data.parent))
     list.append(upRow)
   }
-  for (const name of data.dirs || []) {
-    const row = el('div', { className: 'llnb-picker-row', text: `📁 ${name}` })
-    // At the ROOTS level, each `name` (e.g. `C:\`) IS ALREADY a complete
-    // drive root — joining it onto the literal "ROOTS" sentinel like a
-    // normal child would produce the nonsense path "ROOTS/C:\" (the bug
-    // this fixes); navigate straight to the drive itself instead.
-    const target = data.dir === FS_ROOTS ? name : joinServerPath(data.dir, name)
+  for (const dir of data.dirs || []) {
+    const row = el('div', { className: 'llnb-picker-row', text: `📁 ${dir.name}` })
+    // At the ROOTS level, each entry is independently rooted (this pack's
+    // default library dir, "Home", a drive/volume) and carries its own
+    // `path` (STANDARD-fs-browse.md's documented ROOTS extension) — joining
+    // it onto the literal "ROOTS" sentinel like a normal child would produce
+    // a nonsense path (the original bug this fixed); navigate straight
+    // there instead. Everywhere else, entries are names-only: join onto the
+    // current `dir` + the server-reported `sep`.
+    const target = isRootsList ? dir.path : joinServerPath(data.dir, dir.name, data.sep)
     row.addEventListener('click', () => loadPickerDir(state, dialog, contentEl, pathErrorEl, target))
     list.append(row)
   }
-  for (const name of data.files || []) {
-    const row = el('div', { className: 'llnb-picker-row', text: `📄 ${name}` })
+  for (const file of data.files || []) {
+    const row = el('div', { className: 'llnb-picker-row', text: `📄 ${file.name}` })
     row.addEventListener('click', () => {
       closeBrowsePicker(state)
-      setFileWidgetValue(state, joinServerPath(data.dir, name))
+      setFileWidgetValue(state, joinServerPath(data.dir, file.name, data.sep))
     })
     list.append(row)
   }

@@ -2,10 +2,18 @@
 
 Version/loras rows are exercised implicitly all over the suite; these tests
 pin the two host-machine-awareness behaviors the §7.2 file panel depends on.
+
+fs/list reshaped 2026-07-19 to STANDARD-fs-browse.md, the shared cross-plugin
+"server filesystem Browse" contract with cpsb/cprb: names-only `{"name": ...}`
+(`{"name", "size", "mtime"}` for files) entries, a `sep` field, a `truncated`
+cap, dotfile-skipping, and a `ROOTS` sentinel that now returns a labeled
+roots list (default dir + Home + platform roots) on every platform, not just
+Windows.
 """
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -48,9 +56,35 @@ async def test_fs_list_defaults_to_library_dir_and_filters_md(
     response = await client.get("/lora_library/fs/list")
     data = await response.json()
     assert data["dir"] == str(library)
-    assert "sub" in data["dirs"]
-    assert data["files"] == ["prompts.md"]
+    assert data["sep"] == os.sep
+    assert data["truncated"] is False
+    assert {"name": "sub"} in data["dirs"]
+    assert len(data["files"]) == 1
+    assert data["files"][0]["name"] == "prompts.md"
+    assert data["files"][0]["size"] > 0
+    assert isinstance(data["files"][0]["mtime"], float)
     assert data["parent"] == str(library.parent)
+
+
+async def test_fs_list_skips_dotfiles(client, context: LibraryContext) -> None:
+    library = context.library_dir()
+    (library / "prompts.md").write_text("## A\n", encoding="utf-8")
+    (library / ".hidden.md").write_text("## B\n", encoding="utf-8")
+    (library / ".hidden_dir").mkdir()
+    response = await client.get("/lora_library/fs/list")
+    data = await response.json()
+    assert [entry["name"] for entry in data["files"]] == ["prompts.md"]
+    assert [entry["name"] for entry in data["dirs"]] == []
+
+
+async def test_fs_list_ext_param_narrows_the_default_allowlist(
+    client, context: LibraryContext
+) -> None:
+    library = context.library_dir()
+    (library / "a.md").write_text("## A\n", encoding="utf-8")
+    response = await client.get("/lora_library/fs/list", params={"ext": ".md"})
+    data = await response.json()
+    assert [entry["name"] for entry in data["files"]] == ["a.md"]
 
 
 async def test_fs_list_navigates_an_explicit_absolute_dir(client, tmp_path: Path) -> None:
@@ -60,7 +94,31 @@ async def test_fs_list_navigates_an_explicit_absolute_dir(client, tmp_path: Path
         "/lora_library/fs/list", params={"dir": str(tmp_path / "elsewhere")}
     )
     data = await response.json()
-    assert data["files"] == ["lib.md"]
+    assert [entry["name"] for entry in data["files"]] == ["lib.md"]
+
+
+async def test_fs_list_sorted_case_insensitively_dirs_then_files(
+    client, context: LibraryContext
+) -> None:
+    library = context.library_dir()
+    (library / "zeta.md").write_text("## Z\n", encoding="utf-8")
+    (library / "Alpha.md").write_text("## A\n", encoding="utf-8")
+    (library / "Zeta").mkdir()
+    (library / "alpha_dir").mkdir()
+    response = await client.get("/lora_library/fs/list")
+    data = await response.json()
+    assert [entry["name"] for entry in data["dirs"]] == ["alpha_dir", "Zeta"]
+    assert [entry["name"] for entry in data["files"]] == ["Alpha.md", "zeta.md"]
+
+
+async def test_fs_list_truncates_over_500_entries(client, context: LibraryContext) -> None:
+    library = context.library_dir()
+    for index in range(501):
+        (library / f"{index:04d}.md").touch()
+    response = await client.get("/lora_library/fs/list")
+    data = await response.json()
+    assert data["truncated"] is True
+    assert len(data["files"]) == 500
 
 
 async def test_fs_list_is_loopback_only(client) -> None:
@@ -70,6 +128,13 @@ async def test_fs_list_is_loopback_only(client) -> None:
 
 async def test_fs_list_rejects_relative_dir(client) -> None:
     response = await client.get("/lora_library/fs/list", params={"dir": "not/absolute"})
+    assert response.status == 400
+
+
+async def test_fs_list_rejects_a_file_path(client, tmp_path: Path) -> None:
+    a_file = tmp_path / "not_a_directory.md"
+    a_file.write_text("## A\n", encoding="utf-8")
+    response = await client.get("/lora_library/fs/list", params={"dir": str(a_file)})
     assert response.status == 400
 
 
@@ -90,18 +155,28 @@ async def test_fs_list_unreadable_dir_is_400(client, tmp_path: Path) -> None:
 
 
 async def test_fs_list_roots_sentinel_lists_windows_drives_when_monkeypatched(
-    client, monkeypatch
+    client, monkeypatch, context: LibraryContext
 ) -> None:
     monkeypatch.setattr(lora_routes, "_is_windows", lambda: True)
     monkeypatch.setattr(lora_routes, "_list_windows_drives", lambda: ["C:\\", "D:\\", "U:\\"])
     response = await client.get("/lora_library/fs/list", params={"dir": "ROOTS"})
     data = await response.json()
-    assert data == {
-        "dir": "ROOTS",
-        "parent": None,
-        "dirs": ["C:\\", "D:\\", "U:\\"],
-        "files": [],
-    }
+    assert data["dir"] == "ROOTS"
+    assert data["parent"] is None
+    assert data["sep"] == os.sep
+    assert data["files"] == []
+    assert data["truncated"] is False
+
+    by_name = {entry["name"]: entry["path"] for entry in data["dirs"]}
+    assert by_name["Library Folder"] == str(context.library_dir().resolve())
+    assert by_name["Home"] == str(Path.home().resolve())
+    assert by_name["C:"] == "C:\\"
+    assert by_name["D:"] == "D:\\"
+    assert by_name["U:"] == "U:\\"
+    # Standard's declared ROOTS order: default dir, Home, then platform roots.
+    assert [entry["name"] for entry in data["dirs"]] == [
+        "Library Folder", "Home", "C:", "D:", "U:"
+    ]
 
 
 async def test_fs_list_roots_sentinel_is_still_loopback_only(client, monkeypatch) -> None:
@@ -112,13 +187,30 @@ async def test_fs_list_roots_sentinel_is_still_loopback_only(client, monkeypatch
     assert response.status == 403
 
 
-async def test_fs_list_roots_sentinel_resolves_to_slash_on_posix(client) -> None:
+async def test_fs_list_roots_sentinel_includes_default_dir_and_home_on_posix(
+    client, context: LibraryContext
+) -> None:
     response = await client.get("/lora_library/fs/list", params={"dir": "ROOTS"})
     data = await response.json()
-    assert data["dir"] == "/"
+    assert data["dir"] == "ROOTS"
     assert data["parent"] is None
-    assert isinstance(data["dirs"], list)
-    assert isinstance(data["files"], list)
+
+    by_name = {entry["name"]: entry["path"] for entry in data["dirs"]}
+    assert by_name["Library Folder"] == str(context.library_dir().resolve())
+    assert by_name["Home"] == str(Path.home().resolve())
+
+
+async def test_fs_list_roots_sentinel_lists_macos_volumes_when_monkeypatched(
+    client, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        lora_routes, "_list_macos_volumes", lambda: ["/Volumes/Macintosh HD", "/Volumes/Backup"]
+    )
+    response = await client.get("/lora_library/fs/list", params={"dir": "ROOTS"})
+    data = await response.json()
+    by_name = {entry["name"]: entry["path"] for entry in data["dirs"]}
+    assert by_name["Macintosh HD"] == "/Volumes/Macintosh HD"
+    assert by_name["Backup"] == "/Volumes/Backup"
 
 
 async def test_fs_list_drive_root_parent_climbs_to_roots_under_monkeypatched_windows(
