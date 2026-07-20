@@ -156,17 +156,24 @@ off means three runs.
 mode, and get back the resized image **and** the original, plus both sets of
 dimensions. It replaces a resize node + a reroute + a get-image-size node.
 
+- **The size grid:** a drag pad right on the node — drag anywhere and
+  `width`/`height` follow, snapping to `multiple_of` (or 64 when it's off).
+  Hold **Shift** to drag free, **Ctrl/Cmd** to lock the aspect ratio. The
+  typed fields and the grid stay in sync (edit either), a live readout shows
+  `W x H`, the reduced aspect (3:2) and megapixels, and right-click
+  Properties offers `Grid max` (range) and `Show grid` (hide the pad
+  entirely if you only want the numbers).
 - **Four resize modes:** `stretch`, `keep aspect (fit)`, `crop to fill`,
   and `pad` (black), with a choice of interpolation. `multiple_of` snaps the
   result to a multiple (e.g. 64) for latent-friendly sizes.
 - **Set one axis to `0`** to derive it from the other and the image's aspect.
-- **Outputs:** `image` (untouched passthrough), `resized_image`, `width`,
-  `height`, `original_width`, `original_height`. `width`/`height` report the
-  actual resized dimensions; with no image wired the node still emits your
-  target size, so it doubles as a pure size source.
-- **Declutter:** right-click → Properties to hide the passthrough image or
-  the original-size outputs you aren't using (it won't hide one that's still
-  wired).
+- **Outputs:** `resized_image`, `width`, `height` out of the box —
+  `width`/`height` report the actual resized dimensions, and with no image
+  wired the node still emits your target size, so it doubles as a pure size
+  source. The untouched `image` passthrough and `original_width`/
+  `original_height` outputs are **hidden by default**: right-click →
+  Properties → `Show passthrough image` / `Show original size` to reveal
+  them (it won't hide one that's still wired).
 - Deliberately thin — pipe `width`/`height` into a heavier resize node for
   anything fancier.
 
