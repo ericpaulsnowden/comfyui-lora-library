@@ -16,6 +16,9 @@ import sys
 import types
 
 import pytest
+
+pytest.importorskip("torch")
+
 import torch
 
 from eps_image import nodes_resolution
