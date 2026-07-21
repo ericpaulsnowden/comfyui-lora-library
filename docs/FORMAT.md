@@ -890,6 +890,26 @@ single-frame output (NOT a list); "close-enough preview, EXACT on output".
   core / cprb split: preview approximate, run-time extraction authoritative).
   Selecting/stepping writes the `frame` INT widget. Clean-room — do NOT copy
   GPL VHS/LNL code (this pack is MIT); reimplement the pattern.
+- **Paste a video PATH onto the node (owner ask 2026-07-21; he chose
+  file-path paste over file-upload, keeping the no-copy design):** a
+  per-instance, capture-phase `document` `paste` listener that fires only when
+  THIS Frame Saver is the SOLE selected node and no text field is focused
+  (so the Browse dialog's own path input and the frame box keep native paste).
+  It reads `event.clipboardData.getData('text')` — the paste EVENT, never
+  `navigator.clipboard.readText()`, so it works in the same insecure context
+  (Mac-over-`http://<pc-ip>`) that gates the Image Grid's Copy (§6.6). The text
+  is cleaned to an absolute path (first non-empty line; one pair of wrapping
+  `"`/`'` stripped — Explorer "Copy as path"/shells; `file://` decoded to a
+  plain/UNC path; length-capped) and, if path-shaped, routed through the SAME
+  `chooseVideoPath()` the Browse picker uses (writes `video_path` →
+  probe → `<video>` → counter). Non-path text is left un-consumed (workflow-JSON
+  paste still reaches core); a clearly non-video extension is rejected with a
+  toast WITHOUT clobbering the loaded path (the probe stays the real
+  validator); a remote viewer sets the path like a workflow-loaded one (Browse
+  is hidden, the host-only overlay shows, Run still extracts). Capture-phase
+  registration is what lets an accepted path pre-empt core's own bubble-phase
+  paste handler. Verified live: pasting a clip path loaded it (counter "Frame 0
+  / 16", `<video>` src set); a `.txt` path was rejected, clip unchanged.
 - **Deferred:** multi-frame (sibling node), transcode-for-exotic-codecs,
   in/out range. VFR sources: the frame↔time arithmetic is approximate for the
   counter (shared limitation of all prior art); output still lands on a real

@@ -247,7 +247,10 @@ as an image.
 
 - **Point at a video by path** — click **Browse…** to pick a file (nothing is
   copied; it reads your file in place, NAS included). Host-machine only, like
-  the other pickers.
+  the other pickers. **Or paste a path:** copy a video file's path (Finder's
+  "Copy as Pathname" / Explorer's "Copy as path"), select the node, and press
+  **Ctrl/Cmd+V** — it loads that video. (Quotes and `file://` wrappers are
+  handled; pasting into a text field still pastes normally.)
 - **Scrub to the frame you want:** the node shows the video with play/pause,
   step −1/+1 one frame at a time, a frame-number box, and a live
   **Frame X / N** counter (total frames included).

@@ -67,15 +67,16 @@
  * hidden (`.hidden = true`, the pack-wide "hidden serialized bridge" trick
  * already used for the Notebook's `file`, `EPSSwitcher`'s `toggles`, and
  * `EPSImageGrid`'s `grid_uuid`) and replaced visually by this file's own
- * controls: the path bar's Browse button writes `video_path`; the control
- * strip's step buttons/number input/playback all write `frame`. Unlike
- * `notebook.js`'s `file` widget, neither needs its OWN wrapped `.callback`
- * for external-change detection — the only writers of `video_path` are this
- * file's Browse picker (which calls `onPathChanged` directly, no callback
- * indirection needed) and a workflow load/undo (`configure()` never invokes
- * widget callbacks at all — it assigns `.value` directly — so a wrapped
- * callback would not even see that case; the three resync hooks above are
- * what actually cover it).
+ * controls: the path bar's Browse button and the paste-a-path handler both
+ * write `video_path`; the control strip's step buttons/number input/playback
+ * all write `frame`. Unlike `notebook.js`'s `file` widget, neither needs its
+ * OWN wrapped `.callback` for external-change detection — the only writers
+ * of `video_path` are this file's Browse picker and paste handler (both
+ * funnel through `chooseVideoPath`, which calls `onPathChanged` directly, no
+ * callback indirection needed) and a workflow load/undo (`configure()` never
+ * invokes widget callbacks at all — it assigns `.value` directly — so a
+ * wrapped callback would not even see that case; the three resync hooks
+ * above are what actually cover it).
  *
  * **Preview vs. output ("close-enough preview, EXACT frame on output",
  * FORMAT.md §6.7's locked framing).** The `<video>` element gives smooth,
@@ -119,10 +120,69 @@
  * correction every tick, from the target time never landing exactly back on
  * `currentTime` after a `round()`.
  *
+ * **Paste a path onto the node (owner ask 2026-07-21).** Copy a video
+ * file's path in Finder ("Copy as Pathname") or Explorer ("Copy as path"),
+ * select this node, Ctrl/Cmd+V: the clipboard TEXT becomes `video_path`
+ * through the exact same `chooseVideoPath()` a Browse pick uses — one load
+ * path, so a pasted file probes, previews, and drives the "Frame X / N"
+ * counter identically to a browsed one. Mechanics (implementation under
+ * the "Paste a path" section below):
+ *   - **DOM `paste` event + `event.clipboardData.getData('text')`, never
+ *     `navigator.clipboard.readText()`**: the async Clipboard API is
+ *     [SecureContext]-gated — on the owner's Mac viewing the PC over plain
+ *     `http://<pc-ip>` it does not even EXIST — while the paste event's
+ *     `clipboardData` works there. Same boundary `image_grid.js` documents
+ *     for its Copy (FORMAT.md §6.6's Mac fixes) and already solves the
+ *     same way for its own paste IN ("0.28.1 / clipboard-API sensitivity"
+ *     in its header).
+ *   - **Selection-gated, per-instance, cleaned up** (`image_grid.js`'s
+ *     `installPasteFiles` idiom, adapted — that node gets selection gating
+ *     free from core's `usePaste.ts` FILE routing; TEXT needs our own
+ *     listener): each attached node registers one capture-phase `document`
+ *     listener that no-ops unless THIS node is the SINGLE selected node
+ *     (`app.canvas.selected_nodes`, failing CLOSED) and neither
+ *     `event.target` nor `document.activeElement` is a text-entry surface
+ *     — so pasting into the Browse dialog's own path input, the frame
+ *     number input, or any other field/dialog is never hijacked.
+ *     `wireNodeCleanup`'s `onRemoved` wrap removes the listener; no leaked
+ *     document listeners.
+ *   - **Consume only what is path-shaped.** The text is normalized first
+ *     (`cleanPastedVideoPath`: first non-empty line — Finder multi-select
+ *     copies one path per line — one pair of wrapping quotes stripped
+ *     (Explorer's "Copy as path" double-quotes; shells single-quote), and
+ *     `file://` URLs percent-decoded to plain paths incl. the `/C:/`
+ *     drive and UNC-host forms). Text that does not clean up to
+ *     `looksAbsolutePath` is left entirely alone — NOT consumed — so
+ *     core's own paste pipeline (workflow JSON, node paste, ...) still
+ *     sees it untouched. A path-shaped paste IS consumed (preventDefault +
+ *     stopImmediatePropagation; the capture-phase registration is what
+ *     lets that preempt core's earlier-registered bubble-phase `usePaste`
+ *     listener): an allowlisted-extension or extensionless path routes to
+ *     `chooseVideoPath()` — the probe route stays the REAL validator, its
+ *     errors landing on the path bar exactly as for Browse — while a
+ *     clearly non-video extension is refused EARLY (toast + path-bar
+ *     status naming the allowlist) WITHOUT clobbering the currently-loaded
+ *     path with a rejection the server (lockstep list) guarantees anyway.
+ *   - **Remote viewers change nothing here**: the pasted path writes the
+ *     widget exactly like a workflow-loaded path would, and
+ *     `refreshVideoSource`'s existing `isLocal === false` short-circuit
+ *     skips probe/stream and shows the host-only overlay — Run still
+ *     works, since the SERVER is what reads the path at execute() time.
+ *     The asymmetry with Browse (hidden when remote) is deliberate: Browse
+ *     needs the server to LIST folders for you, paste needs nothing from
+ *     the server until probe time — and the owner's usual viewer (Mac →
+ *     PC over LAN) is exactly the remote case pasting must keep working
+ *     in.
+ * The cleanup/verdict helpers are pure and exported;
+ * `tests/test_frame_saver_paste_js.py` drives them under Node (the
+ * `test_resolution_grid_js.py` fixture pattern) and locks the JS ext
+ * allowlist to `routes_frame_saver.py`'s tuple.
+ *
  * Vanilla ES modules, no build step, matching the rest of this pack.
  */
 
 import { api } from '../../../scripts/api.js'
+import { app } from '../../../scripts/app.js'
 
 /** FORMAT.md §6.7 — frozen once shipped. */
 const CLASS_ID = 'EPSFrameSaver'
@@ -154,14 +214,21 @@ const FS_ROOTS = 'ROOTS'
 /** FORMAT.md §6.7's video ext allowlist, mirrored from `eps_image/
  * routes_frame_saver.py`'s `VIDEO_EXTENSIONS` -- JS has no way to import a
  * Python module, so this list is kept in lockstep by hand; a file the picker
- * lets you choose is always one the probe/stream routes will also accept. */
-const VIDEO_EXT_LIST = ['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.ogv']
+ * lets you choose is always one the probe/stream routes will also accept.
+ * Exported: paste-a-path's early extension check reuses it, and
+ * `tests/test_frame_saver_paste_js.py` asserts it still equals the backend
+ * tuple -- the hand-lockstep, now machine-checked. */
+export const VIDEO_EXT_LIST = ['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.ogv']
 const VIDEO_EXT_PARAM = VIDEO_EXT_LIST.join(',')
 
 const STYLE_TAG_ID = 'eps-frame-saver-styles'
 const PICKER_OVERLAY_ID = 'epsfs-picker-overlay'
 
 const PREFIX = '[eps_image:frame_saver]'
+
+/** FORMAT.md §6.7 display name -- toast summaries only (`resolution.js`'s
+ * identical `NODE_TITLE` convention). */
+const NODE_TITLE = 'EPS Frame Saver'
 
 /** node -> per-instance state, for every EPSFrameSaver we've attached to.
  * A WeakMap (not just a WeakSet) because `loadedGraphNode()` needs to look
@@ -171,6 +238,24 @@ const nodeStates = new WeakMap()
 function warn(message, error) {
   if (error !== undefined) console.warn(PREFIX, message, error)
   else console.warn(PREFIX, message)
+}
+
+/** Best-effort toast via the pack's established `app.extensionManager?.
+ * toast?.add?.(...)` convention (`resolution.js`'s `toast()`,
+ * `image_grid.js`'s `notifyClipboard()`) -- never throws; a missing toast
+ * surface on some older/newer frontend build just degrades to silence,
+ * this pack's usual fail-soft posture. */
+function toast(node, severity, detail) {
+  try {
+    app.extensionManager?.toast?.add?.({
+      severity,
+      summary: node.title || NODE_TITLE,
+      detail,
+      life: severity === 'error' ? 6000 : 3000
+    })
+  } catch (error) {
+    console.warn(PREFIX, 'toast failed', error)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +726,11 @@ function createState(node, pathWidget, frameWidget) {
     // The Browse picker's window-level Escape-key listener while open (the
     // picker lives on document.body, not inside this widget's own DOM).
     pickerKeydownHandler: null,
-    pickerPathInputEl: null
+    pickerPathInputEl: null,
+    // The per-instance document-level `paste` listener for this node's
+    // whole lifetime (paste-a-path, file header) -- registered by
+    // installPastePathHandler, removed by wireNodeCleanup's onRemoved wrap.
+    pasteHandler: null
   }
 }
 
@@ -1078,7 +1167,11 @@ function closePicker(state) {
   state.pickerPathInputEl = null
 }
 
-function looksAbsolutePath(value) {
+/** Whether *value* is an absolute path in SOME supported OS shape -- the
+ * picker's start-dir choice AND paste-a-path's "is this even a path" gate
+ * (exported for the Node tests). Deliberately shallow: real validation is
+ * the server's (`routes_frame_saver.py`'s `_validate_video_path`). */
+export function looksAbsolutePath(value) {
   const trimmed = typeof value === 'string' ? value.trim() : ''
   if (!trimmed) return false
   if (trimmed.startsWith('/')) return true // POSIX
@@ -1257,6 +1350,243 @@ function chooseVideoPath(state, path) {
 }
 
 // ---------------------------------------------------------------------------
+// Paste a path (owner ask 2026-07-21) -- Ctrl/Cmd+V with this node solely
+// selected sets `video_path` from the clipboard's TEXT, through the SAME
+// `chooseVideoPath()` the Browse rows call. See the file header's "Paste a
+// path onto the node" section for the secure-context/gating rationale; the
+// text-cleanup + verdict helpers here are PURE and exported so
+// `tests/test_frame_saver_paste_js.py` can drive them under Node.
+// ---------------------------------------------------------------------------
+
+/** Longest clipboard text still treated as a path candidate -- POSIX
+ * PATH_MAX is 4096 and even Windows extended paths stay well under 32k;
+ * anything longer is a pasted document, not a path. */
+const MAX_PASTED_PATH_LENGTH = 4096
+
+/** The first line of *text* with non-whitespace content, trimmed ('' when
+ * there is none). Finder's "Copy as Pathname" with SEVERAL files selected
+ * puts one path per line -- this node holds exactly one video, so the
+ * first is taken and the rest are ignored. */
+function firstNonEmptyLine(text) {
+  for (const line of String(text ?? '').split(/\r\n|\r|\n/)) {
+    const trimmed = line.trim()
+    if (trimmed) return trimmed
+  }
+  return ''
+}
+
+/**
+ * *text* minus ONE pair of matching wrapping quotes (double or single),
+ * trimmed. Windows Explorer's "Copy as path" wraps the path in double
+ * quotes; shell-copied paths are often single-quoted. Exactly one pair,
+ * never a loop -- a quote character INSIDE a filename must survive, and no
+ * OS stacks wrappers.
+ * @param {string} text
+ */
+export function stripWrappingQuotes(text) {
+  const value = typeof text === 'string' ? text.trim() : ''
+  if (value.length >= 2) {
+    const first = value[0]
+    const last = value[value.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return value.slice(1, -1).trim()
+    }
+  }
+  return value
+}
+
+/**
+ * A `file://` URL decoded to the plain filesystem path the SERVER can
+ * open; any other *text* is returned unchanged. Copying from a browser's
+ * address bar (or some file managers) yields `file:///...` with
+ * percent-escapes -- the server's `Path()` needs the real characters.
+ * Shapes handled (WHATWG `URL` does the parsing, so the Node tests
+ * exercise the browser's own algorithm):
+ *   - `file:///Users/e/My%20Videos/a.mp4` -> `/Users/e/My Videos/a.mp4`
+ *   - `file:///C:/clips/a.mp4` -> `C:/clips/a.mp4` (drive form; forward
+ *     slashes kept -- Python's `Path` accepts them on Windows)
+ *   - `file://localhost/Users/e/a.mp4` -> `/Users/e/a.mp4`
+ *   - `file://nas/share/a.mp4` -> `\\nas\share\a.mp4` (a real host maps
+ *     to a UNC path, backslashed for Windows)
+ * A malformed percent-escape keeps the raw pathname (decode fails soft);
+ * an unparseable URL returns *text* unchanged -- it then simply fails
+ * `looksAbsolutePath` and the paste is ignored.
+ * @param {string} text
+ */
+export function fileUrlToPath(text) {
+  const value = typeof text === 'string' ? text.trim() : ''
+  if (!/^file:\/\//i.test(value)) return value
+  let url
+  try {
+    url = new URL(value)
+  } catch {
+    return value
+  }
+  let pathname = url.pathname
+  try {
+    pathname = decodeURIComponent(pathname)
+  } catch {
+    // Malformed %-sequence in a real filename -- keep the raw pathname.
+  }
+  const host = url.hostname
+  if (host && host.toLowerCase() !== 'localhost') {
+    return `\\\\${host}${pathname.replace(/\//g, '\\')}`
+  }
+  if (/^\/[A-Za-z]:/.test(pathname)) return pathname.slice(1)
+  return pathname
+}
+
+/**
+ * Clipboard text -> the path candidate it carries ('' when it holds none):
+ * first non-empty line, one pair of wrapping quotes stripped, `file://`
+ * decoded, trimmed. Judging the result (absolute? video?) is
+ * `evaluatePastedText`'s job -- this only normalizes what the OS put on
+ * the clipboard.
+ * @param {string} text
+ */
+export function cleanPastedVideoPath(text) {
+  return fileUrlToPath(stripWrappingQuotes(firstNonEmptyLine(text))).trim()
+}
+
+/**
+ * *path*'s lowercased dot-extension ('' when it has none) -- mirrors
+ * Python `Path.suffix`'s semantics (last dot of the LAST component; a
+ * leading dot (`.hidden`) or trailing dot (`name.`) is NO extension) so
+ * the early client check below and `routes_frame_saver.py`'s
+ * `_validate_video_path` reach the same verdict on the same path.
+ * @param {string} path
+ */
+export function pathExtension(path) {
+  const value = typeof path === 'string' ? path : ''
+  const segments = value.split(/[\\/]/)
+  const base = segments[segments.length - 1] || ''
+  const idx = base.lastIndexOf('.')
+  if (idx <= 0 || idx >= base.length - 1) return ''
+  return base.slice(idx).toLowerCase()
+}
+
+/**
+ * The paste handler's whole decision, as data (pure -- the Node tests
+ * drive this exact function):
+ *   - `{action: 'ignore', path: ''}` -- not path-shaped (empty, relative,
+ *     prose, workflow JSON, over-long): do NOT consume the event, so
+ *     core's own paste pipeline still sees it untouched.
+ *   - `{action: 'reject', path, reason}` -- an absolute path whose
+ *     extension the video allowlist (and therefore the server, kept in
+ *     lockstep -- :data:`VIDEO_EXT_LIST`) is guaranteed to refuse:
+ *     consume + surface *reason*, but leave the currently-loaded path
+ *     UNTOUCHED rather than clobbering a working video with a
+ *     guaranteed-to-fail one.
+ *   - `{action: 'accept', path}` -- an absolute path with an allowlisted
+ *     extension, or with NO extension at all (deliberately not judged
+ *     client-side: the probe route stays the real validator, its error
+ *     landing on the path bar exactly as for a Browse pick).
+ * @param {string} text
+ */
+export function evaluatePastedText(text) {
+  const path = cleanPastedVideoPath(text)
+  if (!path || path.length > MAX_PASTED_PATH_LENGTH || !looksAbsolutePath(path)) {
+    return { action: 'ignore', path: '' }
+  }
+  const ext = pathExtension(path)
+  if (ext && !VIDEO_EXT_LIST.includes(ext)) {
+    return {
+      action: 'reject',
+      path,
+      reason: `Not a video file (${ext}) — allowed: ${VIDEO_EXT_LIST.join(', ')}`
+    }
+  }
+  return { action: 'accept', path }
+}
+
+/**
+ * True when *element* is a text-entry surface whose paste must be left
+ * alone -- any `<input>`/`<textarea>`/`<select>` (conservatively including
+ * non-text input types) or anything contenteditable. Duck-typed on
+ * `tagName`/`isContentEditable` rather than instanceof so it stays pure
+ * (Node-testable) and works across realms.
+ * @param {object|null} element
+ */
+export function isTextEntryElement(element) {
+  if (!element) return false
+  const tag = typeof element.tagName === 'string' ? element.tagName.toUpperCase() : ''
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+  return element.isContentEditable === true
+}
+
+/**
+ * True when *node* is the ONLY node currently selected on the canvas --
+ * `app.canvas.selected_nodes` is litegraph's live id->node selection map
+ * (the same `app.canvas` access `resolution.js`/`switcher.js` already
+ * use). With 2+ nodes selected the paste target would be ambiguous, so
+ * nothing acts. Fails CLOSED (no canvas / unexpected shape reads as
+ * not-selected): a paste that silently no-ops beats one that hijacks text
+ * meant for something else.
+ */
+function isSoleSelectedNode(node) {
+  const selected = app.canvas?.selected_nodes
+  if (!selected || typeof selected !== 'object') return false
+  const nodes = Object.values(selected)
+  return nodes.length === 1 && nodes[0] === node
+}
+
+/**
+ * The per-instance document `paste` listener (file header, "Paste a path
+ * onto the node"). Reads `event.clipboardData` -- the DOM paste event's
+ * payload, available on INSECURE contexts (the owner's Mac viewing the PC
+ * over plain http) where `navigator.clipboard.readText()` simply does not
+ * exist -- and only ever CONSUMES the event (preventDefault +
+ * stopImmediatePropagation, which the capture-phase registration lets run
+ * ahead of core's bubble-phase `usePaste` listener) once the text is
+ * judged path-shaped for THIS solely-selected node with no text field
+ * focused. Never throws -- a paste handler must not break the document's
+ * dispatch (pack fail-soft posture).
+ */
+function onPastePathEvent(state, event) {
+  try {
+    if (!isSoleSelectedNode(state.node)) return
+    if (isTextEntryElement(event.target) || isTextEntryElement(document.activeElement)) return
+    const text = event.clipboardData ? event.clipboardData.getData('text') : ''
+    const verdict = evaluatePastedText(text)
+    if (verdict.action === 'ignore') return
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    if (verdict.action === 'reject') {
+      setPathBarStatus(state, verdict.reason, true)
+      toast(state.node, 'warn', verdict.reason)
+      return
+    }
+    // Same code path as a Browse pick -- writes the widget, probes,
+    // (re)loads the <video>, updates the counter. A remote viewer gets
+    // refreshVideoSource's existing isLocal short-circuit (host-only
+    // overlay, no probe attempt -- Run still works, the SERVER reads it).
+    chooseVideoPath(state, verdict.path)
+  } catch (error) {
+    warn('paste-a-path handler failed', error)
+  }
+}
+
+/** Registers *state*'s document-level paste listener. Capture-phase on
+ * purpose: core's `usePaste` listener is bubble-phase on this same
+ * document and registered earlier (app boot precedes node attach), so
+ * capture is the one registration that still lets a CONSUMED path-shaped
+ * paste preempt it; an ignored paste propagates exactly as if this
+ * listener didn't exist. */
+function installPastePathHandler(state) {
+  state.pasteHandler = (event) => onPastePathEvent(state, event)
+  document.addEventListener('paste', state.pasteHandler, true)
+}
+
+/** Removes the paste listener (same capture flag -- removal must match
+ * registration). Called from wireNodeCleanup's onRemoved wrap, so a
+ * deleted node never leaks a document-level listener. */
+function removePastePathHandler(state) {
+  if (!state.pasteHandler) return
+  document.removeEventListener('paste', state.pasteHandler, true)
+  state.pasteHandler = null
+}
+
+// ---------------------------------------------------------------------------
 // Node lifecycle
 // ---------------------------------------------------------------------------
 
@@ -1274,6 +1604,7 @@ function wireNodeCleanup(state) {
     }
     try {
       closePicker(state)
+      removePastePathHandler(state)
       nodeStates.delete(node)
     } catch (error) {
       warn('frame_saver teardown failed', error)
@@ -1340,6 +1671,10 @@ export function attach(node) {
     hideWidget(node, frameWidget)
     wireNodeCleanup(state)
     wireConfigureResync(state)
+    // After wireNodeCleanup on purpose: the removal wrap exists before the
+    // document listener does, so there is no window where a torn-down node
+    // could leak it.
+    installPastePathHandler(state)
 
     refreshGating(state).catch((error) => warn('initial config load failed', error))
 
