@@ -1,0 +1,90 @@
+"""``EPSFrameSaver`` (FORMAT.md §6.7, display: "EPS Frame Saver") — pick a
+video by path, scrub to a frame in-node, output that exact frame + its size.
+
+Owner decisions locked (FORMAT.md §6.7):
+
+- **PATH source, never a copy.** ``video_path`` is chosen via a server-side
+  Browse dialog (``web/eps_image/frame_saver.js``, reusing the pack's
+  ``/lora_library/fs/list`` fs-browse standard with a video ext allowlist) —
+  unlike core's own ``LoadImage``/VHS's ``VHS_LoadVideo``, the file is never
+  copied into ComfyUI's ``input/`` directory.
+- **Single-frame output, not a list.** ``OUTPUT_IS_LIST`` is deliberately
+  ABSENT — this matches the sibling pack's ``PremiereShotFrame`` (FORMAT.md
+  §6.7's own citation). Multi-frame extraction is an explicitly deferred
+  future sibling node.
+- **"Close-enough preview, EXACT frame on output."** The frontend player only
+  ever drives an *approximate* ``<video>``-element preview off the probed
+  fps/frame_count; THIS node's :meth:`EPSFrameSaver.run` always re-decodes
+  the exact requested frame straight from the source file at execution
+  time, completely independent of whatever the preview happened to show.
+
+No torch/av/ComfyUI import anywhere at module scope — :meth:`run` only
+reaches into :mod:`eps_image.frame_saver_video` (which itself lazily imports
+``av``/``torch``, see that module's docstring), so this file stays importable
+in a plain test environment with neither installed — same convention as
+every other node in this pack (``eps_image/nodes_resolution.py``,
+``eps_image/nodes_image_grid.py``).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from . import frame_saver_video as video
+
+CATEGORY_NAME = "EPSNodes"
+
+#: A generous static ceiling for the `frame` widget's declared INT range.
+#: `INPUT_TYPES` is evaluated once at class-registration time, long before
+#: any particular `video_path` is known, so it can never reflect a REAL
+#: video's actual frame count -- that's the frontend's job, per-node-
+#: instance, once `GET /eps_frame_saver/probe` returns one (FORMAT.md §6.7).
+#: This is just wide enough to never clip a legitimate request; `extract_frame`
+#: clamps a too-large index down to the video's last frame regardless (it
+#: never errors purely for running past the end -- see that function's
+#: docstring), so this ceiling is a UI nicety, not a correctness boundary.
+MAX_FRAME_WIDGET_VALUE = 2**31 - 1
+
+
+class EPSFrameSaver:
+    """Load-video-by-path frame picker (FORMAT.md §6.7).
+
+    Re-opens and re-decodes `video_path` on every execution — there is no
+    persisted state to go stale. Mirrors this pack's other file-path nodes'
+    convention of re-reading the source of truth every run
+    (`LoraLibraryNotebook`, `EPSImageGrid`): the FILE is the truth, the node
+    (and its frontend player) are just a view onto it.
+    """
+
+    CATEGORY = CATEGORY_NAME
+    RETURN_TYPES = ("IMAGE", "INT", "INT")
+    RETURN_NAMES = ("image", "width", "height")
+    FUNCTION = "run"
+    DESCRIPTION = (
+        "EPS Frame Saver -- pick a video by path (Browse; the file is never "
+        "copied), scrub to a frame with play/pause/step/type, and Run outputs "
+        "that exact frame as an IMAGE plus its width/height. The in-node "
+        "preview is close-enough for scrubbing; the output frame is always "
+        "decoded exactly from the source file, independent of the preview."
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict[str, Any]:
+        return {
+            "required": {
+                "video_path": ("STRING", {"default": "", "multiline": False}),
+                "frame": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": MAX_FRAME_WIDGET_VALUE, "step": 1},
+                ),
+            },
+        }
+
+    def run(self, video_path: str, frame: int = 0) -> tuple[Any, int, int]:
+        path = str(video_path or "").strip()
+        if not path:
+            raise ValueError(
+                "EPS Frame Saver: no video_path set -- Browse for a video file first."
+            )
+        tensor, width, height = video.extract_frame(path, int(frame))
+        return (tensor, width, height)

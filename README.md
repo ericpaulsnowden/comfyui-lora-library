@@ -27,12 +27,14 @@ Current capabilities, no dependencies:
   passed through) so one node replaces a resize + a reroute + a get-size;
   **EPS Image Grid** collects images across separate Runs into a navigable
   grid and fans the whole set out (gather 10, then run them through a
-  workflow at once).
+  workflow at once); **EPS Frame Saver** loads a video by path, lets you
+  scrub/play to a frame, and outputs that frame as an image.
 
-> **Status: pre-release. Six capabilities ship today:** the **Prompt
+> **Status: pre-release. Seven capabilities ship today:** the **Prompt
 > Notebook**, **Apply LoRA Set**, the **Lora Loader State Controller**,
-> **EPS Switcher**, **EPS Resolution**, and **EPS Image Grid** (each
-> described below). Contracts live in [docs/FORMAT.md](docs/FORMAT.md).
+> **EPS Switcher**, **EPS Resolution**, **EPS Image Grid**, and **EPS Frame
+> Saver** (each described below). Contracts live in
+> [docs/FORMAT.md](docs/FORMAT.md).
 
 ## Prompt Notebook (shipped)
 
@@ -223,6 +225,23 @@ times to gather images, then send the whole set through a workflow at once.
   clipboard, for Photoshop/etc.) or Copy (Clipspace) (into the mask editor or
   another node); and with the node selected, **Ctrl+V** an image to add it to
   the buffer.
+
+## EPS Frame Saver (shipped)
+
+`EPSNodes → EPS Frame Saver`: load a video and pull a single frame out of it
+as an image.
+
+- **Point at a video by path** — click **Browse…** to pick a file (nothing is
+  copied; it reads your file in place, NAS included). Host-machine only, like
+  the other pickers.
+- **Scrub to the frame you want:** the node shows the video with play/pause,
+  step −1/+1 one frame at a time, a frame-number box, and a live
+  **Frame X / N** counter (total frames included).
+- **Outputs** `image`, `width`, `height` for the selected frame. The on-screen
+  preview is best-effort (browser video seeking isn't always frame-perfect);
+  the frame extracted on Run is exact (decoded server-side with PyAV).
+- Common codecs (H.264 mp4, webm) play and scrub smoothly; an exotic codec the
+  browser can't decode still extracts correctly on Run, it just won't preview.
 
 ## Install
 

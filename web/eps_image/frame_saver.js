@@ -1,0 +1,1372 @@
+/**
+ * @file EPS Frame Saver frontend (FORMAT.md §6.7). Exports the `init()`/
+ * `attach(node)`/`loadedGraphNode(node)` hooks `web/eps_image.js` calls; each
+ * no-ops for every node type other than `EPSFrameSaver`.
+ *
+ * Clean-room implementation — this pack is MIT, so nothing here is derived
+ * from GPL video-picker prior art (VHS/LNL); the player is built fresh from
+ * this pack's OWN proven patterns:
+ *
+ * - **The Browse dialog** (`openPicker`/`loadPickerDir`/`renderPickerDialog`/
+ *   `buildPickerFooter` below) is a trimmed port of `comfyui-premiere-bridge`'s
+ *   `web/cprb/nodes.js` `openPicker()` family (itself ported from this pack's
+ *   own `web/lora_library/notebook.js` `openBrowsePicker()`), reduced to the
+ *   FILE-mode-only shape (no directory-choose mode — this node never picks a
+ *   folder): a singleton overlay on `document.body` (never nested in the
+ *   node's own DOM, so it isn't clipped by a small node), Escape/backdrop-
+ *   click to close, a "type or paste a path" row for UNC/other-drive targets
+ *   independent of the server's own drive enumeration, and the `ROOTS`
+ *   sentinel's drive-list navigation. Reuses the pack's EXISTING
+ *   `GET /lora_library/fs/list` (FORMAT.md §5/STANDARD-fs-browse.md) with
+ *   `ext` narrowed to :data:`VIDEO_EXT_PARAM` — no new fs/list route.
+ * - **Host-only gating** mirrors both files' identical `GET /lora_library/
+ *   config` `is_local` cache/gate (`fetchConfig`/`getConfig`/`refreshGating`
+ *   below) — Browse hides and a calm note appears on a remote browser,
+ *   exactly like the Notebook/premiere file panels.
+ * - **DOM-widget sizing** follows the two proven shapes documented in
+ *   `web/lora_library/notebook.js`'s `attachDomWidget()` and
+ *   `comfyui-premiere-bridge/web/cprb/nodes.js`'s `attachBarWidget()`:
+ *     - **Fill** (the video area, `attachFillWidget` below): `getMinHeight`
+ *       only, no `getMaxHeight` — litegraph's widget-arrange pass then gives
+ *       this widget whatever height is left after the fixed-height bars
+ *       above/below it.
+ *     - **Fixed** (the path bar + control strip, `attachFixedWidget` below):
+ *       ALL FOUR knobs — `getMinHeight`+`getMaxHeight` (the classic canvas
+ *       renderer) AND `computeSize`+`computedHeight` (what cprb's
+ *       `attachBarWidget()` found the Vue-node renderer treats as
+ *       authoritative instead — "verified live 2026-07-19: the bar
+ *       collapsed to ~7px and its buttons clipped past the node's bottom
+ *       edge" when only the first two were set) AND the element's own CSS
+ *       `height`/`min-height`. Three separate `addDOMWidget` calls (path bar
+ *       / video / strip), not one mega-widget with internal flex children —
+ *       litegraph arranges DOM widgets top-to-bottom exactly like ordinary
+ *       widgets, handing each fixed one its declared height and the one
+ *       flexible one everything left over, so three simple single-purpose
+ *       widgets compose correctly without needing to fight the layout pass.
+ * - **Post-`configure()` resync** follows `eps_image/image_grid.js`'s
+ *   `attach()`: `nodeCreated` (this file's `attach()`) fires BEFORE
+ *   `LGraphNode.configure()` restores a loaded workflow's real widget
+ *   values (`eps_image/resolution.js`'s header: confirmed live and in
+ *   `LGraphNode.ts`), so reading `video_path`/`frame` synchronously here
+ *   would only ever see their just-constructed defaults. `attach()` below
+ *   defers its initial resync one tick (`setTimeout(fn, 0)`, the same
+ *   trick `image_grid.js`'s `attach()` uses for its own per-node restore
+ *   race) so the current synchronous `configure()` call — if this IS a
+ *   workflow load — finishes first. `loadedGraphNode()` (fired once per
+ *   node after the WHOLE graph's `configure()` pass completes — the
+ *   cross-workflow-load path) and a wrapped `node.onConfigure` (undo/redo,
+ *   which re-applies serialized state via `configure()` directly without
+ *   re-firing `nodeCreated`) are both belt-and-suspenders re-syncs onto the
+ *   same idempotent `fullResync()` — redundant by design, matching
+ *   `image_grid.js`'s explicit "all three firing is redundant by design"
+ *   stance for the identical class of restore-timing bug.
+ *
+ * **Two widgets, hidden.** `video_path` (STRING) and `frame` (INT) are the
+ * node's real, server-declared, serialized widgets — FORMAT.md §6.7 requires
+ * both to round-trip and reach `execute()` untouched by our JS. Both are
+ * hidden (`.hidden = true`, the pack-wide "hidden serialized bridge" trick
+ * already used for the Notebook's `file`, `EPSSwitcher`'s `toggles`, and
+ * `EPSImageGrid`'s `grid_uuid`) and replaced visually by this file's own
+ * controls: the path bar's Browse button writes `video_path`; the control
+ * strip's step buttons/number input/playback all write `frame`. Unlike
+ * `notebook.js`'s `file` widget, neither needs its OWN wrapped `.callback`
+ * for external-change detection — the only writers of `video_path` are this
+ * file's Browse picker (which calls `onPathChanged` directly, no callback
+ * indirection needed) and a workflow load/undo (`configure()` never invokes
+ * widget callbacks at all — it assigns `.value` directly — so a wrapped
+ * callback would not even see that case; the three resync hooks above are
+ * what actually cover it).
+ *
+ * **Preview vs. output ("close-enough preview, EXACT frame on output",
+ * FORMAT.md §6.7's locked framing).** The `<video>` element gives smooth,
+ * native play/pause/loop/seek for scrubbing, but it is ONLY ever a preview:
+ * every frame/counter/seek computation here uses `currentTime = frame / fps`
+ * against the PROBED `fps`/`frame_count` (`GET /eps_frame_saver/probe`),
+ * never the browser's own (possibly VFR-approximate) notion of time. The
+ * actual pixels ComfyUI receives always come from `eps_image/
+ * frame_saver_video.py`'s `extract_frame` at execution time, independent of
+ * whatever the preview happened to show. Two direct consequences below:
+ *   - **Exotic codecs degrade gracefully, never hard-fail.** If the browser
+ *     can't decode the container/codec, the `<video>` element's `error`
+ *     event fires; `state.videoPlayable` flips to `false`, the overlay
+ *     switches to a plain message, and playback/seeking are disabled — but
+ *     the frame number input, step buttons, and counter stay FULLY
+ *     functional (they only need the PROBED fps/frame_count, decoded
+ *     server-side by PyAV, completely independent of what Chrome/whatever
+ *     browser can render), and Run still extracts the exact frame
+ *     regardless. Probing itself failing too (a file PyAV also can't read)
+ *     is the one case output would also fail — surfaced as a status line on
+ *     the path bar, never a client-side block on Run.
+ *   - **Step buttons derive `currentTime` FROM the frame integer
+ *     (`frame / fps`), never the reverse.** FORMAT.md §6.7 describes the
+ *     step as "`currentTime ± 1/fps`" conceptually (each step moves the
+ *     play head by one frame's duration) — implemented here as "increment
+ *     the canonical integer frame by 1, then seek to its exact time" rather
+ *     than repeatedly nudging `currentTime` by a float `1/fps`, which is
+ *     mathematically the same step size but avoids compounding float error
+ *     across many successive steps (`setFrame()`/`seekVideoToFrame()`
+ *     below).
+ *
+ * **Playback vs. programmatic seeking don't fight each other.** While the
+ * video is actually PLAYING, its own `timeupdate` events are the source of
+ * truth for the frame counter (`syncFrameFromPlayback()`) — that path
+ * deliberately never re-assigns `video.currentTime` (it was just READ from
+ * there), only writes the `frame` widget + updates the number input/counter.
+ * A user-driven change (step button, typed number, `configure()`/undo
+ * restore) goes through `setFrame()`/`refreshFrameUi({seek:true})` instead,
+ * which DOES seek the video to match. Mixing the two (seeking during
+ * `timeupdate`) would fight native playback with a constant few-millisecond
+ * correction every tick, from the target time never landing exactly back on
+ * `currentTime` after a `round()`.
+ *
+ * Vanilla ES modules, no build step, matching the rest of this pack.
+ */
+
+import { api } from '../../../scripts/api.js'
+
+/** FORMAT.md §6.7 — frozen once shipped. */
+const CLASS_ID = 'EPSFrameSaver'
+
+/** The node's real, server-declared widget names (FORMAT.md §6.7). */
+const PATH_WIDGET_NAME = 'video_path'
+const FRAME_WIDGET_NAME = 'frame'
+
+const PATH_BAR_WIDGET_NAME = 'epsfs_path_bar'
+const PATH_BAR_WIDGET_TYPE = 'eps_frame_saver_path_bar'
+const VIDEO_WIDGET_NAME = 'epsfs_video'
+const VIDEO_WIDGET_TYPE = 'eps_frame_saver_video'
+const STRIP_WIDGET_NAME = 'epsfs_strip'
+const STRIP_WIDGET_TYPE = 'eps_frame_saver_strip'
+
+/** Fixed heights for the two non-flexible bars (see file header's DOM-widget
+ * sizing section) -- kept small and constant, like cprb's own `BAR_HEIGHT`. */
+const PATH_BAR_HEIGHT = 32
+const STRIP_HEIGHT = 36
+
+/** Floor for the flexible video area -- enough to see a usable preview even
+ * on a freshly-dropped, not-yet-resized node; grows to fill a taller node. */
+const VIDEO_MIN_HEIGHT = 220
+
+/** STANDARD-fs-browse.md's `fs/list` sentinel for "the top level" (mirrors
+ * `lora_library/routes.py`'s `ROOTS`). */
+const FS_ROOTS = 'ROOTS'
+
+/** FORMAT.md §6.7's video ext allowlist, mirrored from `eps_image/
+ * routes_frame_saver.py`'s `VIDEO_EXTENSIONS` -- JS has no way to import a
+ * Python module, so this list is kept in lockstep by hand; a file the picker
+ * lets you choose is always one the probe/stream routes will also accept. */
+const VIDEO_EXT_LIST = ['.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v', '.ogv']
+const VIDEO_EXT_PARAM = VIDEO_EXT_LIST.join(',')
+
+const STYLE_TAG_ID = 'eps-frame-saver-styles'
+const PICKER_OVERLAY_ID = 'epsfs-picker-overlay'
+
+const PREFIX = '[eps_image:frame_saver]'
+
+/** node -> per-instance state, for every EPSFrameSaver we've attached to.
+ * A WeakMap (not just a WeakSet) because `loadedGraphNode()` needs to look
+ * the state BACK up by node, not just check "have we seen this before". */
+const nodeStates = new WeakMap()
+
+function warn(message, error) {
+  if (error !== undefined) console.warn(PREFIX, message, error)
+  else console.warn(PREFIX, message)
+}
+
+// ---------------------------------------------------------------------------
+// Tiny DOM builder + fetch helpers -- this pack is vanilla JS with no
+// templating engine and no shared per-request wrapper across `eps_image/`
+// (unlike `lora_library/api.js`, which `web/lora_library/notebook.js` and
+// `comfyui-premiere-bridge/web/cprb/nodes.js` both import); every existing
+// `eps_image/*.js` file (image_grid.js, switcher.js, resolution.js) instead
+// calls `api.fetchApi`/`api.apiURL` directly or via its own tiny local
+// helper, so this file follows suit rather than reaching into a sibling
+// family's module.
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {string} tag
+ * @param {{className?: string, text?: string, attrs?: Record<string,string>}} [options]
+ * @param {(Node|string)[]} [children]
+ * @returns {HTMLElement}
+ */
+function el(tag, options = {}, children = []) {
+  const node = document.createElement(tag)
+  if (options.className) node.className = options.className
+  if (options.text !== undefined) node.textContent = options.text
+  if (options.attrs) {
+    for (const [key, value] of Object.entries(options.attrs)) {
+      node.setAttribute(key, value)
+    }
+  }
+  for (const child of children) {
+    if (child == null) continue
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)))
+  }
+  return node
+}
+
+/**
+ * GET a JSON route. Resolves to parsed JSON; rejects with an Error whose
+ * message is the server's `error` field when the response is non-2xx.
+ * @param {string} path
+ * @param {Record<string, string>} [params]
+ */
+async function getJson(path, params) {
+  const query = params ? `?${new URLSearchParams(params)}` : ''
+  const response = await api.fetchApi(`${path}${query}`)
+  let data = null
+  try {
+    data = await response.json()
+  } catch {
+    // Non-JSON body (proxy error page etc.) -- fall through to status check.
+  }
+  if (!response.ok) {
+    const message = data && data.error ? data.error : `HTTP ${response.status}`
+    const error = new Error(message)
+    error.status = response.status
+    throw error
+  }
+  return data
+}
+
+/**
+ * *text* if it already fits in *maxChars*, else `'…' + the last
+ * (maxChars - 1) characters` -- truncated from the FRONT so the tail
+ * (usually the filename, the part that actually identifies the file) stays
+ * visible. Ported from `notebook.js`/`cprb/nodes.js`'s identical
+ * `frontTruncate()`, with a fixed character budget rather than their
+ * `ResizeObserver`-driven pixel measurement -- a reasonable simplification
+ * for this file's small, fixed-width bar (unlike the Notebook's full-width,
+ * highly variable file panel).
+ * @param {string} text
+ * @param {number} [maxChars]
+ */
+function frontTruncate(text, maxChars = 60) {
+  const value = String(text ?? '')
+  if (value.length <= maxChars) return value
+  return `…${value.slice(-(maxChars - 1))}`
+}
+
+// ---------------------------------------------------------------------------
+// Node / widget lookups
+// ---------------------------------------------------------------------------
+
+/**
+ * @param {object} node
+ * @returns {string|null} the node's ComfyUI class id, or null if it can't be
+ * determined (ported from `notebook.js`'s `isNotebookNode`/`nodeClassOf`).
+ */
+function nodeClassOf(node) {
+  if (!node) return null
+  if (node.comfyClass) return node.comfyClass
+  if (node.constructor && node.constructor.comfyClass) return node.constructor.comfyClass
+  return null
+}
+
+function findWidget(node, name) {
+  return node.widgets?.find((w) => w && w.name === name)
+}
+
+/** Writes *value* through *widget*'s real setter + callback, so a
+ * programmatic change (Browse's onChoose) behaves exactly like the user
+ * having typed/picked it themselves. Ported from `notebook.js`/`cprb/
+ * nodes.js`'s identical `setFileWidgetValue`/`setWidgetValue`. */
+function writeWidgetValue(widget, node, value) {
+  widget.value = value
+  try {
+    widget.callback?.(value)
+  } catch (error) {
+    warn(`${widget.name} widget callback threw`, error)
+  }
+  node.graph?.setDirtyCanvas(true, true)
+}
+
+function hideWidget(node, widget) {
+  widget.hidden = true
+  node.graph?.setDirtyCanvas(true, true)
+}
+
+// ---------------------------------------------------------------------------
+// Styles -- one injected <style> tag, guarded so re-registration (hot
+// reload, multiple nodes) never duplicates it. ComfyUI theme variables with
+// literal fallbacks, matching every other DOM widget in this pack.
+// ---------------------------------------------------------------------------
+
+let stylesInjected = false
+
+const CSS_TEXT = `
+.epsfs-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  background: var(--comfy-menu-bg, #262626);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--input-text, #ccc);
+  overflow: hidden;
+}
+.epsfs-btn {
+  flex: 0 0 auto;
+  background: var(--comfy-input-bg, #1e1e1e);
+  border: 1px solid var(--border-color, #444);
+  color: var(--input-text, #ccc);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.epsfs-btn:hover:not(:disabled) { background: var(--content-hover-bg, #2a2a2a); }
+.epsfs-btn:disabled { opacity: 0.5; cursor: default; }
+.epsfs-btn-small { padding: 2px 8px; }
+.epsfs-btn-icon { min-width: 30px; text-align: center; font-weight: 600; }
+.epsfs-path-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  color: var(--descrip-text, #999);
+}
+.epsfs-host-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-style: italic;
+  color: var(--descrip-text, #999);
+}
+.epsfs-host-note:empty { display: none; }
+.epsfs-path-status {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: right;
+  color: var(--descrip-text, #999);
+}
+.epsfs-path-status:empty { display: none; }
+.epsfs-path-status-error { color: var(--error-text, #ff4444); }
+.epsfs-videowrap {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  background: #000;
+  border: 1px solid var(--border-color, #444);
+  border-radius: 4px;
+}
+.epsfs-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+  cursor: pointer;
+}
+.epsfs-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 12px;
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--input-text, #ccc);
+  font-size: 12px;
+  font-style: italic;
+  pointer-events: none;
+}
+.epsfs-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  height: 100%;
+  box-sizing: border-box;
+  padding: 4px 6px;
+  background: var(--comfy-menu-bg, #262626);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--input-text, #ccc);
+  overflow: hidden;
+}
+.epsfs-frame-input {
+  flex: 0 0 auto;
+  width: 56px;
+  box-sizing: border-box;
+  background: var(--comfy-input-bg, #1e1e1e);
+  border: 1px solid var(--border-color, #444);
+  color: var(--input-text, #ccc);
+  border-radius: 4px;
+  padding: 3px 5px;
+  font-size: 11px;
+}
+.epsfs-frame-input:disabled { opacity: 0.5; }
+.epsfs-counter {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  text-align: right;
+  color: var(--descrip-text, #999);
+}
+.epsfs-picker-backdrop {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: 10000;
+}
+.epsfs-picker {
+  display: flex;
+  flex-direction: column;
+  width: min(480px, 90vw);
+  max-height: min(520px, 80vh);
+  background: var(--comfy-menu-bg, #262626);
+  border: 1px solid var(--border-color, #444);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--input-text, #ccc);
+}
+.epsfs-picker-pathbar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color, #444);
+}
+.epsfs-picker-path-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--comfy-input-bg, #1e1e1e);
+  border: 1px solid var(--border-color, #444);
+  color: var(--input-text, #ccc);
+  border-radius: 4px;
+  padding: 4px 6px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+}
+.epsfs-picker-path-input:focus { outline: 1px solid var(--input-focus-border, #5c9dff); }
+.epsfs-picker-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.epsfs-picker-header {
+  flex: 0 0 auto;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border-color, #444);
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--descrip-text, #999);
+}
+.epsfs-picker-list {
+  flex: 1 1 auto;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: 4px;
+}
+.epsfs-picker-row {
+  padding: 5px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.epsfs-picker-row:hover { background: var(--content-hover-bg, #2a2a2a); }
+.epsfs-picker-status,
+.epsfs-picker-empty {
+  padding: 10px;
+  color: var(--descrip-text, #999);
+  font-style: italic;
+}
+.epsfs-picker-error { color: var(--error-text, #ff4444); font-style: normal; }
+.epsfs-picker-footer {
+  flex: 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 6px 8px;
+  border-top: 1px solid var(--border-color, #444);
+}
+`
+
+function injectStyles() {
+  if (stylesInjected) return
+  stylesInjected = true
+  if (document.getElementById(STYLE_TAG_ID)) return
+  const style = document.createElement('style')
+  style.id = STYLE_TAG_ID
+  style.textContent = CSS_TEXT
+  document.head.appendChild(style)
+}
+
+// ---------------------------------------------------------------------------
+// Remote gating (FORMAT.md §6.7 "Host-only Browse") -- `GET /lora_library/
+// config` cached at MODULE scope (every attached EPSFrameSaver node shares
+// one fetch) with a short TTL; concurrent callers de-dupe onto one in-flight
+// promise. Ported from `notebook.js`/`cprb/nodes.js`'s identical
+// `fetchConfig`/`getConfig`/`refreshGating`. Reusing lora_library's OWN
+// `/config` route (rather than inventing a second one) matches this file
+// reusing `/lora_library/fs/list` for Browse -- both are the pack's existing
+// "am I local" + "browse the server filesystem" primitives, and FORMAT.md
+// §6.7 explicitly says to reuse the fs/list standard rather than building a
+// parallel one.
+// ---------------------------------------------------------------------------
+
+const CONFIG_CACHE_TTL_MS = 60000
+
+let cachedConfig = null
+let cachedConfigAt = 0
+let cachedConfigPromise = null
+
+function fetchConfig() {
+  if (cachedConfigPromise) return cachedConfigPromise
+  cachedConfigPromise = getJson('/lora_library/config')
+    .then((data) => {
+      cachedConfig = data
+      cachedConfigAt = Date.now()
+      return data
+    })
+    .finally(() => {
+      cachedConfigPromise = null
+    })
+  return cachedConfigPromise
+}
+
+function getConfig() {
+  if (cachedConfig && Date.now() - cachedConfigAt < CONFIG_CACHE_TTL_MS) {
+    return Promise.resolve(cachedConfig)
+  }
+  return fetchConfig()
+}
+
+/**
+ * Refreshes `state.isLocal` from (cached) `/lora_library/config` and applies
+ * it (hides Browse + shows the host-machine note on a remote viewer). Never
+ * throws: a failed fetch leaves `state.isLocal` whatever it already was
+ * (`null`/unknown reads as local everywhere this is checked with
+ * `=== false`) -- fails OPEN rather than disabling the node over a network
+ * hiccup, this pack's usual posture.
+ */
+async function refreshGating(state) {
+  let config
+  try {
+    config = await getConfig()
+  } catch (error) {
+    warn('could not load /lora_library/config; treating this node as local', error)
+    return
+  }
+  state.isLocal = config?.is_local !== false
+  applyGating(state)
+}
+
+function applyGating(state) {
+  const remote = state.isLocal === false
+  if (state.browseBtn) state.browseBtn.style.display = remote ? 'none' : ''
+  if (state.hostNoteEl) {
+    state.hostNoteEl.textContent = remote ? 'Host machine only' : ''
+    state.hostNoteEl.title = remote
+      ? 'Video preview and probing only work on the machine running ComfyUI; Run still works.'
+      : ''
+  }
+  refreshVideoSource(state) // re-decide the preview now that isLocal is known.
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+function createState(node, pathWidget, frameWidget) {
+  return {
+    node,
+    pathWidget,
+    frameWidget,
+    path: '',
+    // GET /eps_frame_saver/probe's last successful result, or null.
+    probe: null,
+    // Bumped on every path change; a probe response is discarded if this no
+    // longer matches the token it was issued under (stale, superseded by a
+    // later path change) -- same guard shape as notebook.js's loadToken.
+    probeToken: 0,
+    // §2/§7.1-style locality verdict; null = not yet known (treated as
+    // local -- see refreshGating's docstring).
+    isLocal: null,
+    // null = loading/unknown, true = the <video> can decode this file,
+    // false = it fired an `error` event (exotic codec) -- see file header's
+    // "Exotic codecs degrade gracefully" section.
+    videoPlayable: null,
+    // DOM refs, filled in by buildUi().
+    videoEl: null,
+    overlayEl: null,
+    browseBtn: null,
+    pathTextEl: null,
+    hostNoteEl: null,
+    pathStatusEl: null,
+    stepBackBtn: null,
+    playPauseBtn: null,
+    stepFwdBtn: null,
+    frameInputEl: null,
+    counterEl: null,
+    // The Browse picker's window-level Escape-key listener while open (the
+    // picker lives on document.body, not inside this widget's own DOM).
+    pickerKeydownHandler: null,
+    pickerPathInputEl: null
+  }
+}
+
+// ---------------------------------------------------------------------------
+// DOM-widget attachment (see file header's "DOM-widget sizing" section for
+// which of these two shapes each of the three widgets below uses, and why).
+// ---------------------------------------------------------------------------
+
+function attachFillWidget(node, name, type, element, minHeight) {
+  const domWidget = node.addDOMWidget(name, type, element, {
+    hideOnZoom: true,
+    serialize: false, // excludes from the API prompt (utils/executionUtil.ts)
+    getMinHeight: () => minHeight
+    // Deliberately no getMaxHeight: litegraph's widget-arrange pass then
+    // gives this widget whatever height remains after the fixed-height bars
+    // above/below it (notebook.js attachDomWidget()'s identical pattern).
+  })
+  domWidget.serialize = false // excludes from the workflow JSON (a DIFFERENT flag -- see file header)
+  domWidget.serializeValue = () => undefined
+  return domWidget
+}
+
+function attachFixedWidget(node, name, type, element, height) {
+  const domWidget = node.addDOMWidget(name, type, element, {
+    hideOnZoom: true,
+    serialize: false,
+    getMinHeight: () => height,
+    getMaxHeight: () => height
+  })
+  // getMinHeight/getMaxHeight ALONE are ignored for a small standalone DOM
+  // widget on the Vue-node renderer (cprb/nodes.js's attachBarWidget(): "the
+  // bar collapsed to ~7px"). All four knobs together is the robust fix --
+  // see file header.
+  domWidget.computeSize = (width) => [width, height]
+  domWidget.computedHeight = height
+  element.style.height = `${height}px`
+  element.style.minHeight = `${height}px`
+  domWidget.serialize = false
+  domWidget.serializeValue = () => undefined
+  return domWidget
+}
+
+// ---------------------------------------------------------------------------
+// UI construction
+// ---------------------------------------------------------------------------
+
+function buildPathBar(state) {
+  state.browseBtn = el('button', {
+    className: 'epsfs-btn',
+    text: 'Browse…',
+    attrs: { title: 'Pick a video file on the server (never copied into ComfyUI)' }
+  })
+  state.browseBtn.addEventListener('click', () => {
+    if (state.browseBtn.disabled) return
+    openPicker(state)
+  })
+  state.pathTextEl = el('div', { className: 'epsfs-path-text', text: '(no video selected)' })
+  state.hostNoteEl = el('div', { className: 'epsfs-host-note' })
+  state.pathStatusEl = el('div', { className: 'epsfs-path-status' })
+  return el('div', { className: 'epsfs-bar' }, [
+    state.browseBtn,
+    state.pathTextEl,
+    state.hostNoteEl,
+    state.pathStatusEl
+  ])
+}
+
+function buildVideoArea(state) {
+  state.videoEl = el('video', { className: 'epsfs-video' })
+  state.videoEl.loop = true
+  state.videoEl.muted = true
+  state.videoEl.playsInline = true
+  state.videoEl.preload = 'auto'
+  state.videoEl.controls = false // this file owns the whole control surface -- see file header
+  state.overlayEl = el('div', { className: 'epsfs-overlay', text: 'No video selected' })
+  wireVideoEvents(state)
+  return el('div', { className: 'epsfs-videowrap' }, [state.videoEl, state.overlayEl])
+}
+
+function buildControlStrip(state) {
+  state.stepBackBtn = el('button', {
+    className: 'epsfs-btn epsfs-btn-icon',
+    text: '−1',
+    attrs: { title: 'Step back one frame' }
+  })
+  state.playPauseBtn = el('button', {
+    className: 'epsfs-btn epsfs-btn-icon',
+    text: '▶',
+    attrs: { title: 'Play preview' }
+  })
+  state.stepFwdBtn = el('button', {
+    className: 'epsfs-btn epsfs-btn-icon',
+    text: '+1',
+    attrs: { title: 'Step forward one frame' }
+  })
+  state.frameInputEl = el('input', {
+    className: 'epsfs-frame-input',
+    attrs: { type: 'number', min: '0', step: '1', title: 'Frame number' }
+  })
+  state.counterEl = el('div', { className: 'epsfs-counter', text: 'No video selected' })
+
+  state.stepBackBtn.addEventListener('click', () => {
+    setFrame(state, Number(state.frameWidget.value) - 1)
+  })
+  state.stepFwdBtn.addEventListener('click', () => {
+    setFrame(state, Number(state.frameWidget.value) + 1)
+  })
+  state.playPauseBtn.addEventListener('click', () => togglePlayPause(state))
+  state.frameInputEl.addEventListener('change', () => commitFrameInputValue(state))
+  state.frameInputEl.addEventListener('keydown', (event) => {
+    event.stopPropagation() // don't let litegraph's global shortcuts eat this keystroke
+    if (event.key === 'Enter') {
+      event.preventDefault()
+      commitFrameInputValue(state)
+      state.frameInputEl.blur()
+    }
+  })
+
+  return el('div', { className: 'epsfs-strip' }, [
+    state.stepBackBtn,
+    state.playPauseBtn,
+    state.stepFwdBtn,
+    state.frameInputEl,
+    state.counterEl
+  ])
+}
+
+function buildUi(state) {
+  injectStyles()
+  const pathBarEl = buildPathBar(state)
+  const videoAreaEl = buildVideoArea(state)
+  const stripEl = buildControlStrip(state)
+
+  attachFixedWidget(state.node, PATH_BAR_WIDGET_NAME, PATH_BAR_WIDGET_TYPE, pathBarEl, PATH_BAR_HEIGHT)
+  attachFillWidget(state.node, VIDEO_WIDGET_NAME, VIDEO_WIDGET_TYPE, videoAreaEl, VIDEO_MIN_HEIGHT)
+  attachFixedWidget(state.node, STRIP_WIDGET_NAME, STRIP_WIDGET_TYPE, stripEl, STRIP_HEIGHT)
+}
+
+// ---------------------------------------------------------------------------
+// Frame state -- the single source of truth is the (hidden) `frame` widget;
+// every function below either WRITES it (setFrame/syncFrameFromPlayback, on
+// a real change in intent) or just REFRESHES the visible UI from its CURRENT
+// value (refreshFrameUi) -- see file header's "Playback vs. programmatic
+// seeking" section for why the two write paths are kept separate.
+// ---------------------------------------------------------------------------
+
+function clampFrame(state, frame) {
+  const n = Number.isFinite(frame) ? Math.trunc(frame) : 0
+  const max = state.probe ? Math.max(0, state.probe.frame_count - 1) : Number.MAX_SAFE_INTEGER
+  return Math.min(Math.max(n, 0), max)
+}
+
+function updateCounterLabel(state, frame) {
+  if (!state.counterEl) return
+  if (!state.path) {
+    state.counterEl.textContent = 'No video selected'
+    state.counterEl.title = ''
+    return
+  }
+  const total = state.probe ? String(state.probe.frame_count) : '?'
+  state.counterEl.textContent = `Frame ${frame} / ${total}`
+  state.counterEl.title = state.probe
+    ? `${state.probe.fps.toFixed(3)} fps · ${state.probe.duration.toFixed(2)}s · ${state.probe.width}×${state.probe.height}`
+    : ''
+}
+
+/** Seeks the PREVIEW to *frame*'s exact time (`frame / fps`, against the
+ * PROBED fps -- file header). No-ops when the video can't currently seek
+ * (not yet probed, or the codec fallback is active) -- the frame widget/
+ * counter/number-input stay correct regardless; only the visual seek is
+ * skipped. */
+function seekVideoToFrame(state, frame) {
+  if (state.videoPlayable !== true || !state.probe) return
+  const target = frame / state.probe.fps
+  if (Number.isFinite(target)) {
+    try {
+      state.videoEl.currentTime = target
+    } catch (error) {
+      warn('video currentTime seek failed', error)
+    }
+  }
+}
+
+/**
+ * Writes *frame* to the (hidden) `frame` widget -- unconditionally refreshes
+ * the visible number input + counter, but only touches the widget's own
+ * `.value`/`.callback`/canvas-dirty when the value actually changed.
+ * `dirty: false` (used by the high-frequency playback path,
+ * `syncFrameFromPlayback`) skips `setDirtyCanvas` -- nothing CANVAS-visible
+ * depends on this hidden widget's value in real time, and redrawing the
+ * whole LiteGraph canvas on every `timeupdate` tick while a video plays
+ * would be needless overhead.
+ */
+function commitFrame(state, frame, { dirty = true } = {}) {
+  if (state.frameWidget.value !== frame) {
+    state.frameWidget.value = frame
+    try {
+      state.frameWidget.callback?.(frame)
+    } catch (error) {
+      warn('frame widget callback threw', error)
+    }
+    if (dirty) state.node.graph?.setDirtyCanvas(true, true)
+  }
+  if (state.frameInputEl) state.frameInputEl.value = String(frame)
+  updateCounterLabel(state, frame)
+}
+
+/** User-driven frame change (step buttons, typed number, or a probe-time
+ * clamp) -- clamps, commits, AND seeks the preview to match. */
+function setFrame(state, frame) {
+  const clamped = clampFrame(state, frame)
+  commitFrame(state, clamped)
+  seekVideoToFrame(state, clamped)
+}
+
+/** Playback-driven sync (`timeupdate` while playing) -- derives the frame
+ * from the video's OWN current position and commits it, WITHOUT seeking
+ * (the video is already there -- see file header). */
+function syncFrameFromPlayback(state) {
+  if (!state.probe || state.videoPlayable !== true) return
+  const raw = Math.round(state.videoEl.currentTime * state.probe.fps)
+  commitFrame(state, clampFrame(state, raw), { dirty: false })
+}
+
+/** Read-only refresh of the visible UI from the frame widget's CURRENT
+ * value -- never writes the widget. Used for the initial/resync paths
+ * (attach, post-configure, post-probe) where the value itself hasn't
+ * changed, just what we know about its bounds/preview has. */
+function refreshFrameUi(state, { seek = false } = {}) {
+  const raw = Number(state.frameWidget.value)
+  const frame = clampFrame(state, Number.isFinite(raw) ? Math.round(raw) : 0)
+  if (state.frameInputEl) state.frameInputEl.value = String(frame)
+  updateCounterLabel(state, frame)
+  if (seek) seekVideoToFrame(state, frame)
+}
+
+/** Called once right after a probe resolves: if the currently-stored frame
+ * is now out of range for THIS video (e.g. a workflow saved against a
+ * longer clip, now pointed at a shorter one), clamp it for real -- keeping
+ * an unreachable value serialized would be misleading, and `extract_frame`
+ * would silently clamp it anyway at Run time (FORMAT.md §6.7). Otherwise
+ * just refresh the display and seek the (now-known-playable-or-not)
+ * preview to the still-valid current frame. */
+function clampFrameToProbeBounds(state) {
+  if (!state.probe) return
+  const current = Number(state.frameWidget.value)
+  const clamped = clampFrame(state, Number.isFinite(current) ? Math.round(current) : 0)
+  if (clamped !== current) {
+    setFrame(state, clamped)
+  } else {
+    refreshFrameUi(state, { seek: true })
+  }
+}
+
+function commitFrameInputValue(state) {
+  const parsed = Number.parseInt(state.frameInputEl.value, 10)
+  setFrame(state, Number.isFinite(parsed) ? parsed : 0)
+}
+
+// ---------------------------------------------------------------------------
+// Playback controls
+// ---------------------------------------------------------------------------
+
+function togglePlayPause(state) {
+  if (!state.videoEl || state.videoPlayable !== true) return
+  if (state.videoEl.paused) {
+    state.videoEl.play().catch((error) => warn('video play() rejected', error))
+  } else {
+    state.videoEl.pause()
+  }
+}
+
+function updatePlayPauseIcon(state) {
+  if (!state.playPauseBtn) return
+  const playing = Boolean(state.videoEl) && !state.videoEl.paused && !state.videoEl.ended
+  state.playPauseBtn.textContent = playing ? '⏸' : '▶'
+  state.playPauseBtn.title = playing ? 'Pause preview' : 'Play preview'
+}
+
+function wireVideoEvents(state) {
+  const video = state.videoEl
+  video.addEventListener('loadedmetadata', () => {
+    state.videoPlayable = true
+    updateOverlayUi(state)
+    refreshFrameUi(state, { seek: true }) // land the preview on the stored frame, not frame 0
+  })
+  video.addEventListener('error', () => {
+    // FORMAT.md §6.7's exotic-codec fallback -- see file header. Probe data
+    // (if any) is left untouched: it came from PyAV server-side and is
+    // independent of what THIS browser can decode.
+    state.videoPlayable = false
+    updateOverlayUi(state)
+  })
+  video.addEventListener('play', () => updatePlayPauseIcon(state))
+  video.addEventListener('pause', () => updatePlayPauseIcon(state))
+  video.addEventListener('timeupdate', () => {
+    if (!video.paused) syncFrameFromPlayback(state)
+  })
+  video.addEventListener('click', () => togglePlayPause(state))
+}
+
+// ---------------------------------------------------------------------------
+// Overlay / control-enablement (FORMAT.md §6.7's "fail soft throughout")
+// ---------------------------------------------------------------------------
+
+function currentOverlayMessage(state) {
+  if (!state.path) return 'No video selected — Browse for a video file.'
+  if (state.isLocal === false) {
+    return 'Preview + probing require the machine running ComfyUI — Run still works.'
+  }
+  if (state.videoPlayable === false) {
+    return "Preview unavailable for this codec — Run still extracts the exact frame."
+  }
+  if (state.videoPlayable === null) return 'Loading preview…'
+  return '' // playable -- overlay hidden, video shown.
+}
+
+function updateOverlayUi(state) {
+  const message = currentOverlayMessage(state)
+  if (state.overlayEl) {
+    state.overlayEl.textContent = message
+    state.overlayEl.style.display = message ? '' : 'none'
+  }
+  if (state.videoEl) {
+    state.videoEl.style.visibility = message ? 'hidden' : 'visible'
+  }
+  updateControlsEnabled(state)
+}
+
+function updateControlsEnabled(state) {
+  const hasPath = Boolean(state.path)
+  // Step/number-input stay enabled whenever a path is set, REGARDLESS of
+  // preview playability -- they only need the PROBED fps/frame_count
+  // (decoded server-side, independent of what this browser can render), so
+  // they keep working even when the <video> preview itself has degraded.
+  if (state.frameInputEl) state.frameInputEl.disabled = !hasPath
+  if (state.stepBackBtn) state.stepBackBtn.disabled = !hasPath
+  if (state.stepFwdBtn) state.stepFwdBtn.disabled = !hasPath
+  // Play/pause is the one control that genuinely needs a playable preview.
+  if (state.playPauseBtn) state.playPauseBtn.disabled = !hasPath || state.videoPlayable !== true
+}
+
+// ---------------------------------------------------------------------------
+// Path changes -- Browse pick, workflow load/undo resync, or gating flip.
+// ---------------------------------------------------------------------------
+
+function updatePathBarText(state) {
+  if (!state.pathTextEl) return
+  const text = state.path || '(no video selected)'
+  state.pathTextEl.textContent = frontTruncate(text)
+  state.pathTextEl.title = state.path || ''
+}
+
+function setPathBarStatus(state, message, isError = false) {
+  if (!state.pathStatusEl) return
+  state.pathStatusEl.textContent = message || ''
+  state.pathStatusEl.title = message || ''
+  state.pathStatusEl.classList.toggle('epsfs-path-status-error', Boolean(isError))
+}
+
+/**
+ * `GET /eps_frame_saver/probe` for *path*, guarded by `state.probeToken` so
+ * a slow response from a since-superseded path can never clobber current
+ * state (mirrors `notebook.js`'s identical `loadToken` guard).
+ */
+async function startProbe(state, path) {
+  const token = state.probeToken
+  setPathBarStatus(state, '')
+  try {
+    const data = await getJson('/eps_frame_saver/probe', { path })
+    if (token !== state.probeToken) return // superseded by a later path change
+    state.probe = data
+    clampFrameToProbeBounds(state)
+  } catch (error) {
+    if (token !== state.probeToken) return
+    state.probe = null
+    setPathBarStatus(state, error.message || 'Could not probe this video.', true)
+    refreshFrameUi(state)
+  }
+}
+
+/**
+ * Re-derives the preview (video `src` + probe fetch) from `state.path` +
+ * `state.isLocal`. Called after every path change AND after gating
+ * resolves/changes (`applyGating`) -- idempotent, safe to call redundantly.
+ */
+function refreshVideoSource(state) {
+  state.videoPlayable = null
+  state.probe = null
+  state.probeToken += 1
+
+  if (!state.path || state.isLocal === false) {
+    // Empty path, or a remote viewer (the stream/probe routes are
+    // loopback-only regardless -- FORMAT.md §6.7 -- so don't even try;
+    // avoids a confusing generic video `error` event standing in for "this
+    // requires the host machine").
+    state.videoEl.removeAttribute('src')
+    state.videoEl.load()
+  } else {
+    const url = api.apiURL(`/eps_frame_saver/stream?path=${encodeURIComponent(state.path)}`)
+    state.videoEl.src = url
+    state.videoEl.load()
+    startProbe(state, state.path)
+  }
+  updateOverlayUi(state)
+  refreshFrameUi(state)
+}
+
+function onPathChanged(state, rawPath) {
+  state.path = String(rawPath || '').trim()
+  updatePathBarText(state)
+  setPathBarStatus(state, '')
+  refreshVideoSource(state)
+}
+
+/** Re-derives EVERYTHING from the widgets' CURRENT values -- the single
+ * entry point all three restore-timing hooks call (see file header). */
+function fullResync(state) {
+  onPathChanged(state, state.pathWidget.value)
+}
+
+// ---------------------------------------------------------------------------
+// Browse picker (FORMAT.md §6.7's "Browse a file server-side") -- trimmed,
+// file-mode-only port of `cprb/nodes.js`'s `openPicker` family; see file
+// header for the full citation.
+// ---------------------------------------------------------------------------
+
+function closePicker(state) {
+  document.getElementById(PICKER_OVERLAY_ID)?.remove()
+  if (state.pickerKeydownHandler) {
+    window.removeEventListener('keydown', state.pickerKeydownHandler)
+    state.pickerKeydownHandler = null
+  }
+  state.pickerPathInputEl = null
+}
+
+function looksAbsolutePath(value) {
+  const trimmed = typeof value === 'string' ? value.trim() : ''
+  if (!trimmed) return false
+  if (trimmed.startsWith('/')) return true // POSIX
+  if (/^[a-zA-Z]:[\\/]/.test(trimmed)) return true // Windows drive, e.g. C:\ or C:/
+  if (trimmed.startsWith('\\\\')) return true // UNC, e.g. \\server\share
+  return false
+}
+
+function dirnameOfServerPath(path) {
+  const trimmed = typeof path === 'string' ? path.trim() : ''
+  if (!trimmed) return null
+  const sep = trimmed.includes('\\') && !trimmed.includes('/') ? '\\' : '/'
+  const idx = trimmed.lastIndexOf(sep)
+  if (idx <= 0) return null
+  return trimmed.slice(0, idx)
+}
+
+/**
+ * @param {string} dir
+ * @param {string} name
+ * @param {string} [sep] - the server-reported `sep` (`fs/list`'s response
+ * field) -- preferred when given, since it's authoritative for the machine
+ * actually being browsed.
+ */
+function joinServerPath(dir, name, sep) {
+  const separator = sep || (dir.includes('\\') && !dir.includes('/') ? '\\' : '/')
+  return dir.endsWith(separator) ? `${dir}${name}` : `${dir}${separator}${name}`
+}
+
+function openPicker(state) {
+  closePicker(state) // only one picker at a time, ever
+  injectStyles()
+
+  const backdrop = el('div', { className: 'epsfs-picker-backdrop', attrs: { id: PICKER_OVERLAY_ID } })
+  const dialog = el('div', { className: 'epsfs-picker' })
+  backdrop.append(dialog)
+  backdrop.addEventListener('mousedown', (event) => {
+    if (event.target === backdrop) closePicker(state)
+  })
+  dialog.addEventListener('mousedown', (event) => event.stopPropagation())
+  document.body.append(backdrop)
+
+  state.pickerKeydownHandler = (event) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      closePicker(state)
+    }
+  }
+  window.addEventListener('keydown', state.pickerKeydownHandler)
+
+  // The navigable area is its own child so the path bar built next (which
+  // sits above it, for the picker's whole lifetime) is never wiped out by
+  // loadPickerDir()'s replaceChildren() calls.
+  const content = el('div', { className: 'epsfs-picker-content' })
+  dialog.append(buildPickerPathBar(state, content), content)
+
+  const startDir = looksAbsolutePath(state.path) ? dirnameOfServerPath(state.path) : null
+  loadPickerDir(state, content, startDir)
+}
+
+function buildPickerPathBar(state, content) {
+  const input = el('input', {
+    className: 'epsfs-picker-path-input',
+    attrs: {
+      type: 'text',
+      placeholder: String.raw`\\server\share or D:\clips`,
+      spellcheck: 'false',
+      autocomplete: 'off'
+    }
+  })
+  const goBtn = el('button', {
+    className: 'epsfs-btn epsfs-btn-small',
+    text: 'Go',
+    attrs: { title: 'Go to this path' }
+  })
+
+  const goToTypedPath = () => {
+    const typed = input.value.trim()
+    if (!typed) return
+    loadPickerDir(state, content, typed)
+  }
+  goBtn.addEventListener('click', goToTypedPath)
+  input.addEventListener('keydown', (event) => {
+    event.stopPropagation()
+    if (event.key !== 'Enter') return
+    event.preventDefault()
+    goToTypedPath()
+  })
+
+  state.pickerPathInputEl = input
+  return el('div', { className: 'epsfs-picker-pathbar' }, [input, goBtn])
+}
+
+async function loadPickerDir(state, content, dir) {
+  content.replaceChildren(el('div', { className: 'epsfs-picker-status', text: 'Loading…' }))
+  const params = { ext: VIDEO_EXT_PARAM }
+  if (dir) params.dir = dir
+  let data
+  try {
+    data = await getJson('/lora_library/fs/list', params)
+  } catch (error) {
+    content.replaceChildren(
+      el('div', {
+        className: 'epsfs-picker-header',
+        text: frontTruncate(dir || 'Browse'),
+        attrs: { title: dir || '' }
+      }),
+      el('div', {
+        className: 'epsfs-picker-status epsfs-picker-error',
+        text: `Could not list folder: ${error.message}`
+      }),
+      buildPickerFooter(state)
+    )
+    return
+  }
+  renderPickerDialog(state, content, data)
+}
+
+function renderPickerDialog(state, content, data) {
+  if (state.pickerPathInputEl) {
+    state.pickerPathInputEl.value = data.dir === FS_ROOTS ? '' : data.dir
+  }
+
+  const isRootsList = data.dir === FS_ROOTS
+  const headerText = isRootsList ? 'Top Level' : data.dir
+  const header = el('div', {
+    className: 'epsfs-picker-header',
+    text: frontTruncate(headerText),
+    attrs: { title: headerText }
+  })
+  const list = el('div', { className: 'epsfs-picker-list' })
+
+  if (data.parent !== null) {
+    const upRow = el('div', { className: 'epsfs-picker-row', text: '.. (parent folder)' })
+    upRow.addEventListener('click', () => loadPickerDir(state, content, data.parent))
+    list.append(upRow)
+  }
+  for (const dirEntry of data.dirs || []) {
+    const row = el('div', {
+      className: 'epsfs-picker-row',
+      text: isRootsList ? dirEntry.name : `${dirEntry.name}/`
+    })
+    const target = isRootsList ? dirEntry.path : joinServerPath(data.dir, dirEntry.name, data.sep)
+    row.addEventListener('click', () => loadPickerDir(state, content, target))
+    list.append(row)
+  }
+  for (const file of data.files || []) {
+    const row = el('div', { className: 'epsfs-picker-row', text: file.name })
+    row.addEventListener('click', () => {
+      const path = joinServerPath(data.dir, file.name, data.sep)
+      closePicker(state)
+      chooseVideoPath(state, path)
+    })
+    list.append(row)
+  }
+  const hasFiles = (data.files || []).length > 0
+  if (data.parent === null && !(data.dirs || []).length && !hasFiles) {
+    list.append(el('div', { className: 'epsfs-picker-empty', text: 'No subfolders or video files here.' }))
+  }
+
+  content.replaceChildren(header, list, buildPickerFooter(state))
+}
+
+function buildPickerFooter(state) {
+  const cancelBtn = el('button', { className: 'epsfs-btn epsfs-btn-small', text: 'Cancel' })
+  cancelBtn.addEventListener('click', () => closePicker(state))
+  return el('div', { className: 'epsfs-picker-footer' }, [cancelBtn])
+}
+
+/** Writes the chosen path through the real `video_path` widget (so it
+ * serializes/reaches `execute()` exactly like typing it would), then runs
+ * the same path-change flow every other trigger uses. */
+function chooseVideoPath(state, path) {
+  writeWidgetValue(state.pathWidget, state.node, path)
+  onPathChanged(state, path)
+}
+
+// ---------------------------------------------------------------------------
+// Node lifecycle
+// ---------------------------------------------------------------------------
+
+function wireNodeCleanup(state) {
+  const node = state.node
+  const originalOnRemoved = node.onRemoved
+  node.onRemoved = function (...args) {
+    let result
+    if (typeof originalOnRemoved === 'function') {
+      try {
+        result = originalOnRemoved.apply(this, args)
+      } catch (error) {
+        warn('original node onRemoved threw', error)
+      }
+    }
+    try {
+      closePicker(state)
+      nodeStates.delete(node)
+    } catch (error) {
+      warn('frame_saver teardown failed', error)
+    }
+    return result
+  }
+}
+
+/** Undo/redo re-applies a node's prior serialized state via
+ * `LGraphNode.configure()` directly -- it does NOT recreate the node
+ * instance, so `nodeCreated`/`attach()` never runs again for it (see file
+ * header's citation of `eps_image/image_grid.js`'s identical finding for its
+ * own uuid dedup). Wrapping `onConfigure` here is the belt-and-suspenders
+ * third resync path alongside the deferred `attach()` call and
+ * `loadedGraphNode()` below -- all three landing on the same idempotent
+ * `fullResync()`. */
+function wireConfigureResync(state) {
+  const node = state.node
+  const originalOnConfigure = node.onConfigure
+  node.onConfigure = function (...args) {
+    const result =
+      typeof originalOnConfigure === 'function' ? originalOnConfigure.apply(this, args) : undefined
+    try {
+      fullResync(state)
+    } catch (error) {
+      warn('post-configure resync failed', error)
+    }
+    return result
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points (called from web/eps_image.js)
+// ---------------------------------------------------------------------------
+
+/** EPSFrameSaver is a real backend node (no frontend-only type registration
+ * needed) -- everything here is per-instance, done in attach(). Kept as an
+ * export because eps_image.js calls it unconditionally. */
+export function init() {}
+
+/** Per-node-instance attach; no-op unless *node* is an EPSFrameSaver. */
+export function attach(node) {
+  try {
+    if (!node) return
+    if (nodeClassOf(node) !== CLASS_ID) return
+    if (nodeStates.has(node)) return
+    if (typeof node.addDOMWidget !== 'function') {
+      warn('this ComfyUI frontend has no addDOMWidget; frame_saver player not attached')
+      return
+    }
+
+    const pathWidget = findWidget(node, PATH_WIDGET_NAME)
+    const frameWidget = findWidget(node, FRAME_WIDGET_NAME)
+    if (!pathWidget || !frameWidget) {
+      warn('EPSFrameSaver node is missing its video_path/frame widgets; player not attached')
+      return
+    }
+
+    const state = createState(node, pathWidget, frameWidget)
+    nodeStates.set(node, state)
+
+    buildUi(state)
+    hideWidget(node, pathWidget)
+    hideWidget(node, frameWidget)
+    wireNodeCleanup(state)
+    wireConfigureResync(state)
+
+    refreshGating(state).catch((error) => warn('initial config load failed', error))
+
+    // Deferred one tick -- see file header's "Post-configure() resync"
+    // section for exactly why this can't run synchronously here.
+    setTimeout(() => {
+      try {
+        fullResync(state)
+      } catch (error) {
+        warn('deferred initial resync failed', error)
+      }
+    }, 0)
+  } catch (error) {
+    warn('attach failed', error)
+  }
+}
+
+/** Fires once per node, AFTER a whole saved workflow has finished loading
+ * (every node's widgets already restored) -- the cross-workflow-load resync
+ * path; see file header. No-op unless *node* was actually attached. */
+export function loadedGraphNode(node) {
+  try {
+    if (!node) return
+    const state = nodeStates.get(node)
+    if (!state) return
+    fullResync(state)
+  } catch (error) {
+    warn('loadedGraphNode resync failed', error)
+  }
+}

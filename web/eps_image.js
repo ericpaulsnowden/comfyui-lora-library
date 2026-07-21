@@ -11,6 +11,7 @@ import { app } from '../../scripts/app.js'
 import * as switcher from './eps_image/switcher.js'
 import * as resolution from './eps_image/resolution.js'
 import * as imageGrid from './eps_image/image_grid.js'
+import * as frameSaver from './eps_image/frame_saver.js'
 
 const PREFIX = '[eps_image]'
 const REPO_URL = 'https://github.com/ericpaulsnowden/comfyui-epsnodes'
@@ -35,6 +36,7 @@ app.registerExtension({
     safely('switcher.init', () => switcher.init?.())
     safely('resolution.init', () => resolution.init?.())
     safely('imageGrid.init', () => imageGrid.init?.())
+    safely('frameSaver.init', () => frameSaver.init?.())
   },
 
   /** Fires once per node instance; each attach is a no-op for other types. */
@@ -42,16 +44,19 @@ app.registerExtension({
     safely('switcher.attach', () => switcher.attach?.(node))
     safely('resolution.attach', () => resolution.attach?.(node))
     safely('imageGrid.attach', () => imageGrid.attach?.(node))
+    safely('frameSaver.attach', () => frameSaver.attach?.(node))
   },
 
   /**
    * Fires once per node, AFTER a whole saved workflow has finished loading
    * (every node's widgets/properties already restored) — EPS Image Grid's
-   * §6.6 cross-workflow-reuse half of its uuid dedup; see
-   * `eps_image/image_grid.js`'s own header comment for the exact hook this
-   * is (verified against the installed frontend package's bundle).
+   * §6.6 cross-workflow-reuse half of its uuid dedup, and EPS Frame Saver's
+   * §6.7 identical restore-timing resync; see each module's own header
+   * comment for the exact hook this is (verified against the installed
+   * frontend package's bundle).
    */
   loadedGraphNode(node) {
     safely('imageGrid.loadedGraphNode', () => imageGrid.loadedGraphNode?.(node))
+    safely('frameSaver.loadedGraphNode', () => frameSaver.loadedGraphNode?.(node))
   }
 })

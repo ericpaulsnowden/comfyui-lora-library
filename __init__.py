@@ -87,6 +87,7 @@ _NODE_SPECS = [
     ("eps_image.nodes_switcher", "EPSSwitcher", "EPS Switcher"),
     ("eps_image.nodes_resolution", "EPSResolution", "EPS Resolution"),
     ("eps_image.nodes_image_grid", "EPSImageGrid", "EPS Image Grid"),
+    ("eps_image.nodes_frame_saver", "EPSFrameSaver", "EPS Frame Saver"),
 ]
 
 NODE_CLASS_MAPPINGS = {}
@@ -117,6 +118,20 @@ try:
     _image_grid_routes.register()
 except Exception:
     logger.exception("lora_library: eps_image.routes_image_grid failed to register")
+
+# EPSFrameSaver's own route module (FORMAT.md §6.7: `GET /eps_frame_saver/
+# probe` + `GET /eps_frame_saver/stream`) — same reasoning as
+# eps_image.routes_image_grid just above: no LibraryContext needed (it
+# validates whatever absolute path the frontend sends), so it isn't folded
+# into `_routes.register(_context)`, and registered just as defensively.
+try:
+    _frame_saver_routes_path = "eps_image.routes_frame_saver"
+    if _TOP_PREFIX:
+        _frame_saver_routes_path = f"{_TOP_PREFIX}.{_frame_saver_routes_path}"
+    _frame_saver_routes = importlib.import_module(_frame_saver_routes_path)
+    _frame_saver_routes.register()
+except Exception:
+    logger.exception("lora_library: eps_image.routes_frame_saver failed to register")
 
 WEB_DIRECTORY = "./web"
 
