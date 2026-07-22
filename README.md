@@ -20,6 +20,9 @@ Current capabilities, no dependencies:
   [rgthree's Power Lora Loader](https://github.com/rgthree/rgthree-comfy),
   the `Lora Loader State Controller` drives it directly — capture
   its current rows as a state, apply a state back, reorder included.
+  **EPS LoRA Sweep** takes any `LORA_STACK` and auditions it by strength —
+  set a min/max/increment range and it runs your workflow once per step
+  (per lora, or all together) in a single queue.
 - **Image utilities** — **EPS Switcher** toggles any number of image inputs
   on/off and fans the enabled ones out (N enabled → the workflow runs N
   times); **EPS Resolution** is an image-first, all-in-one resize + size
@@ -30,10 +33,10 @@ Current capabilities, no dependencies:
   workflow at once); **EPS Frame Saver** loads a video by path, lets you
   scrub/play to a frame, and outputs that frame as an image.
 
-> **Status: pre-release. Seven capabilities ship today:** the **Prompt
+> **Status: pre-release. Eight capabilities ship today:** the **Prompt
 > Notebook**, **Apply LoRA Set**, the **Lora Loader State Controller**,
-> **EPS Switcher**, **EPS Resolution**, **EPS Image Grid**, and **EPS Frame
-> Saver** (each described below). Contracts live in
+> **EPS LoRA Sweep**, **EPS Switcher**, **EPS Resolution**, **EPS Image
+> Grid**, and **EPS Frame Saver** (each described below). Contracts live in
 > [docs/FORMAT.md](docs/FORMAT.md).
 
 ## Prompt Notebook (shipped)
@@ -157,6 +160,41 @@ expectation — including stacked rows, a dual clip strength, a disabled row,
 and `strength_scale`. It needs `torch` plus an importable ComfyUI (set
 `EPS_COMFYUI_ROOT=/path/to/ComfyUI` if `comfy` isn't already on the path)
 and skips cleanly where those are absent.
+
+## EPS LoRA Sweep (shipped)
+
+`EPSNodes → EPS LoRA Sweep`: audition a lora (or several) by strength —
+wire in a `LORA_STACK`, set `min` / `max` / `increment`, queue once, and
+the rest of your workflow runs at every step.
+
+- **Wire `Apply LoRA Set`'s `lora_stack` output straight in**, alongside
+  the same `model`/`clip` you'd normally pass through the loader — EPS LoRA
+  Sweep does its own applying internally, so no separate "apply the stack"
+  node sits between them. Any other `LORA_STACK` producer works too.
+- **Two modes:** `Each lora independently` (the default) sweeps one lora at
+  a time across the range while every other active lora holds its own
+  saved strength; `All together` moves every active lora to the same value
+  at once. **Watch the run count** — independent mode is `n_loras ×
+  n_steps`, so 3 active loras swept 0.0→1.0 at 0.1 is **33 runs**; all-
+  together mode is just `n_steps` (11, same range) no matter how many
+  loras are active. **Both endpoints are inclusive** — 0.0 to 1.0 at a 0.1
+  increment is 11 steps, not 10.
+- **Outputs:** `model`, `clip`, and `label`, one triple per run, all fanned
+  out together — plug them straight into a sampler chain and it runs once
+  per step automatically, no extra wiring needed. `label` is a
+  filename-safe summary of exactly what that run swept (e.g.
+  `detailer_0.3`) — wire it into a `SaveImage` `filename_prefix` so every
+  image in the batch names itself.
+- **Same seed every run, on purpose:** whatever seed you wire downstream
+  repeats identically across the whole sweep — that's what turns it into a
+  clean side-by-side strength comparison instead of 11 unrelated random
+  images. Want per-step variation too? Wire an explicit per-run seed list
+  instead.
+- Changing **any** setting (even just the mode) re-renders the **whole**
+  sweep on the next queue — there's no partial re-render of only the new
+  steps.
+- `min`/`max` go from −10 to 10 and are **not clamped** to the usual 0–1
+  range, for deliberately testing over- or under-strength.
 
 ## EPS Switcher (shipped)
 

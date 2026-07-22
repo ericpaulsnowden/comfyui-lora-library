@@ -84,6 +84,7 @@ _routes.register(_context)
 _NODE_SPECS = [
     ("lora_library.nodes_notebook", "LoraLibraryNotebook", "Prompt Notebook"),
     ("lora_library.nodes_sets", "LoraLibraryApplySet", "Apply LoRA Set"),
+    ("lora_library.nodes_sweep", "LoraLibrarySweep", "EPS LoRA Sweep"),
     ("eps_image.nodes_switcher", "EPSSwitcher", "EPS Switcher"),
     ("eps_image.nodes_resolution", "EPSResolution", "EPS Resolution"),
     ("eps_image.nodes_image_grid", "EPSImageGrid", "EPS Image Grid"),

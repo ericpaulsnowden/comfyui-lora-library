@@ -922,6 +922,120 @@ single-frame output (NOT a list); "close-enough preview, EXACT on output".
   counter (shared limitation of all prior art); output still lands on a real
   frame. No module-scope torch/av/ComfyUI import.
 
+### §6.8 `LoraLibrarySweep` (display: "EPS LoRA Sweep") — strength iterator
+
+Roadmap: `research/roadmap-eps-lora-sweep.md` (M1 = this section). Lives in
+`lora_library/` (a lora-family feature, unlike the `eps_image/` non-lora
+nodes just above), category "EPSNodes". Class id `LoraLibrarySweep` frozen
+once shipped (§8). Genuinely uncovered per research (`r1-market.md`): no
+MIT-clean node anywhere combines a real min/max/increment range sweep with
+per-activated-lora fan-out and filename-safe labeling in one place.
+
+**ONE node, not a producer+applier pair** (roadmap "Architecture decision:
+ONE node", 2026-07-22): it applies internally, reusing
+`LoraLibraryApplySet._apply_stack` (§6.2) rather than emitting swept stacks
+for a separate standalone `LORA_STACK` applier — the owner's use case never
+needs a stack outside sweeping, so a second node would only be one more
+thing to wire with no benefit; see the roadmap for the full tradeoff.
+
+- **Inputs (all required):** `model` (MODEL), `clip` (CLIP), `lora_stack`
+  (LORA_STACK — wire in any producer's output, most commonly Apply LoRA
+  Set's own `lora_stack`; "activated" = however many rows the wired stack
+  already contains, since a producer like Apply LoRA Set already excludes
+  its own disabled rows). Unlike Apply LoRA Set, `model`/`clip` are NOT
+  optional here — this node is a lora *tester*, it needs a model to be
+  useful; an optional pure-stack-source mode is a possible future, not M1.
+- **Widgets:** `min` / `max` (FLOAT, default 0.0/1.0, range −10.0..10.0,
+  step 0.05), `increment` (FLOAT, default 0.1, range 0.01..10.0, step
+  0.01), `mode` (COMBO: `Each lora independently` default / `All
+  together`).
+- **Outputs:** `RETURN_TYPES=("MODEL","CLIP","STRING")`,
+  `RETURN_NAMES=("model","clip","label")`, all three declared
+  `OUTPUT_IS_LIST=(True,True,True)` — the node produces the WHOLE list up
+  front (not a per-widget list-conversion trick); downstream (KSampler →
+  VAEDecode → SaveImage, none of which declare `INPUT_IS_LIST`) then fans
+  out via ComfyUI's own list execution, running once per planned step —
+  the same Prompt-Notebook/`EPSSwitcher` fan-out mechanic (§6.1/§6.4), not
+  the "wire a list into a widget" pattern.
+- **Step math (fencepost/precision — `build_sweep_plan`'s `_step_values`
+  helper):** `n = max(1, round((max-min)/increment) + 1)` when
+  `increment > 0` and `max >= min`, else a degenerate single step at `min`
+  (covers a non-positive increment, `max < min`, and `min == max` alike —
+  the last reaches the same single-value result through the ordinary
+  formula, since `max >= min` already holds when they're equal). Both ends
+  are INCLUSIVE: `0.0 → 1.0 @ 0.1` is **11** steps, not 10. `max` is a
+  documented CEILING target, not a hard clamp, when the range doesn't
+  divide evenly — the step count rounds to the NEAREST fit. Every value is
+  computed FRESH from its index (`min + i*increment`, then rounded to
+  `increment`'s own decimal precision), never accumulated — accumulating
+  `+= increment` across many steps compounds binary-float error
+  (`0.30000000000000004`-style dirt); computing fresh plus a trailing
+  `round()` keeps every fencepost value exact for any sanely-dialed-in
+  increment.
+- **Mode "Each lora independently" (default):** for every row in
+  `lora_stack`, sweep THAT row's strength across every step while every
+  OTHER row holds its own configured `strength_model`/`strength_clip`
+  unchanged. `n_loras × n_steps` runs total. A row whose stored
+  `strength_model`/`strength_clip` differ is swept on BOTH sides to the
+  same value (locked default — one knob, one mental model, matching what
+  the label then shows; revisit only on feedback).
+- **Mode "All together":** every row in `lora_stack` moves to the SAME
+  swept value at once, one run per step. `n_steps` runs total, independent
+  of how many loras are in the stack (including zero — see the empty-stack
+  note below).
+- **Label:** `nodes_sets._loras_text(swept_stack)` — the same filename-safe
+  `stem_strength` tokens Apply LoRA Set's `loras_text` produces (§6.2),
+  reused verbatim (never reimplemented) — e.g. `detailer_0.3 grain_0.8`.
+  Self-identifying and safe to wire straight into a `SaveImage`
+  `filename_prefix`.
+- **Empty-stack passthrough:** an empty `lora_stack` in "Each lora
+  independently" mode has zero rows to iterate, so the plan would otherwise
+  contain literally ZERO entries — not merely uninteresting: an empty
+  `OUTPUT_IS_LIST` list actively crashes ComfyUI's own list fan-out
+  (`execution.py`'s `slice_dict` indexes the LAST element of each list
+  input; an empty list has none) the moment this node's output feeds any
+  downstream node that also has an ordinary, non-list input — the exact
+  lesson already learned for `EPSSwitcher`'s all-off case and
+  `EPSImageGrid`'s empty buffer (§6.4/§6.6). THERE the fix is an
+  `ExecutionBlocker` (deliberately skip downstream); HERE a base-model
+  passthrough is more useful than a block — nothing about the inputs is
+  wrong, there's just nothing to sweep — so the node instead emits a
+  SINGLE sentinel run: unpatched `model`/`clip` and the label `(no loras to
+  sweep)`. (An empty stack in "All together" mode does NOT hit this guard
+  — it still emits `n_steps` passthrough-shaped runs, since there is
+  always at least one step value regardless of the stack; each just carries
+  an empty label.)
+- **Weight patching:** `m, c = LoraLibraryApplySet._apply_stack(context,
+  model, clip, swept_stack)` per planned step — the exact staticmethod §6.2
+  uses, proven to match ComfyUI's own `LoraLoader` to zero floating-point
+  diff by `tests/test_nodes_sets_weight_math.py`; this node never
+  reimplements weight patching. `_apply_stack` clones a fresh patcher per
+  call, so the N produced models/clips are fully independent of each other
+  — and cheaply so: a `ModelPatcher` is a patch-list over a shared base,
+  not a weight copy, so actual weight materialization stays lazy until
+  sample time. Producing N patched models up front is not N times the
+  VRAM.
+- **No context configured** (node probed before `__init__.py`'s
+  `set_context` loop has run): a single passthrough run — unpatched
+  `model`/`clip`, label `(no context configured)` — mirroring
+  `LoraLibraryApplySet.apply`'s own no-context posture (§6.2), logged as a
+  warning.
+- **Caching:** no `IS_CHANGED` override. Unlike Apply LoRA Set, this node
+  reads no file off disk — `lora_stack` is an ordinary hashed INPUT (the
+  upstream producer re-executes on its own file change, not this node), so
+  ComfyUI's default input-hash caching over the three widgets plus the
+  three wired inputs is already correct. No `VALIDATE_INPUTS` either:
+  `mode`'s COMBO is static (two hardcoded options), not a dynamic
+  set-of-names list like Apply LoRA Set's `set`.
+- **Caveats (surfaced in the node's `DESCRIPTION`):** a scalar seed wired
+  downstream repeats IDENTICALLY across every fanned run — the core
+  list-zip mechanic (§6.4's same caveat) — which is exactly right for a
+  clean strength A/B, not a bug; wire an explicit per-run seed list instead
+  for per-run variation. Changing ANY widget here (even just `mode`)
+  re-renders the WHOLE sweep on the next queue — caching is all-or-nothing
+  per node, never per swept step. `min`/`max` apply UNCLAMPED (−10..10) —
+  deliberate over/under-strength testing is allowed.
+
 ## §7 Frontend surfaces
 
 - **§7.1 Extension entry** `web/lora_library.js`: exactly one
