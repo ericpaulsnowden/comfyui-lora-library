@@ -187,10 +187,11 @@ the rest of your workflow runs at every step.
   increment is 11 steps, not 10.
 - **Outputs:** `model`, `clip`, and `label`, one triple per run, all fanned
   out together — plug them straight into a sampler chain and it runs once
-  per step automatically, no extra wiring needed. `label` is a
-  filename-safe summary of exactly what that run swept (e.g.
-  `detailer_0.3`) — wire it into a `SaveImage` `filename_prefix` so every
-  image in the batch names itself.
+  per step automatically, no extra wiring needed. `label` names exactly the
+  lora and strength that run swept — `my_great_lora_0.5` (in "all together"
+  mode, `all_0.5`) — with a consistent decimal so the files line up and
+  sort. Wire it into a `SaveImage` `filename_prefix` and every image names
+  itself by the lora value under test.
 - **Same seed every run, on purpose:** whatever seed you wire downstream
   repeats identically across the whole sweep — that's what turns it into a
   clean side-by-side strength comparison instead of 11 unrelated random

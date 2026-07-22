@@ -108,6 +108,34 @@ def _decimal_places(value: float, cap: int = 6) -> int:
     return min(len(text.split(".", 1)[1]), cap)
 
 
+def _stem(file: str) -> str:
+    """Basename of *file* with directory and extension stripped, tolerant of
+    either path separator -- the same normalization
+    :func:`nodes_sets._loras_text` uses, so a lora referenced by a set
+    written on the other OS still labels cleanly (FORMAT.md §4).
+    """
+    return file.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+
+
+def _sweep_label(name: str, value: float, ndigits: int) -> str:
+    """One run's filename-safe label: ``<name>_<value>`` (owner ask
+    2026-07-22 -- "name files by exactly the lora + strength under test", e.g.
+    ``my_great_lora_0.5``).
+
+    *value* is formatted to a CONSTANT number of decimals -- *ndigits*, the
+    increment's own precision (:func:`_decimal_places`) -- so a whole sweep's
+    filenames line up and sort naturally (``my_great_lora_0.0``,
+    ``my_great_lora_0.5``, ``my_great_lora_1.0`` for a 0.1 sweep), never the
+    ragged ``_0`` / ``_0.5`` / ``_1`` mix a ``%g``-style format gives at the
+    round-number endpoints. Deliberately NOT
+    :func:`nodes_sets._loras_text`: that lists the WHOLE stack -- every HELD
+    lora too, space-joined -- which buries the one value actually being swept
+    among constants; fine for Apply LoRA Set's static ``loras_text`` output,
+    wrong for a per-run sweep filename.
+    """
+    return f"{name}_{value:.{ndigits}f}"
+
+
 def _step_values(min_v: float, max_v: float, increment: float) -> list[float]:
     """The swept FLOAT values for one lora, both endpoints inclusive.
 
@@ -183,6 +211,15 @@ def build_sweep_plan(
     sweep-both, revisit on feedback") -- one knob per lora, one mental
     model, matching what the label then shows.
 
+    **Label** (per entry, :func:`_sweep_label`): ``<lora>_<value>`` naming
+    ONLY the lora being swept and its value, at the increment's decimal
+    precision -- e.g. ``my_great_lora_0.5``. In "Each lora independently"
+    that's the swept row's stem; in "All together" it's the lone lora's stem
+    (1-lora stack) or ``all`` (≥2). NOT the whole-stack
+    :func:`nodes_sets._loras_text` dump: for a per-run filename the held
+    loras are constant noise, so the label is just the lora + strength under
+    test (owner ask 2026-07-22).
+
     **Empty-plan guard**: the only way this loop produces literally ZERO
     entries is "Each lora independently" over an EMPTY *lora_stack*
     (``for index in range(0)`` never iterates) -- "All together" always
@@ -203,20 +240,33 @@ def build_sweep_plan(
     human-readable label) rather than either an empty list or a block.
     """
     values = _step_values(min_v, max_v, increment)
+    ndigits = _decimal_places(increment)
 
     plan: list[tuple[list[tuple[str, float, float]], str]] = []
     if mode == MODE_ALL_TOGETHER:
+        # Every lora moves to the same value, so no single lora is "the" one
+        # being swept: label by the shared value under a name that says so --
+        # the lone lora's stem when there's exactly one (so a 1-lora sweep
+        # reads identically in either mode), else "all" (e.g. all_0.5). An
+        # empty stack falls to "all" too (len != 1), never indexing [0].
+        name = _stem(lora_stack[0][0]) if len(lora_stack) == 1 else "all"
         for value in values:
             swept_stack = [(file, value, value) for file, _sm, _sc in lora_stack]
-            plan.append((swept_stack, nodes_sets._loras_text(swept_stack)))
+            plan.append((swept_stack, _sweep_label(name, value, ndigits)))
     else:
         for index in range(len(lora_stack)):
+            # The label names ONLY the one lora this block sweeps, at each
+            # value -- the held loras are constant across the whole sweep, so
+            # leaving them out of the per-run filename is the point (owner ask
+            # 2026-07-22: the filename should be the lora + strength under
+            # test, e.g. my_great_lora_0.5, not the whole stack space-joined).
+            name = _stem(lora_stack[index][0])
             for value in values:
                 swept_stack = [
                     (file, value, value) if row_index == index else (file, sm, sc)
                     for row_index, (file, sm, sc) in enumerate(lora_stack)
                 ]
-                plan.append((swept_stack, nodes_sets._loras_text(swept_stack)))
+                plan.append((swept_stack, _sweep_label(name, value, ndigits)))
 
     if not plan:
         return [([], _EMPTY_PLAN_LABEL)]
@@ -278,7 +328,10 @@ class LoraLibrarySweep:
         "Changing ANY widget here re-renders the WHOLE sweep on the next "
         "queue (all-or-nothing node caching, not per-step). min/max accept "
         "-10..10 and are applied UNCLAMPED -- deliberate over/under-"
-        "strength testing is allowed, nothing here clips back to 0..1."
+        "strength testing is allowed, nothing here clips back to 0..1. The "
+        "'label' output names each run <lora>_<strength> (e.g. "
+        "my_great_lora_0.5) -- wire it into Save Image's filename_prefix so "
+        "every saved file says exactly which lora and strength produced it."
     )
 
     @classmethod

@@ -990,10 +990,19 @@ thing to wire with no benefit; see the roadmap for the full tradeoff.
   swept value at once, one run per step. `n_steps` runs total, independent
   of how many loras are in the stack (including zero — see the empty-stack
   note below).
-- **Label:** `nodes_sets._loras_text(swept_stack)` — the same filename-safe
-  `stem_strength` tokens Apply LoRA Set's `loras_text` produces (§6.2),
-  reused verbatim (never reimplemented) — e.g. `detailer_0.3 grain_0.8`.
-  Self-identifying and safe to wire straight into a `SaveImage`
+- **Label** (`_sweep_label`): `<lora>_<value>` naming ONLY the lora being
+  swept and its value — e.g. `my_great_lora_0.5`. In "Each lora
+  independently" that's the swept row's stem; in "All together" it's the lone
+  lora's stem (1-lora stack) or `all` (≥2 loras, e.g. `all_0.5`). The value
+  is formatted to a CONSTANT number of decimals (the increment's own
+  precision, `_decimal_places`) so a sweep's filenames line up and sort
+  (`my_great_lora_0.0` … `my_great_lora_1.0` for a 0.1 sweep), not the ragged
+  `_0`/`_0.5`/`_1` a `%g` format gives at round-number endpoints.
+  Deliberately NOT `nodes_sets._loras_text(swept_stack)` (owner ask
+  2026-07-22): that dumps the WHOLE stack — every HELD lora too, space-joined
+  (`detailer_0.3 grain_0.8`) — which buries the one value under test among
+  constants; right for Apply LoRA Set's static `loras_text` (§6.2), wrong for
+  a per-run sweep filename. Filename-safe; wire straight into a `SaveImage`
   `filename_prefix`.
 - **Empty-stack passthrough:** an empty `lora_stack` in "Each lora
   independently" mode has zero rows to iterate, so the plan would otherwise

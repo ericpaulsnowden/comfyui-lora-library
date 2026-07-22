@@ -189,7 +189,9 @@ class TestBuildSweepPlanAllTogetherMode:
         plan = build_sweep_plan([], 0.0, 1.0, 0.5, MODE_ALL_TOGETHER)
         assert len(plan) == 3
         assert all(swept_stack == [] for swept_stack, _label in plan)
-        assert all(label == "" for _swept_stack, label in plan)  # _loras_text([]) == ""
+        # No lora to name, so all-together falls back to the "all_<value>"
+        # form (never indexes an empty stack); still carries the value.
+        assert [label for _swept_stack, label in plan] == ["all_0.0", "all_0.5", "all_1.0"]
 
 
 class TestBuildSweepPlanIndependentMode:
@@ -262,21 +264,53 @@ class TestBuildSweepPlanModeFallback:
 
 
 class TestBuildSweepPlanLabels:
-    def test_every_label_matches_loras_text_of_its_own_swept_stack(self) -> None:
-        # The task's own definition of label correctness: not a hardcoded
-        # string, but agreement with the shared _loras_text helper.
-        stack = _stack(("a.safetensors", 0.5, 0.5), ("styles/b.safetensors", 0.8, 0.3))
-        for mode in (MODE_INDEPENDENT, MODE_ALL_TOGETHER):
-            plan = build_sweep_plan(stack, 0.0, 1.0, 0.5, mode)
-            for swept_stack, label in plan:
-                assert label == nodes_sets._loras_text(swept_stack)
+    def test_independent_label_names_only_the_swept_lora_and_value(self) -> None:
+        # Owner ask 2026-07-22: the per-run filename is the ONE lora being
+        # swept + its value (e.g. my_great_lora_0.5), NOT the whole-stack
+        # _loras_text dump that buries it among the held loras.
+        stack = _stack(("my_great_lora.safetensors", 0.8, 0.8), ("held.safetensors", 0.3, 0.3))
+        plan = build_sweep_plan(stack, 0.0, 1.0, 0.5, MODE_INDEPENDENT)
+        labels = [label for _swept, label in plan]
+        # Row 0 ("my_great_lora") swept across 0.0/0.5/1.0, then row 1 ("held").
+        assert labels == [
+            "my_great_lora_0.0",
+            "my_great_lora_0.5",
+            "my_great_lora_1.0",
+            "held_0.0",
+            "held_0.5",
+            "held_1.0",
+        ]
 
-    def test_label_is_filename_safe_and_self_identifying(self) -> None:
+    def test_all_together_label_is_all_underscore_value_for_multi_lora(self) -> None:
+        stack = _stack(("a.safetensors", 0.5, 0.5), ("b.safetensors", 0.8, 0.3))
+        plan = build_sweep_plan(stack, 0.0, 1.0, 0.5, MODE_ALL_TOGETHER)
+        assert [label for _swept, label in plan] == ["all_0.0", "all_0.5", "all_1.0"]
+
+    def test_single_lora_reads_the_same_in_either_mode(self) -> None:
+        # A 1-lora sweep names itself by that lora in BOTH modes (all-together
+        # uses the lone stem, not "all"), so switching mode never silently
+        # changes the filenames.
+        stack = _stack(("solo.safetensors", 0.8, 0.8))
+        indep = [label for _s, label in build_sweep_plan(stack, 0.0, 1.0, 0.5, MODE_INDEPENDENT)]
+        allt = [label for _s, label in build_sweep_plan(stack, 0.0, 1.0, 0.5, MODE_ALL_TOGETHER)]
+        assert indep == allt == ["solo_0.0", "solo_0.5", "solo_1.0"]
+
+    def test_value_decimals_are_consistent_to_the_increment_precision(self) -> None:
+        # Endpoints don't collapse to a ragged _0 / _1: a 0.1 sweep formats
+        # every value to 1 decimal so filenames line up and sort; a 0.05
+        # sweep uses 2.
+        stack = _stack(("x.safetensors", 0.5, 0.5))
+        one_dp = [label for _s, label in build_sweep_plan(stack, 0.0, 1.0, 0.1, MODE_INDEPENDENT)]
+        assert one_dp[0] == "x_0.0" and one_dp[-1] == "x_1.0" and "x_0.5" in one_dp
+        two_dp = [label for _s, label in build_sweep_plan(stack, 0.0, 0.1, 0.05, MODE_INDEPENDENT)]
+        assert two_dp == ["x_0.00", "x_0.05", "x_0.10"]
+
+    def test_label_is_filename_safe_dir_stripped(self) -> None:
         stack = _stack(("styles/detailer.safetensors", 0.8, 0.3))
-        plan = build_sweep_plan(stack, 0.6, 0.6, 0.1, MODE_ALL_TOGETHER)
+        plan = build_sweep_plan(stack, 0.6, 0.6, 0.1, MODE_INDEPENDENT)
         [(_swept_stack, label)] = plan
-        assert label == "detailer_0.6"  # basename only, dir stripped, dual->single (sm==sc==v)
-        assert "<" not in label and ":" not in label and "\\" not in label
+        assert label == "detailer_0.6"  # basename only, dir + extension stripped
+        assert "<" not in label and ":" not in label and "\\" not in label and "/" not in label
 
 
 # ---------------------------------------------- build_sweep_plan: empty guard
