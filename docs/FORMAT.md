@@ -1125,21 +1125,61 @@ because core list execution ZIPS index-by-index and repeats the shorter
 list's last element (`execution.py` `slice_dict`, `v[i if len(v) > i else
 -1]`). Core has no cross-product mechanism; this node is it.
 
-- **Inputs (both required):** `images` (IMAGE) + `texts` (STRING,
-  `forceInput` — wire-only, there is nothing sensible to type here).
-  `INPUT_IS_LIST = True` for the same reason as §6.4's switcher: without it
-  core would map THIS node over the longer list, zipping the very lists it
-  exists to multiply.
-- **Outputs:** `image` + `text`, both `OUTPUT_IS_LIST`, length N×M,
-  IMAGE-MAJOR (image 1 with every text in order, then image 2 with every
-  text, …), index-aligned by construction — wire them onward in place of
-  the two originals and downstream runs N×M times with the pairs intact.
-  A `[B,H,W,C]` batch element stays ONE element (switcher-consistent; the
-  node never unpacks upstream batches).
+- **Inputs:** `images` (IMAGE) + `texts` (STRING, `forceInput` — wire-only)
+  required; `names` (STRING, `forceInput`) OPTIONAL (2026-07-23b, §6.10's
+  organization ask): the Prompt Notebook's `name` output, index-aligned
+  with its `text`, crossed identically so each pair keeps a short
+  human-readable identity. `INPUT_IS_LIST = True` for the same reason as
+  §6.4's switcher: without it core would map THIS node over the longer
+  list, zipping the very lists it exists to multiply.
+- **Outputs:** `image` + `text` + `name` (appended 2026-07-23b — additive,
+  existing wires keep their indices; unwired `names` → aligned empty
+  strings, and a short `names` list pads with "" rather than guessing),
+  all `OUTPUT_IS_LIST`, length N×M, IMAGE-MAJOR (image 1 with every text
+  in order, then image 2 with every text, …), index-aligned by
+  construction — wire them onward in place of the originals and downstream
+  runs N×M times with the pairs intact. A `[B,H,W,C]` batch element stays
+  ONE element (switcher-consistent; the node never unpacks upstream
+  batches).
 - **Empty side** (either list empty after dropping `None`s) → the §6.4
   `[ExecutionBlocker(None)]` pattern on BOTH outputs: the branch silently
   skips, the queue succeeds. No `IS_CHANGED` (pure function of inputs).
   No torch/ComfyUI import at module scope (elements are opaque).
+
+### §6.10 `EPSCrossSweep` (display: "EPS Cross Sweep") — sweep × pairs, organized
+
+NON-lora node in `eps_image/`, category "EPSNodes". Class id `EPSCrossSweep`
+frozen once shipped (§8). Owner ask 2026-07-23b: run an EPS LoRA Sweep
+across ALL of §6.9's image/text pairs — sweep(11 steps) × pairs(8) must be
+88 runs, but wiring both into one sampler ZIPS them (§6.9's core
+semantics), yielding 11. This node crosses the two GROUPS while keeping
+each internally aligned — a model is only meaningful with ITS clip and
+label, so two chained Cross Products cannot express it.
+
+- **Inputs (required):** `model` + `clip` + `label` (the sweep's three
+  aligned lists — wire all three from the SAME EPS LoRA Sweep) and
+  `image` + `text` (from the SAME EPS Cross Product). Optional: `name`
+  (Cross Product's `name` output) and a `base_folder` STRING widget (may
+  be empty; `/` allowed for nesting). `INPUT_IS_LIST = True` (§6.9's
+  rationale). Mismatched lengths within a group log a warning and use the
+  min; either group empty → the §6.4 `[ExecutionBlocker(None)]` pattern on
+  all six outputs.
+- **Outputs (all `OUTPUT_IS_LIST`, length steps×pairs):** `model`, `clip`,
+  `image`, `text`, `save_prefix`, `label` — **STRENGTH-MAJOR** (owner
+  decision 2026-07-23b: outer loop = sweep step, so each strength's
+  results land together; 11 steps × 8 pairs = 88, and the run count
+  multiplies again per lora in the sweep's independent mode — surface the
+  math in the DESCRIPTION, the owner manages scale on his side).
+- **`save_prefix`** = the organization ask: per-run
+  `<base_folder>/<sweep label>/<pair name>` ready for
+  `SaveImage.filename_prefix` (core treats `/` as output subfolders) →
+  one folder per strength, files named by pair. Components are sanitized
+  (path separators/Windows-reserved/control chars → `_`, `..` segments
+  dropped, whitespace collapsed); empty pair name falls back to a stable
+  `pair_NN`, empty label to `step_NN`.
+- A fixed seed repeats across all runs (desired: strength and pair are the
+  only moving variables). No `IS_CHANGED` (pure function of inputs). No
+  torch/ComfyUI import at module scope (elements are opaque).
 
 ## §7 Frontend surfaces
 

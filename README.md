@@ -32,14 +32,17 @@ Current capabilities, no dependencies:
   grid and fans the whole set out (gather 10, then run them through a
   workflow at once); **EPS Cross Product** pairs every image with every
   text (2 images × 4 prompts = 8 runs — ComfyUI's own list pairing zips
-  instead); **EPS Frame Saver** loads a video by path, lets you
-  scrub/play to a frame, and outputs that frame as an image.
+  instead); **EPS Cross Sweep** multiplies a whole EPS LoRA Sweep across
+  all of those pairs, strength-grouped, with per-run save paths so big
+  runs land in tidy folders; **EPS Frame Saver** loads a video by path,
+  lets you scrub/play to a frame, and outputs that frame as an image.
 
-> **Status: pre-release. Nine capabilities ship today:** the **EPS Prompt
+> **Status: pre-release. Ten capabilities ship today:** the **EPS Prompt
 > Notebook**, **EPS Apply LoRA Set**, the **EPS Lora Loader State Controller**,
 > **EPS LoRA Sweep**, **EPS Switcher**, **EPS Resolution**, **EPS Image
-> Grid**, **EPS Cross Product**, and **EPS Frame Saver** (each described
-> below). Contracts live in [docs/FORMAT.md](docs/FORMAT.md).
+> Grid**, **EPS Cross Product**, **EPS Cross Sweep**, and **EPS Frame
+> Saver** (each described below). Contracts live in
+> [docs/FORMAT.md](docs/FORMAT.md).
 
 ## EPS Prompt Notebook (shipped)
 
@@ -329,12 +332,41 @@ images × 4 prompts = 8 runs, not 4.
   last entry. Two images + four prompts comes out as four runs, three of
   them reusing the last image. This node produces all the combinations
   instead.
-- **How to wire it:** grid `image` → `images`, notebook `text` → `texts`;
-  then use this node's `image`/`text` outputs downstream in place of the
-  originals. They stay paired index-for-index (image 1 with each prompt in
-  order, then image 2, …).
+- **How to wire it:** grid `image` → `images`, notebook `text` → `texts`
+  (and notebook `name` → `names` if you want each pair to carry its entry
+  name — EPS Cross Sweep uses it for folder names); then use this node's
+  `image`/`text`/`name` outputs downstream in place of the originals. They
+  stay paired index-for-index (image 1 with each prompt in order, then
+  image 2, …).
 - **Empty inputs** (an empty grid, no prompts selected) skip the branch
   cleanly — never a crash.
+
+## EPS Cross Sweep (shipped)
+
+`EPSNodes → EPS Cross Sweep`: run a **whole lora sweep across a whole set
+of image/prompt pairs** — 11 strengths × 8 pairs = 88 runs, grouped by
+strength, each landing in its own folder.
+
+- **Why you need it:** the same list-zipping that made Cross Product
+  necessary happens again one level up — a sweep wired alongside crossed
+  pairs gives you max(11, 8) = 11 runs, not 11 × 8. This node multiplies
+  the sweep group (model/clip/label) by the pair group (image/text) while
+  keeping each group internally matched.
+- **How to wire it:** EPS LoRA Sweep `model`/`clip`/`label` → the same
+  inputs here; EPS Cross Product `image`/`text` (and `name`) → likewise.
+  Use this node's outputs downstream. **Strength-grouped:** all pairs at
+  the first strength, then all pairs at the next.
+- **Folders for free:** wire `save_prefix` into SaveImage's
+  `filename_prefix` and every run lands at
+  `output/<base_folder>/<sweep label>/<pair name>_00001_.png` — one folder
+  per strength, files named by prompt entry. `base_folder` is a text field
+  on the node (nesting with `/` works); the pair name comes from the
+  notebook via Cross Product, with a clean `pair_01` fallback.
+- **Mind the multiplication:** steps × pairs × (loras, in the sweep's
+  independent mode). 2 loras × 11 steps × 8 pairs = 176 generations in one
+  queue — deliberate-use / overnight territory, exactly as intended. A
+  fixed seed repeats across every run, so strength and pair are the only
+  variables moving.
 
 ## EPS Frame Saver (shipped)
 

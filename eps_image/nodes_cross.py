@@ -50,12 +50,22 @@ def _as_clean_list(value: Any) -> list[Any]:
 
 
 class EPSCrossProduct:
-    """N images x M texts -> N*M (image, text) pairs, image-major."""
+    """N images x M texts -> N*M (image, text) pairs, image-major.
+
+    2026-07-23b (owner's folder-organization ask, FORMAT.md §6.10): an
+    optional ``names`` input (the Prompt Notebook's ``name`` output — its
+    entry headings, index-aligned with its ``text``) rides through the
+    SAME cross as a third output, so every pair downstream carries a short
+    human-readable identity — EPS Cross Sweep turns it into the pair half
+    of ``save_prefix``. Additive only: the new output is APPENDED (existing
+    workflows' wires keep their indices), and unwired ``names`` yields
+    empty strings, never a shape change.
+    """
 
     CATEGORY = "EPSNodes"
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("image", "text")
-    OUTPUT_IS_LIST = (True, True)
+    RETURN_TYPES = ("IMAGE", "STRING", "STRING")
+    RETURN_NAMES = ("image", "text", "name")
+    OUTPUT_IS_LIST = (True, True, True)
     INPUT_IS_LIST = True
     FUNCTION = "run"
     DESCRIPTION = (
@@ -81,11 +91,24 @@ class EPSCrossProduct:
                 # multi-select `text` output).
                 "texts": ("STRING", {"forceInput": True}),
             },
+            "optional": {
+                # The Prompt Notebook's `name` output, index-aligned with
+                # its `text` -- crossed identically so each pair keeps its
+                # short identity (class docstring). Optional + additive.
+                "names": ("STRING", {"forceInput": True}),
+            },
         }
 
-    def run(self, images: Any = None, texts: Any = None) -> tuple[list[Any], list[Any]]:
+    def run(
+        self, images: Any = None, texts: Any = None, names: Any = None
+    ) -> tuple[list[Any], list[Any], list[Any]]:
         image_list = _as_clean_list(images)
         text_list = _as_clean_list(texts)
+        # Names align with TEXTS by index (the Notebook emits text/name as
+        # parallel lists); a missing/short list pads with "" rather than
+        # guessing -- downstream fallbacks (EPS Cross Sweep's pair_NN) own
+        # the empty case.
+        name_list = _as_clean_list(names)
 
         if not image_list or not text_list:
             # Same empty-safety pattern as EPSSwitcher/EPSImageGrid (see
@@ -102,12 +125,14 @@ class EPSCrossProduct:
             from comfy_execution.graph import ExecutionBlocker
 
             blocked = [ExecutionBlocker(None)]
-            return (blocked, blocked)
+            return (blocked, blocked, blocked)
 
         out_images: list[Any] = []
         out_texts: list[Any] = []
+        out_names: list[Any] = []
         for image in image_list:
-            for text in text_list:
+            for index, text in enumerate(text_list):
                 out_images.append(image)
                 out_texts.append(text)
-        return (out_images, out_texts)
+                out_names.append(name_list[index] if index < len(name_list) else "")
+        return (out_images, out_texts, out_names)
