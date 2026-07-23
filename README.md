@@ -92,11 +92,13 @@ whole configurations ("states") in and out of it:
   the target's rows snap to it — count, order, toggles, strengths. (Reloading
   a saved workflow never re-applies; only that second click does.)
 - **New State** captures the loader's current rows into a named state
-  file; **Save State** overwrites the selected state with the current rows —
-  **unless you've typed a new name in the field, in which case it saves a
-  brand-new state under that name** (the quickest way to spin a variant off an
-  existing state); **Delete State** removes it (two-click "Are you sure?"
-  confirm — the armed button turns red).
+  file — it's the only button that creates a new entry; **Save State**
+  overwrites the selected state with the current rows — **and if you've
+  typed a different name in the field, it renames that same state in
+  place** (no duplicate entry; saved workflows keep working because the
+  internal id never changes); **Delete State** removes it (two-click "Are
+  you sure?" confirm — the armed button turns red; it's deliberately the
+  last button in the stack).
 - **Multi-loader targeting:** with two or more Power Lora Loaders in the
   graph (WAN high/low noise, for example) the target dropdown offers
   `All Power Lora Loaders (N)`. With `All` selected, a state stores **each

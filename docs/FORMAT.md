@@ -372,10 +372,12 @@ execution — **the file is the truth; the UI is a view.**
 Naming (owner 2026-07-18c, refined 2026-07-19): the node's DISPLAY name is
 **"EPS Lora Loader State Controller"** (was "Power Lora Loader State
 Controller" — "Power" dropped) and every user-facing word in its UI says
-**state**, not set — widget label `state`, buttons `New State` (capture
-current rows as a new state), `Save State` (overwrite the selected state
-with current rows), `Delete State` (two-click confirm), and `Push State`
-(broadcast — below). The class id `LoraLibrarySetController` stays frozen
+**state**, not set — widget label `state`, buttons in this order (Delete
+last — owner ask 2026-07-22): `New State` (capture current rows as a new
+state — the ONLY create path), `Save State` (overwrite the selected state
+with current rows; a changed `name` field renames it IN PLACE, slug
+unchanged — see below), `Push State` (broadcast — below), and
+`Delete State` (two-click confirm). The class id `LoraLibrarySetController` stays frozen
 (§8), and states ARE §4 set files — same storage, same routes, same files
 the EPS Apply LoRA Set node reads; only the controller's vocabulary changes.
 
@@ -466,13 +468,18 @@ queue. It drives a **genuine, untouched `Power Lora Loader (rgthree)`**:
   to the target loader(s) — forcing the apply even when re-picking the same row,
   per the strength-persistence fix. (The old auto-apply-on-single-click was too
   eager: selecting to rename/delete detonated an apply across all loaders.) A
-  `name` text field for New/Save stays. **Save State honors a changed name
-  (owner bug 2026-07-21 — "Save doesn't save a new name if an element is
-  selected"):** when a row is selected and the `name` field has been edited to
-  something different, `Save State` writes a NEW state under that new name
-  (this is the primary way to spin a new item off an existing one) and selects
-  it; when the name is unchanged it overwrites the selected state as before.
-  `New State` (empty name → capture current rows) is unchanged. The selected
+  `name` text field for New/Save stays. **Save State renames IN PLACE
+  (REVERSED 2026-07-22, owner bug report: "selecting a state, changing the
+  name of a state, and clicking save will create a new entry" — supersedes
+  the 2026-07-21 save-as-new interpretation):** Save State ALWAYS writes to
+  the selected state's own slug (`POST /lora_library/set` slug-form,
+  `{slug, set}`); a non-empty `name` field that differs from the selected
+  state's name rides along as `set.name` — a rename-in-place. The slug
+  NEVER changes (sets_store.save_set's caller-supplied-slug contract), so
+  EPS Apply LoRA Set nodes referencing the state by slug keep working.
+  Renaming to another state's display name is allowed (slugs stay unique;
+  the list's dedup "(slug)" suffix disambiguates). `New State` (empty name
+  → capture current rows) is the ONLY create path. The selected
   state must still round-trip as a serialized value
   (keep the internal `set` STRING widget, hidden, driven by the list
   selection — the Notebook's `entry`-widget trick, §7.2), so a saved
@@ -484,13 +491,14 @@ queue. It drives a **genuine, untouched `Power Lora Loader (rgthree)`**:
   DOM-widget sizing so the panel fills the node and never collapses.
 - Widgets/controls retained: `target` (COMBO of PLL nodes by title `#id`,
   PLUS `All Power Lora Loaders (N)` when N ≥ 2 — the WAN high/low case;
-  auto-selects when exactly one exists). Buttons (now stacked in the RIGHT
-  pane): `New State`, `Save State`, `Delete State` (two-click "Are you sure?"
-  confirm; the armed button is visually distinct, survives background cache
-  refreshes for its full window, and selection is slug-anchored so a
-  mid-window sets-poll cannot invalidate it — the 2026-07-18 "delete does
-  nothing during a running workflow" bug), and `Push State` (broadcast to all
-  EPS Apply LoRA Set nodes). All existing behavior — apply-on-select, composite
+  auto-selects when exactly one exists). Buttons (stacked in the RIGHT
+  pane, Delete LAST — owner ask 2026-07-22): `New State`, `Save State`,
+  `Push State` (broadcast to all EPS Apply LoRA Set nodes), `Delete State`
+  (two-click "Are you sure?" confirm; the armed button is visually
+  distinct, survives background cache refreshes for its full window, and
+  selection is slug-anchored so a mid-window sets-poll cannot invalidate
+  it — the 2026-07-18 "delete does nothing during a running workflow"
+  bug). All existing behavior — apply-on-select, composite
   capture/apply with target `All`, selective Push, `Show status`,
   serialize-based capture (v0.14.1), own-menu version-proof apply (v0.13.0) —
   is PRESERVED; only the state-selection UI changes from a dropdown to the

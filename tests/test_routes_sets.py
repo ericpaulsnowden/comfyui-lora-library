@@ -101,6 +101,60 @@ async def test_post_set_with_explicit_slug_updates_in_place(
     assert (await fetched.json())["name"] == "Foo Renamed"
 
 
+async def test_post_set_slug_form_rename_persists_new_name_and_rows_in_place(
+    context: LibraryContext, aiohttp_client
+) -> None:
+    """web/lora_library/controller.js's "Save State" now sends exactly this
+    shape for a rename (2026-07-22 reversal, file header section B): a
+    slug-form POST whose ``set.name`` differs from the file's current name,
+    carrying a freshly re-captured (and here deliberately DIFFERENT) rows
+    list in the same request. Unlike
+    ``test_post_set_with_explicit_slug_updates_in_place`` above (empty
+    ``loras`` throughout, so it can't tell a preserved row from a dropped
+    one), this proves the rows travelling alongside the rename are the ones
+    that land on disk, under the SAME slug/file — no second file minted.
+    """
+    client = await aiohttp_client(make_app(context))
+    created = await client.post(
+        "/lora_library/set",
+        json={"set": {"name": "Original", "loras": [{"file": "detailer.safetensors"}]}},
+    )
+    slug = (await created.json())["slug"]
+
+    renamed = await client.post(
+        "/lora_library/set",
+        json={
+            "slug": slug,
+            "set": {
+                "name": "Renamed",
+                "loras": [
+                    {"file": "detailer.safetensors", "strength": 0.8},
+                    {"file": "styles/film_grain.safetensors", "strength": 0.4},
+                ],
+            },
+        },
+    )
+    assert renamed.status == 200
+    body = await renamed.json()
+    assert body["slug"] == slug  # same slug — no new file minted
+    assert len(body["sets"]) == 1
+    assert body["sets"][0]["name"] == "Renamed"
+
+    fetched = await client.get("/lora_library/set", params={"slug": slug})
+    saved = await fetched.json()
+    assert saved["slug"] == slug
+    assert saved["name"] == "Renamed"
+    assert [row["file"] for row in saved["loras"]] == [
+        "detailer.safetensors",
+        "styles/film_grain.safetensors",
+    ]
+
+    # Exactly one file on disk for this slug — the rename really updated in
+    # place rather than minting a sibling (sets_store.save_set's
+    # caller-supplied-slug contract, lines 295-297).
+    assert [p.stem for p in context.sets_dir().glob("*.json")] == [slug]
+
+
 async def test_post_set_malformed_json_body_is_400(
     context: LibraryContext, aiohttp_client
 ) -> None:

@@ -374,7 +374,9 @@
  * 2026-07-21b (owner feedback on the same-day two-pane build; FORMAT.md
  * §6.3 "Select vs. apply are SEPARATE clicks" + "Save State honors a
  * changed name" — both amended there the same day). Two behavior changes,
- * nothing else:
+ * nothing else at the time — section (B) below was itself reversed the
+ * very next day, 2026-07-22; see its own updated text, which keeps this
+ * paragraph's original reasoning as history rather than deleting it:
  *
  * (A) SELECT vs APPLY split (owner: "We should now have it be a second
  * click to activate. Single click to select in case a user wants to update
@@ -427,34 +429,88 @@
  * `.value =` (never a DOM click), so a reopened workflow shows its saved
  * selection highlighted without applying anything.
  *
- * (B) SAVE STATE HONORS A CHANGED NAME (owner: "Save does not save a new
- * name if one of the elements is selected and the name has changed. This
- * is key for creating new items."). `_saveAsNewName()` decides once per
- * Save, up front in `_doUpdate()` (shared with `_updateComposite()`): the
- * trimmed `name` field, when non-empty AND different from the selected
- * entry's own name, makes this Save a SAVE-AS-NEW — the SAME
- * `POST /lora_library/set` route in its NO-SLUG form (the exact create
- * path `New State`/`_doCapture()` has always used; routes_sets.py
- * `post_set` derives the slug from the new name and `sets_store.
- * _unique_slug` de-duplicates it against existing files, so a new name
- * that happens to collide with some OTHER state's name mints a fresh file
- * rather than overwriting that state) — then selects the newly created
- * state and toasts with the create verb ("Saved"), read-back included.
- * Rows are the CURRENT capture either way (Save has always been a
- * re-capture); trigger_words/notes are inherited from the SELECTED state
- * (the same best-effort GET the overwrite path already did) — a spun-off
- * variant keeps its parent's metadata rather than silently blanking it;
- * only the name and slug are new. An UNCHANGED or EMPTY field is the
- * byte-identical pre-existing overwrite (empty never means "rename to
- * empty" — the field simply doesn't participate, exactly as every Save
- * before this rule; it also means the post-New-State field state stays
- * benign). `New State` itself is unchanged, including its field-clearing
- * epilogue: `_doCapture()`/`_captureComposite()`'s explicit
- * `name.value = ''` deliberately runs AFTER `_selectSetBySlug()` (which
- * now loads the new state's name into the field via `_selectEntry()`), so
- * New State still ends with an empty field — typing a name and pressing
- * New State twice still yields one named state plus one auto-named
- * "State N", never two same-named copies.
+ * (B) SAVE RENAMES IN PLACE — REVERSED 2026-07-22 (owner bug report, dated:
+ * "selecting a state, changing the name of a state, and clicking save will
+ * create a new entry" — filed as a BUG, a deliberate reversal one day
+ * later of the 2026-07-21b decision this section used to document; see the
+ * HISTORY paragraph below for that decision's own reasoning, kept rather
+ * than deleted — this file's rename-history practice, same as the
+ * NODE_TITLE renames at the very top of this header). Current behavior:
+ * with a state SELECTED, Save State ALWAYS writes to THAT state's OWN
+ * slug, never a new one. `_saveAsNewName()` (name kept from the
+ * 2026-07-21b design though it now computes a RENAME target, not a
+ * new-entry name — see its own doc comment) still decides once per Save,
+ * up front in `_doUpdate()` (shared with `_updateComposite()`), whether
+ * the trimmed `name` field is non-empty AND differs from the selected
+ * entry's own name — but a non-null result no longer switches which POST
+ * FORM this Save uses. EVERY Save now posts the SAME slug-form `POST
+ * /lora_library/set` — `{ slug: entry.slug, set: {...} }` — whether or not
+ * the name changed; a non-null result only changes what `set.name` carries
+ * inside that one request. This needed ZERO backend changes:
+ * `sets_store.save_set()`'s own docstring (lines 295-297) already states
+ * the contract this relies on — "A caller-supplied slug (updating a known
+ * set) is used as-is — renaming a set's display name must not move its
+ * file out from under saved workflows/routes that reference it by slug" —
+ * and it calls `normalize_set(set_data)` (line 299, which reads `name`
+ * unconditionally from the posted `set` object) BEFORE it ever looks at
+ * whether a slug was supplied (line 300's `if slug is None`).
+ * routes_sets.py's `post_set` (lines 48-72) passes the body's `set`
+ * straight through — `sets_store.save_set(context, body.get("set"),
+ * slug=slug)` (line 67) — so a slug-form POST whose `set.name` differs
+ * from the file's current name has ALWAYS been a rename-in-place at the
+ * storage layer; this reversal only changes which POST FORM the
+ * controller chooses to send. Rows are still the CURRENT capture either
+ * way, and trigger_words/notes still come from a best-effort GET of the
+ * selected state's own file — a rename now keeps its own metadata, same
+ * as an overwrite always did (there is no "spin-off" left to inherit
+ * anything from). `New State`/`_doCapture()` remains the ONLY create path,
+ * untouched. EDGE CASES: renaming to a name that happens to equal some
+ * OTHER state's display name is ALLOWED and never conflicts — `save_set`
+ * only de-duplicates NAMES via `_unique_slug` for a brand-new, no-slug
+ * save, never for an explicit-slug one, and the two-pane list's existing
+ * dedup "(slug)"-suffix machinery (`_applySetsResponse()`) already
+ * displays same-named entries unambiguously. Save with NO state selected
+ * is unaffected — `_doUpdate()`'s existing early "no entry -> warn and
+ * return" branch, above all of this, is untouched. The read-back toast's
+ * lead verb is now `"Saved + renamed to"` for a rename — composing with
+ * the read-back's own quoted, post-save name right after it into `Saved +
+ * renamed to "New Name": ...` — or the pre-existing `"Updated"` otherwise;
+ * an UNRENAMED Save is BYTE-IDENTICAL to every Save before this reversal,
+ * toast included. Selection stays on the same slug afterward (it never
+ * moved) and the `name` field is left holding the just-saved name rather
+ * than cleared — both fall out of the existing `_selectSetBySlug()` ->
+ * `_selectEntry()` chain running, exactly as before, AFTER
+ * `_applySetsResponse()` has already refreshed `_setsCache` from the POST
+ * response's own fresh `sets` list, so the entry `_selectEntry()` reads
+ * back already carries the new name.
+ *
+ * HISTORY — the 2026-07-21b decision this reverses (owner then: "Save does
+ * not save a new name if one of the elements is selected and the name has
+ * changed. This is key for creating new items."): for exactly one day, a
+ * changed `name` field made Save a SAVE-AS-NEW instead of an overwrite —
+ * the SAME `POST /lora_library/set` route in its NO-SLUG form (the exact
+ * create path `New State`/`_doCapture()` has always used; routes_sets.py
+ * `post_set` derived the slug from the new name and `sets_store.
+ * _unique_slug` de-duplicated it against existing files, so a new name
+ * that happened to collide with some OTHER state's name minted a fresh
+ * file rather than overwriting that state) — then selected the newly
+ * created state and toasted with the create verb ("Saved"), read-back
+ * included. Rows were the CURRENT capture either way (Save has always been
+ * a re-capture); trigger_words/notes were inherited from the SELECTED
+ * state (the same best-effort GET the overwrite path already did) — a
+ * spun-off variant kept its parent's metadata rather than silently
+ * blanking it; only the name and slug were new. This is EXACTLY the
+ * mechanism the owner's 2026-07-22 report calls a bug ("will create a new
+ * entry") — the two owner asks are a straight reversal of each other, not
+ * a misunderstanding on either side, which is the whole reason this record
+ * is kept rather than deleted. `New State` itself was, and remains,
+ * unchanged, including its field-clearing epilogue:
+ * `_doCapture()`/`_captureComposite()`'s explicit `name.value = ''`
+ * deliberately runs AFTER `_selectSetBySlug()` (which loads the new
+ * state's name into the field via `_selectEntry()`), so New State still
+ * ends with an empty field — typing a name and pressing New State twice
+ * still yields one named state plus one auto-named "State N", never two
+ * same-named copies.
  *
  * This file binds to rgthree internals it does not own. Every binding is
  * cited below with the exact file + lines read (rgthree-comfy's COMPILED
@@ -1876,11 +1932,17 @@ export function registerControllerNode() {
         this._w.pushBtn = this._createActionButton('llsc-btn', LABEL_PUSH, () => this._onPushClick())
         this._actionButtons = [this._w.captureBtn, this._w.updateBtn, this._w.deleteBtn]
 
+        // 2026-07-22 (owner ask): Delete moved LAST — New State / Save State
+        // / Push State / Delete State. Pure visual reorder of this array
+        // only: button IDENTITY (`_w.deleteBtn` etc.), the `_actionButtons`
+        // disable-loop (order-independent — see `_probeAndUpdateStatus()`),
+        // every handler, and the armed-Delete red-state/focus/disabled
+        // machinery below are all untouched.
         const rightPane = el('div', { className: 'llsc-pane-right' }, [
           this._w.captureBtn,
           this._w.updateBtn,
-          this._w.deleteBtn,
-          this._w.pushBtn
+          this._w.pushBtn,
+          this._w.deleteBtn
         ])
 
         const panes = el('div', { className: 'llsc-panes' }, [leftPane, rightPane])
@@ -2144,10 +2206,12 @@ export function registerControllerNode() {
        * drift-proof anchor `_selectedSetEntry()` falls back to), the hidden
        * serialized `set` widget + list-highlight repaint (via
        * `_setSetValueSilently()`), the `name` field loaded with the state's
-       * own name (`entryDisplayName()` — the rename/spin-off flows both
-       * start from that, see `_saveAsNewName()`; `loadName: false` is the
-       * apply-reclick's way of NOT clobbering a name the user may already
-       * have typed for a save-as-new), and disarming any pending
+       * own name (`entryDisplayName()` — the rename flow starts from that,
+       * see `_saveAsNewName()`; `loadName: false` is the apply-reclick's way
+       * of NOT clobbering a name the user may already have typed to rename
+       * on their next Save — 2026-07-22: renaming no longer spins off a new
+       * state, but the same non-clobbering rule still applies to the
+       * in-place rename), and disarming any pending
        * delete-confirm (moved here from `_onSetPicked()` so EVERY selection
        * movement — a user click, a post-save/capture auto-select, delete's
        * fallback — disarms, not just user picks: `_doDelete()` deletes
@@ -2237,7 +2301,7 @@ export function registerControllerNode() {
        * `_selectedSetEntry()` (label-drift-proof — the same resolution the
        * delete confirm relies on), and the apply branch still runs
        * `_selectEntry()` first (with `loadName: false`, so it can't clobber
-       * a typed save-as-new name) — a dedup-suffix label drift self-heals
+       * a typed rename-in-progress name) — a dedup-suffix label drift self-heals
        * into the serialized widget instead of surviving until the next
        * save. `label` is always one of `_setsCache`'s own `.label` strings
        * (the row's text IS the label), so the exact-match lookup below
@@ -2434,7 +2498,9 @@ export function registerControllerNode() {
        * state back (§5 `GET /lora_library/set?slug=`) and toast what the
        * FILE holds, not what the caller thinks it sent — see the file
        * header's item (4) for why. `verb` matches the existing toast
-       * vocabulary ("Saved"/"Updated"); `extraNote` is the existing
+       * vocabulary ("Saved"/"Updated"/2026-07-22's "Saved + renamed to",
+       * which composes with the quoted `saved.name` right after it into
+       * "Saved + renamed to "New Name": ..."); `extraNote` is the existing
        * multi-target capture-source suffix, unchanged in shape.
        */
       async _toastRowsSaved(verb, slug, extraNote) {
@@ -2565,18 +2631,27 @@ export function registerControllerNode() {
       }
 
       /**
-       * FORMAT.md §6.3 "Save State honors a changed name" (owner bug
-       * 2026-07-21b — file header, section B): the NEW name this Save
-       * should CREATE a state under, or `null` for the plain
-       * overwrite-the-selected-state save. Non-null iff the trimmed `name`
-       * field holds a non-empty value that differs from the selected
-       * entry's own name (`entryDisplayName()` — the same string
-       * `_selectEntry()` loads into the field on select, so "unchanged"
-       * means exactly "the user didn't edit what selecting put there"). An
-       * EMPTY field never means "rename to empty": it keeps the overwrite
-       * byte-identical to every Save before this rule — the field simply
-       * doesn't participate — which also keeps the post-New-State state
-       * (selection set, field deliberately cleared) saving benignly.
+       * FORMAT.md §6.3 "Save State honors a changed name" — REVERSED
+       * 2026-07-22 (owner bug report; file header, section B, which keeps
+       * the pre-reversal reasoning as history). This now decides whether
+       * Save carries a RENAME, not whether it spins off a new state — New
+       * State (`_doCapture()`) is the only create path. Returns the NEW
+       * name to write into `set.name` alongside the selected entry's
+       * UNCHANGED slug, or `null` for a plain overwrite that leaves the
+       * name untouched too. The METHOD NAME is a holdover from the
+       * pre-reversal design — kept rather than churned across every
+       * citation of it below, now that its job is "compute this Save's
+       * rename target" instead of "compute this Save's new-entry name" —
+       * don't let it suggest a create path exists here; it doesn't. Non-null
+       * iff the trimmed `name` field holds a non-empty value that differs
+       * from the selected entry's own name (`entryDisplayName()` — the same
+       * string `_selectEntry()` loads into the field on select, so
+       * "unchanged" means exactly "the user didn't edit what selecting put
+       * there"). An EMPTY field never means "rename to empty": it keeps the
+       * overwrite byte-identical to every Save before the 2026-07-21b rule
+       * — the field simply doesn't participate — which also keeps the
+       * post-New-State state (selection set, field deliberately cleared)
+       * saving benignly.
        */
       _saveAsNewName(entry) {
         const typed = (this._w.name?.value || '').trim()
@@ -2592,18 +2667,22 @@ export function registerControllerNode() {
        * Loaders (N)", N>=2, and why the single-target path below is
        * otherwise untouched by this addition.
        *
-       * 2026-07-21b "Save State honors a changed name" (file header,
-       * section B): `_saveAsNewName()` decides ONCE, up front — shared by
-       * the single-target path below and `_updateComposite()` — whether
-       * this Save OVERWRITES the selected state (field empty/unchanged: the
-       * exact pre-existing slug'd POST) or CREATES a new state under the
-       * field's value (the no-slug form of the SAME POST /lora_library/set
-       * route `New State` uses — same backend save path, same per-state
-       * JSON files, slug de-duplicated server-side) and then selects the
-       * newly created state. Either way the rows are the CURRENT capture,
-       * and trigger_words/notes come from the selected state's file (a
-       * spin-off inherits its parent's metadata; the overwrite preserves
-       * its own — one GET serves both).
+       * 2026-07-22 "Save renames in place" (file header, section B — a
+       * REVERSAL of the 2026-07-21b behavior this same doc comment used to
+       * describe; the old text is kept there as history). `_saveAsNewName()`
+       * still decides ONCE, up front — shared by the single-target path
+       * below and `_updateComposite()` — whether the trimmed `name` field
+       * is non-empty and differs from the selected entry's own name, but a
+       * non-null result no longer switches which POST FORM this Save uses.
+       * Every Save now posts the SAME slug-form `POST /lora_library/set` —
+       * `{ slug: entry.slug, set }` — whether or not the name changed; a
+       * non-null result only changes what `set.name` carries. The selected
+       * state's SLUG never changes and no new file is ever created here —
+       * `New State`/`_doCapture()` is the only create path. Rows are still
+       * the CURRENT capture either way, and trigger_words/notes still come
+       * from a best-effort GET of the selected state's own file (a rename
+       * now keeps its own metadata, same as an overwrite always did — there
+       * is no "spin-off" left to inherit anything).
        */
       async _doUpdate() {
         const targets = resolveTargetNodes(this._w.target?.value)
@@ -2626,11 +2705,9 @@ export function registerControllerNode() {
 
         const source = targets[0]
         const loras = await captureRows(source, { debugCapture: !!this.properties[PROP_DEBUG_CAPTURE] })
-        // Preserve the existing name/trigger_words/notes; only the rows
-        // change on a plain overwrite — best-effort GET, falls back to
-        // rows-only. The save-as-new path (2026-07-21b) reuses the same GET
-        // for trigger_words/notes: a spun-off state inherits the selected
-        // state's metadata, just never its name or slug.
+        // Preserve the existing trigger_words/notes; only the rows (and,
+        // 2026-07-22, optionally the name — see this method's doc comment)
+        // change on Save — best-effort GET, falls back to rows-only.
         let name = entry.name
         let trigger_words = ''
         let notes = ''
@@ -2643,11 +2720,12 @@ export function registerControllerNode() {
           api.warn(`${NODE_TITLE}: could not read existing set before update; overwriting rows only`, error)
         }
         const set = { format: 1, name: newName ?? name, loras, trigger_words, notes }
-        // 2026-07-21b: a changed name posts the NO-SLUG create form (see
-        // `_doUpdate()`'s doc comment); unchanged/empty posts the exact
-        // pre-existing overwrite, `entry.slug` and all.
-        const response = await api.postJson('/lora_library/set', newName ? { set } : { slug: entry.slug, set })
-        const savedSlug = newName ? response.slug : entry.slug
+        // 2026-07-22 reversal (file header, section B): ALWAYS the slug-form
+        // POST now — a changed name rides along in `set.name` inside the
+        // very same request that carries the rows, instead of switching to
+        // the no-slug create form `New State` uses. The slug never changes.
+        const response = await api.postJson('/lora_library/set', { slug: entry.slug, set })
+        const savedSlug = entry.slug
         this._applySetsResponse(response)
         announceSetsChanged()
         this._selectSetBySlug(savedSlug)
@@ -2670,9 +2748,11 @@ export function registerControllerNode() {
         this._setStatusText(
           `Captured ${loras.length} row${loras.length === 1 ? '' : 's'} from ${source.title || source.type} #${source.id}.`
         )
-        // "Saved" is the create verb (`_doCapture()`'s), "Updated" the
-        // overwrite verb — the read-back toast names which one happened.
-        await this._toastRowsSaved(newName ? 'Saved' : 'Updated', savedSlug, '')
+        // 2026-07-22: a rename gets its own lead phrase, composing with the
+        // read-back's own quoted (post-save, so already-new) name into
+        // `Saved + renamed to "New Name": ...`; an unrenamed Save keeps the
+        // byte-identical "Updated" verb/text from before this reversal.
+        await this._toastRowsSaved(newName ? 'Saved + renamed to' : 'Updated', savedSlug, '')
       }
 
       /**
@@ -2680,14 +2760,16 @@ export function registerControllerNode() {
        * Loaders (N)", N>=2 — re-captures EVERY target into the SAME
        * selected slug (a format-2 overwrite), same "Update is a re-capture"
        * rule the single-target half of `_doUpdate()` already follows;
-       * preserves the existing name/trigger_words/notes exactly like that
+       * preserves the existing trigger_words/notes exactly like that
        * single-target path (best-effort GET, falls back to rows-only).
-       * 2026-07-21b: `newName` (decided by `_doUpdate()`'s single up-front
-       * `_saveAsNewName()` call, passed through so both halves agree) flips
-       * this to the no-slug CREATE form of the same POST — a format-2
-       * save-as-new — mirroring the single-target path exactly: new
-       * name/slug, current rows, inherited trigger_words/notes, then select
-       * the new state.
+       * 2026-07-22 reversal (file header, section B — supersedes the
+       * 2026-07-21b save-as-new behavior this comment used to describe):
+       * `newName` (decided once by `_doUpdate()`'s up-front
+       * `_saveAsNewName()` call, passed through so both halves agree) no
+       * longer switches this to a different POST form — it ALWAYS posts the
+       * slug-form `{ slug: entry.slug, set }`, format-2 as before; a
+       * non-null `newName` only changes what `set.name` carries. Same
+       * selected slug either way, current rows, existing metadata.
        */
       async _updateComposite(targets, entry, newName) {
         const debugCapture = !!this.properties[PROP_DEBUG_CAPTURE]
@@ -2714,8 +2796,8 @@ export function registerControllerNode() {
           trigger_words,
           notes
         }
-        const response = await api.postJson('/lora_library/set', newName ? { set } : { slug: entry.slug, set })
-        const savedSlug = newName ? response.slug : entry.slug
+        const response = await api.postJson('/lora_library/set', { slug: entry.slug, set })
+        const savedSlug = entry.slug
         this._applySetsResponse(response)
         announceSetsChanged()
         this._selectSetBySlug(savedSlug)
@@ -2732,7 +2814,9 @@ export function registerControllerNode() {
             targets.map((_node, i) => `L${i} ${loadersRows[i].length} row${loadersRows[i].length === 1 ? '' : 's'}`).join(', ') +
             '.'
         )
-        await this._toastCompositeRowsSaved(newName ? 'Saved' : 'Updated', savedSlug)
+        // 2026-07-22: same rename-verb decision as the single-target path
+        // (`_doUpdate()`) — both halves must read consistently.
+        await this._toastCompositeRowsSaved(newName ? 'Saved + renamed to' : 'Updated', savedSlug)
       }
 
       async _doDelete() {
