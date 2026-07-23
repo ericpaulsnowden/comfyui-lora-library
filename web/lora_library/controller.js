@@ -1,9 +1,15 @@
 /**
- * @file Lora Loader State Controller — frontend-only virtual node
+ * @file EPS Lora Loader State Controller — frontend-only virtual node
  * (FORMAT.md §6.3) that drives a genuine, untouched `Power Lora Loader
  * (rgthree)` node elsewhere in the graph. Registered purely in JS (like
  * core's MarkdownNote/NoteNode) — never executes, never appears in the API
  * prompt.
+ *
+ * Renamed a THIRD time 2026-07-22 (owner: every node's display name
+ * must start with "EPS" so a gallery search for "EPS" surfaces the
+ * whole pack): "Lora Loader State Controller" -> "EPS Lora Loader
+ * State Controller". As before ONLY `NODE_TITLE` changed; the class
+ * id stays FROZEN.
  *
  * Renamed from "LoRA Set Controller" (owner, 2026-07-18c): every user-facing
  * word now says "state" instead of "set" — button labels, the `set` widget's
@@ -204,7 +210,7 @@
  * 2026-07-20 (§4.1 composite fix, owner: "All Power Lora Loaders currently
  * reads only the lowest-id loader and writes that ONE config to ALL
  * loaders; I want each loader to keep its OWN distinct set, captured/
- * restored together" — same root cause as "two Apply LoRA Set nodes on
+ * restored together" — same root cause as "two EPS Apply LoRA Set nodes on
  * different loaders show identical loras_text", fixed on the ApplySet side
  * by nodes_sets.py's new `loader_slot`). FORMAT.md §4.1 adds a `loaders[]`
  * array to the §4 set-file schema for exactly this case; this file's half:
@@ -662,7 +668,7 @@ import * as api from './api.js'
 // ---------------------------------------------------------------- constants
 
 const NODE_TYPE = 'LoraLibrarySetController'
-const NODE_TITLE = 'Lora Loader State Controller'
+const NODE_TITLE = 'EPS Lora Loader State Controller'
 const NODE_CATEGORY = 'EPSNodes'
 
 /** Exact rgthree type/title/comfyClass string — constants.js addRgthree("Power Lora Loader"). */
@@ -674,7 +680,7 @@ const PROP_SHOW_STRENGTHS_DUAL = 'Separate Model & Clip'
 const LORA_ROW_NAME_RE = /^lora_\d+$/
 
 /**
- * FORMAT.md §6.3 Push State: the Apply LoRA Set node's class id + its `set`
+ * FORMAT.md §6.3 Push State: the EPS Apply LoRA Set node's class id + its `set`
  * widget's internal name (lora_library/nodes_sets.py `LoraLibraryApplySet`;
  * web/lora_library/sets.js `WIDGET_NAME`) — same literals, kept in sync by
  * hand since neither file imports the other.
@@ -682,7 +688,7 @@ const LORA_ROW_NAME_RE = /^lora_\d+$/
 const APPLY_SET_NODE_CLASS = 'LoraLibraryApplySet'
 const APPLY_SET_WIDGET_NAME = 'set'
 /**
- * FORMAT.md §6.2/§4.1 (2026-07-20 composite fix): the Apply LoRA Set node's
+ * FORMAT.md §6.2/§4.1 (2026-07-20 composite fix): the EPS Apply LoRA Set node's
  * `loader_slot` widget name — a real, Python-declared widget
  * (lora_library/nodes_sets.py INPUT_TYPES), hidden by default by the
  * sibling `sets.js` behind its own `Show loader slot` property. Same
@@ -756,7 +762,7 @@ const MAX_ROW_ADJUST_STEPS = 500
 const PLACEHOLDER_NO_TARGET = '(none found)'
 const PLACEHOLDER_NO_SETS = '(no states saved)'
 
-const MSG_NO_RGTHREE = 'Install rgthree-comfy, or use Apply LoRA Set instead'
+const MSG_NO_RGTHREE = 'Install rgthree-comfy, or use EPS Apply LoRA Set instead'
 const MSG_SHAPE_DRIFT = 'Power Lora Loader internals changed — controller disabled (v-check)'
 const MSG_NO_TARGET_IN_GRAPH =
   'No Power Lora Loader (rgthree) node in this graph yet — add one, then pick it above.'
@@ -1135,7 +1141,7 @@ function stemOf(file) {
 /**
  * FORMAT.md §6.3 read-back toast (2026-07-19c): human-readable row summary
  * for a saved-state toast, e.g. `detailer 0.8, film_grain 1.2`. Deliberately
- * NOT the Apply LoRA Set node's `loras_text` format (FORMAT.md §6.2 —
+ * NOT the EPS Apply LoRA Set node's `loras_text` format (FORMAT.md §6.2 —
  * underscore-joined, filename-safe tokens): this is comma-separated prose
  * for a toast, always shows BOTH strengths when they differ (a
  * dual-strength state applied against a single-strength target, or vice
@@ -1175,7 +1181,7 @@ function summarizeRowsForToast(rows) {
  */
 /**
  * Announce a set CRUD to the rest of the pack (FORMAT.md §7.4) — sets.js
- * listens and refreshes every Apply LoRA Set combo. A DOM event rather than
+ * listens and refreshes every EPS Apply LoRA Set combo. A DOM event rather than
  * an import keeps the two modules decoupled: either can ship/fail alone.
  */
 function announceSetsChanged() {
@@ -1289,7 +1295,7 @@ function findApplySetNodes() {
 }
 
 /**
- * Write `slug` to one Apply LoRA Set node's `set` widget through its REAL
+ * Write `slug` to one EPS Apply LoRA Set node's `set` widget through its REAL
  * setter — `BaseWidget.setValue()`, not a plain `.value =` assignment — so
  * its `callback`/`node.onWidgetChanged` fire exactly like a genuine user
  * pick — DELIBERATELY still `setValue()`, not the `onClick`-menu replacement
@@ -2225,7 +2231,7 @@ export function registerControllerNode() {
         this._runAction(LABEL_UPDATE, () => this._doUpdate())
       }
 
-      /** FORMAT.md §6.3 Push State — broadcasts to Apply LoRA Set nodes, see `_doPush()`. */
+      /** FORMAT.md §6.3 Push State — broadcasts to EPS Apply LoRA Set nodes, see `_doPush()`. */
       _onPushClick() {
         this._disarmDeleteButton()
         this._runAction(LABEL_PUSH, () => this._doPush())
@@ -2705,7 +2711,7 @@ export function registerControllerNode() {
 
       /**
        * FORMAT.md §6.2/§6.3 SELECTIVE Push State (2026-07-19c amendment,
-       * owner: "set different Apply LoRA Set nodes to different Power Lora
+       * owner: "set different EPS Apply LoRA Set nodes to different Power Lora
        * Loaders as targets"): broadcast the currently-selected state, but
        * only to the Apply nodes this controller's `target` combo selects
        * for — see `selectPushTargets()`/`mirrorsTagMatches()` (this file)
@@ -2733,7 +2739,7 @@ export function registerControllerNode() {
         const applyNodes = selectPushTargets(targetValue)
         if (applyNodes.length === 0) {
           const scope = pushingAll ? 'in this graph' : `tagged to "${targetValue}" (or "(any)")`
-          this._toast('warn', NODE_TITLE, `No Apply LoRA Set nodes ${scope}.`)
+          this._toast('warn', NODE_TITLE, `No EPS Apply LoRA Set nodes ${scope}.`)
           return
         }
         const count = pushStateToNodes(applyNodes, entry.slug)
@@ -2749,7 +2755,7 @@ export function registerControllerNode() {
         this._toast(
           'success',
           NODE_TITLE,
-          `Pushed "${entry.name}" to ${count} Apply LoRA Set node${count === 1 ? '' : 's'}${scopeNote}.`
+          `Pushed "${entry.name}" to ${count} EPS Apply LoRA Set node${count === 1 ? '' : 's'}${scopeNote}.`
         )
       }
 

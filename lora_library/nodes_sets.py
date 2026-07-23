@@ -1,5 +1,4 @@
-"""The ``LoraLibraryApplySet`` ComfyUI node (FORMAT.md §6.2, display: "Apply
-LoRA Set").
+"""The ``LoraLibraryApplySet`` ComfyUI node (FORMAT.md §6.2, display: "EPS Apply LoRA Set").
 
 ``comfy.utils``/``comfy.sd`` are imported only inside the one method that
 touches actual model/clip weights, never at module level, so this module —
@@ -104,7 +103,7 @@ class LoraLibraryApplySet:
     (``loaders[i].loras``); ``loader_slot`` (default 0) picks which one this
     node applies, via :func:`sets_store.loras_for_slot`. A plain format-1 set
     ignores ``loader_slot`` and always applies its single ``loras`` — so two
-    ``Apply LoRA Set`` nodes pointed at the SAME composite state but
+    ``EPS Apply LoRA Set`` nodes pointed at the SAME composite state but
     different ``loader_slot`` values apply different loras and report
     different ``loras_text`` (the fix for the owner's "both Apply nodes show
     the same loras_text" report).
@@ -185,7 +184,9 @@ class LoraLibraryApplySet:
 
         context = _context
         if context is None:
-            logger.warning("lora_library: Apply LoRA Set has no context configured; passthrough")
+            logger.warning(
+                "lora_library: EPS Apply LoRA Set has no context configured; passthrough"
+            )
             return model, clip, [], "", ""
 
         try:
@@ -200,7 +201,7 @@ class LoraLibraryApplySet:
         # FORMAT.md §4.1/§6.2: picks the loader_slot-th loader's rows for a
         # composite (format-2) state; a plain format-1 state ignores
         # loader_slot entirely and returns its single `loras` unchanged —
-        # this is the exact fix for "two Apply LoRA Set nodes on the same
+        # this is the exact fix for "two EPS Apply LoRA Set nodes on the same
         # composite state show identical loras_text" (they now select
         # different slices below, so the loras_text built from them differs
         # too).

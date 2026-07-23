@@ -7,7 +7,7 @@ beyond it — image-flow utilities now live here too.
 
 Current capabilities, no dependencies:
 
-- **Prompt Notebook** — your prompt library as a node: a scrollable list of
+- **EPS Prompt Notebook** — your prompt library as a node: a scrollable list of
   named prompts with an editor pane beside it. Backed by a plain
   **Markdown file you can put anywhere** — including a NAS folder shared by
   several machines. Selected prompts flow out as `STRING`s you can wire
@@ -15,10 +15,10 @@ Current capabilities, no dependencies:
   VS Code, on the other computer — everything stays in sync.
 - **LoRA states** — save a whole lora configuration (which loras, order,
   on/off, strengths) as a named state, then switch from a list.
-  `Apply LoRA Set` works standalone (MODEL/CLIP in → out, plus a
+  `EPS Apply LoRA Set` works standalone (MODEL/CLIP in → out, plus a
   `LORA_STACK` and trigger words). If you use
   [rgthree's Power Lora Loader](https://github.com/rgthree/rgthree-comfy),
-  the `Lora Loader State Controller` drives it directly — capture
+  the `EPS Lora Loader State Controller` drives it directly — capture
   its current rows as a state, apply a state back, reorder included.
   **EPS LoRA Sweep** takes any `LORA_STACK` and auditions it by strength —
   set a min/max/increment range and it runs your workflow once per step
@@ -34,14 +34,14 @@ Current capabilities, no dependencies:
   scrub/play to a frame, and outputs that frame as an image.
 
 > **Status: pre-release. Eight capabilities ship today:** the **Prompt
-> Notebook**, **Apply LoRA Set**, the **Lora Loader State Controller**,
+> Notebook**, **EPS Apply LoRA Set**, the **EPS Lora Loader State Controller**,
 > **EPS LoRA Sweep**, **EPS Switcher**, **EPS Resolution**, **EPS Image
 > Grid**, and **EPS Frame Saver** (each described below). Contracts live in
 > [docs/FORMAT.md](docs/FORMAT.md).
 
-## Prompt Notebook (shipped)
+## EPS Prompt Notebook (shipped)
 
-`EPSNodes → Prompt Notebook`: a two-pane editor inside the node — entry
+`EPSNodes → EPS Prompt Notebook`: a two-pane editor inside the node — entry
 list on the left (grouped by `# Category` headings, with `＋ New` /
 `🗑 Delete`), a flexible text editor + `Save` on the right. Outputs:
 `text` and `name` (the entry's heading — handy for filename prefixes and
@@ -75,15 +75,15 @@ captions).
 - The workflow stores only the file path + selected entry name — never the
   text. The file is the truth; the node is a view.
 
-## Lora Loader State Controller (shipped; requires rgthree-comfy)
+## EPS Lora Loader State Controller (shipped; requires rgthree-comfy)
 
-`EPSNodes → Lora Loader State Controller`: a small panel node that
+`EPSNodes → EPS Lora Loader State Controller`: a small panel node that
 drives a genuine, untouched
 [Power Lora Loader (rgthree)](https://github.com/rgthree/rgthree-comfy)
 elsewhere in your graph — rgthree stays the loader; this node just moves
 whole configurations ("states") in and out of it:
 
-- **Two-pane layout** (like the Prompt Notebook): a scrolling list of all
+- **Two-pane layout** (like the EPS Prompt Notebook): a scrolling list of all
   your saved states on the left, the buttons stacked on the right.
 - **One click selects, a second click applies.** A single click just
   *selects* a state (highlights it, loads its name) — it does **not** touch
@@ -103,7 +103,7 @@ whole configurations ("states") in and out of it:
   loader's OWN config** (a "composite" state): New/Save State captures every
   loader distinctly, and picking that state restores each loader to its own
   rows — so one state file holds your whole WAN high+low setup. To feed those
-  distinct configs into the standalone `Apply LoRA Set` loaders, give each
+  distinct configs into the standalone `EPS Apply LoRA Set` loaders, give each
   Apply node a `loader_slot` (0 = first loader, 1 = second, …; revealed via
   right-click → Properties → `Show loader slot`). Single-loader states are
   unchanged and fully backward-compatible.
@@ -117,14 +117,14 @@ whole configurations ("states") in and out of it:
   with any bug report and the cause is pinpointed.
 - It's a frontend-only virtual node: it never executes and can't block a
   queue. If rgthree isn't installed (or its internals ever drift), the node
-  disables itself with a message and points you at `Apply LoRA Set`, which
+  disables itself with a message and points you at `EPS Apply LoRA Set`, which
   needs no dependencies.
-- Every `Apply LoRA Set` dropdown refreshes automatically after any state
+- Every `EPS Apply LoRA Set` dropdown refreshes automatically after any state
   change — no page reload.
 
-## Apply LoRA Set (shipped)
+## EPS Apply LoRA Set (shipped)
 
-`EPSNodes → Apply LoRA Set`: pick a saved state from the dropdown and every
+`EPSNodes → EPS Apply LoRA Set`: pick a saved state from the dropdown and every
 enabled lora in it is applied **in order** to the `model`/`clip` you wire
 through — it *is* a loader, no Power Lora Loader involved. (For WAN-style
 dual-model workflows: two Apply nodes, one in the HIGH branch, one in the
@@ -167,7 +167,7 @@ and skips cleanly where those are absent.
 wire in a `LORA_STACK`, set `min` / `max` / `increment`, queue once, and
 the rest of your workflow runs at every step.
 
-- **Wire `Apply LoRA Set`'s `lora_stack` output straight in**, alongside
+- **Wire `EPS Apply LoRA Set`'s `lora_stack` output straight in**, alongside
   the `model` (and `clip`) you'd normally pass through the loader — EPS LoRA
   Sweep does its own applying internally, so no separate "apply the stack"
   node sits between them. Any other `LORA_STACK` producer works too.

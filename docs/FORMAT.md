@@ -8,7 +8,7 @@ module `lora_library/`, the `/lora_library/*` route prefix, and the
 `LoraLibrary*` node class ids are the pack's first FEATURE FAMILY and stay
 frozen (§8) — future non-lora features arrive as sibling modules under the
 same EPSNodes banner, without repo churn. `LoraLibraryNotebook`'s display
-name is **"Prompt Notebook"** (it stores prompts; the original name was a
+name is **"EPS Prompt Notebook"** (it stores prompts; the original name was a
 misnomer).
 
 This document is BINDING, in the comfyui-photoshop-bridge PROTOCOL.md sense:
@@ -278,7 +278,7 @@ Route paths are FROZEN once shipped (§8).
 Class ids are FROZEN once shipped. Both nodes re-read their files at every
 execution — **the file is the truth; the UI is a view.**
 
-### §6.1 `LoraLibraryNotebook` (display: "Prompt Notebook")
+### §6.1 `LoraLibraryNotebook` (display: "EPS Prompt Notebook")
 
 - Widgets: `file` (STRING, default `"loras.md"`), `entry` (STRING — the
   SELECTION; the DOM widget UI sets it, but it stays a plain serialized
@@ -305,7 +305,7 @@ execution — **the file is the truth; the UI is a view.**
   on-disk edit from the *other* machine re-executes; `VALIDATE_INPUTS`
   returns True (entry names are dynamic).
 
-### §6.2 `LoraLibraryApplySet` (display: "Apply LoRA Set")
+### §6.2 `LoraLibraryApplySet` (display: "EPS Apply LoRA Set")
 
 - Optional inputs: `model` (MODEL), `clip` (CLIP).
 - Widgets: `set` (COMBO of set names by slug + `"None"`), `strength_scale`
@@ -353,14 +353,11 @@ execution — **the file is the truth; the UI is a view.**
   warning, missing individual loras follow §4 skip rules.
 - `IS_CHANGED` → set file mtime/size + widget values; `VALIDATE_INPUTS`
   True (set list is dynamic).
-- **Sync target of the controller's Push State (§6.3).** Apply LoRA Set
+- **Sync target of the controller's Push State (§6.3).** EPS Apply LoRA Set
   needs no structural change for this: the controller's Push State button
-  sets each Apply LoRA Set node's `set` widget to a chosen state and
-  triggers a re-read. So one controller can keep any number of Apply LoRA
-  Set nodes on the same state at once — the owner's "multiple Apply LoRA
-  Set nodes all controlled by one controller, kept in sync" use case.
-- **`mirrors loader` tag (owner ask 2026-07-19c: "set different Apply LoRA
-  Set nodes to different Power Lora Loaders as targets").** A FRONTEND-ONLY
+  sets each EPS Apply LoRA Set node's `set` widget to a chosen state and
+  triggers a re-read. So one controller can keep any number of EPS Apply LoRA Set nodes on the same state at once — the owner's "multiple EPS Apply LoRA Set nodes all controlled by one controller, kept in sync" use case.
+- **`mirrors loader` tag (owner ask 2026-07-19c: "set different EPS Apply LoRA Set nodes to different Power Lora Loaders as targets").** A FRONTEND-ONLY
   combo widget (added by `sets.js` on nodeCreated; the server never sees
   it) listing the graph's PLL nodes plus `"(any)"` (default). It's a
   GROUPING TAG for §6.3's selective Push — it does not change what the
@@ -370,17 +367,17 @@ execution — **the file is the truth; the UI is a view.**
   displayed by title; tolerates the id disappearing (falls back to
   "(any)").
 
-### §6.3 `Lora Loader State Controller` (frontend-only virtual node)
+### §6.3 `EPS Lora Loader State Controller` (frontend-only virtual node)
 
 Naming (owner 2026-07-18c, refined 2026-07-19): the node's DISPLAY name is
-**"Lora Loader State Controller"** (was "Power Lora Loader State
+**"EPS Lora Loader State Controller"** (was "Power Lora Loader State
 Controller" — "Power" dropped) and every user-facing word in its UI says
 **state**, not set — widget label `state`, buttons `New State` (capture
 current rows as a new state), `Save State` (overwrite the selected state
 with current rows), `Delete State` (two-click confirm), and `Push State`
 (broadcast — below). The class id `LoraLibrarySetController` stays frozen
 (§8), and states ARE §4 set files — same storage, same routes, same files
-the Apply LoRA Set node reads; only the controller's vocabulary changes.
+the EPS Apply LoRA Set node reads; only the controller's vocabulary changes.
 
 **Push State** (owner ask 2026-07-19; SELECTIVE since 2026-07-19c): sets
 `LoraLibraryApplySet` nodes to the controller's currently-selected state
@@ -493,7 +490,7 @@ queue. It drives a **genuine, untouched `Power Lora Loader (rgthree)`**:
   refreshes for its full window, and selection is slug-anchored so a
   mid-window sets-poll cannot invalidate it — the 2026-07-18 "delete does
   nothing during a running workflow" bug), and `Push State` (broadcast to all
-  Apply LoRA Set nodes). All existing behavior — apply-on-select, composite
+  EPS Apply LoRA Set nodes). All existing behavior — apply-on-select, composite
   capture/apply with target `All`, selective Push, `Show status`,
   serialize-based capture (v0.14.1), own-menu version-proof apply (v0.13.0) —
   is PRESERVED; only the state-selection UI changes from a dropdown to the
@@ -939,9 +936,9 @@ needs a stack outside sweeping, so a second node would only be one more
 thing to wire with no benefit; see the roadmap for the full tradeoff.
 
 - **Inputs:** `model` (MODEL, required) + `lora_stack` (LORA_STACK, required
-  — wire in any producer's output, most commonly Apply LoRA Set's own
+  — wire in any producer's output, most commonly EPS Apply LoRA Set's own
   `lora_stack`; "activated" = however many rows the wired stack already
-  contains, since a producer like Apply LoRA Set already excludes its own
+  contains, since a producer like EPS Apply LoRA Set already excludes its own
   disabled rows), plus `clip` (CLIP, **OPTIONAL** — owner ask 2026-07-22).
   `model` is required because a lora *tester* needs a model to patch (no
   pure-stack-source mode). `clip` is NOT required: many models neither
@@ -1001,7 +998,7 @@ thing to wire with no benefit; see the roadmap for the full tradeoff.
   Deliberately NOT `nodes_sets._loras_text(swept_stack)` (owner ask
   2026-07-22): that dumps the WHOLE stack — every HELD lora too, space-joined
   (`detailer_0.3 grain_0.8`) — which buries the one value under test among
-  constants; right for Apply LoRA Set's static `loras_text` (§6.2), wrong for
+  constants; right for EPS Apply LoRA Set's static `loras_text` (§6.2), wrong for
   a per-run sweep filename. Filename-safe; wire straight into a `SaveImage`
   `filename_prefix`.
 - **Empty-stack passthrough:** an empty `lora_stack` in "Each lora
@@ -1036,13 +1033,13 @@ thing to wire with no benefit; see the roadmap for the full tradeoff.
   `model`/`clip`, label `(no context configured)` — mirroring
   `LoraLibraryApplySet.apply`'s own no-context posture (§6.2), logged as a
   warning.
-- **Caching:** no `IS_CHANGED` override. Unlike Apply LoRA Set, this node
+- **Caching:** no `IS_CHANGED` override. Unlike EPS Apply LoRA Set, this node
   reads no file off disk — `lora_stack` is an ordinary hashed INPUT (the
   upstream producer re-executes on its own file change, not this node), so
   ComfyUI's default input-hash caching over the three widgets plus the
   three wired inputs is already correct. No `VALIDATE_INPUTS` either:
   `mode`'s COMBO is static (two hardcoded options), not a dynamic
-  set-of-names list like Apply LoRA Set's `set`.
+  set-of-names list like EPS Apply LoRA Set's `set`.
 - **Caveats (surfaced in the node's `DESCRIPTION`):** a scalar seed wired
   downstream repeats IDENTICALLY across every fanned run — the core
   list-zip mechanic (§6.4's same caveat) — which is exactly right for a

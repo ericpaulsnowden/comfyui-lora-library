@@ -1,5 +1,5 @@
 /**
- * @file Apply LoRA Set frontend behavior (FORMAT.md §7.4): keeps every
+ * @file EPS Apply LoRA Set frontend behavior (FORMAT.md §7.4): keeps every
  * `LoraLibraryApplySet` node's `set` combo fresh without a page reload.
  *
  * Mechanism: each ApplySet node's combo gets `options.values` swapped for a
@@ -16,7 +16,7 @@
  * this module only closes the UX gap, not a correctness one.
  *
  * 2026-07-19c addition: FORMAT.md §6.2's `mirrors loader` tag (owner:
- * "set different Apply LoRA Set nodes to different Power Lora Loaders as
+ * "set different EPS Apply LoRA Set nodes to different Power Lora Loaders as
  * targets") — `attachMirrorsWidget()`. A second frontend-only combo per
  * Apply node, appended AFTER the server widgets (`set`, `strength_scale`)
  * on every `nodeCreated`. It is a pure GROUPING TAG read by controller.js's

@@ -1,7 +1,7 @@
 /**
  * fs-browse dialog v1 — synced from STANDARD-fs-browse.md
  *
- * @file Prompt Notebook two-pane DOM widget (FORMAT.md §7.2) — attaches to
+ * @file EPS Prompt Notebook two-pane DOM widget (FORMAT.md §7.2) — attaches to
  * `LoraLibraryNotebook` nodes. Left pane: a scrollable, category-grouped,
  * multi-selectable, drag-to-reorder (including a multiselect dragged as one
  * block, and a whole category dragged by its header) entry list — with

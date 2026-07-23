@@ -173,7 +173,7 @@ class LoraLibraryNotebook:
     def read_entry(self, file: str, entry: str) -> tuple[list[str], list[str]]:
         context = _context
         if context is None:
-            raise RuntimeError("lora_library: Prompt Notebook has no context configured")
+            raise RuntimeError("lora_library: EPS Prompt Notebook has no context configured")
 
         try:
             path = context.resolve_notebook_file(file)
@@ -190,13 +190,13 @@ class LoraLibraryNotebook:
         if mtime is None:
             hint = _unreachable_library_dir_hint(path)
             raise ValueError(
-                f"Prompt Notebook: file {file!r} does not exist (resolved: {path}){hint}"
+                f"EPS Prompt Notebook: file {file!r} does not exist (resolved: {path}){hint}"
             )
 
         names = _selected_names(entry)
         if not names:
             raise ValueError(
-                f"Prompt Notebook: no entry selected in {file!r} (resolved: {path})"
+                f"EPS Prompt Notebook: no entry selected in {file!r} (resolved: {path})"
             )
 
         texts: list[str] = []
@@ -212,7 +212,7 @@ class LoraLibraryNotebook:
 
         if missing:
             raise ValueError(
-                f"Prompt Notebook: no entry named {missing!r} in {file!r} (resolved: {path})"
+                f"EPS Prompt Notebook: no entry named {missing!r} in {file!r} (resolved: {path})"
             )
 
         return (texts, result_names)

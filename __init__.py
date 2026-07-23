@@ -82,8 +82,8 @@ _routes.register(_context)
 # set_context is called only when a module defines it (the image nodes don't
 # need the library context for their current milestones).
 _NODE_SPECS = [
-    ("lora_library.nodes_notebook", "LoraLibraryNotebook", "Prompt Notebook"),
-    ("lora_library.nodes_sets", "LoraLibraryApplySet", "Apply LoRA Set"),
+    ("lora_library.nodes_notebook", "LoraLibraryNotebook", "EPS Prompt Notebook"),
+    ("lora_library.nodes_sets", "LoraLibraryApplySet", "EPS Apply LoRA Set"),
     ("lora_library.nodes_sweep", "LoraLibrarySweep", "EPS LoRA Sweep"),
     ("eps_image.nodes_switcher", "EPSSwitcher", "EPS Switcher"),
     ("eps_image.nodes_resolution", "EPSResolution", "EPS Resolution"),

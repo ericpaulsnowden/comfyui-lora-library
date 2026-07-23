@@ -5,7 +5,7 @@
 - ComfyUI (a 2025+ build; the pack is developed against current ComfyUI).
 - Nothing else — no pip dependencies.
 - Optional: [rgthree-comfy](https://github.com/rgthree/rgthree-comfy), only
-  if you want the `Lora Loader State Controller` to drive a Power Lora Loader. The
+  if you want the `EPS Lora Loader State Controller` to drive a Power Lora Loader. The
   rest of the pack works without it.
 
 ## Install
