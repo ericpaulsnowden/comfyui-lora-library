@@ -42,7 +42,10 @@ Current capabilities, no dependencies:
 > **EPS LoRA Sweep**, **EPS Switcher**, **EPS Resolution**, **EPS Image
 > Grid**, **EPS Cross Product**, **EPS Cross Sweep**, and **EPS Frame
 > Saver** (each described below). Contracts live in
-> [docs/FORMAT.md](docs/FORMAT.md).
+> [docs/FORMAT.md](docs/FORMAT.md). Want to see everything working
+> together? Load
+> [examples/eps-full-pipeline.json](examples/eps-full-pipeline.json) —
+> all ten nodes stitched into one annotated workflow.
 
 ## EPS Prompt Notebook (shipped)
 
